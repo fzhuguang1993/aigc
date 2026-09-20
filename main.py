@@ -4,7 +4,11 @@ main.py —— 入口
 import threading
 from datetime import datetime
 
-from core.config import EXCEL_PATH, ACCOUNTS, DOWNLOAD_DIR, DEFAULT_DURATION
+# 首次运行：交互式生成 config.json（姓名 + API 接口），必须在加载配置前执行
+from core.setup_wizard import ensure_config
+ensure_config()
+
+from core.config import EXCEL_PATH, ACCOUNTS, DOWNLOAD_DIR, DEFAULT_DURATION, USER_NAME
 from core.logger import raw_info, raw_warning
 from registry.manager import health_monitor_worker
 from workers.poll import start_poll_threads
@@ -19,6 +23,7 @@ def main():
     
     # 汇总启动信息为极简格式
     info_parts = [
+        f"姓名={USER_NAME or '未配置'}",
         f"Excel={EXCEL_PATH.split('/')[-1]}",
         f"账号={'/'.join([a['name'] for a in ACCOUNTS])}",
         f"下载={DOWNLOAD_DIR.split('/')[-1]}",

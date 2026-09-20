@@ -55,10 +55,31 @@ LOG_LEVEL_CONSOLE = "INFO"
 LOG_RETENTION_DAYS = 7
 
 # ============================================================
-# 6. 本地敏感配置（账号地址等，不上传版本库）
-#    首次使用：复制 config_local.example.py 为 config_local.py 并填入真实信息
+# 6. 本地用户配置
+#    分发模式：运行目录下的 config.json（首次运行向导自动生成，含姓名与账号接口）
+#    开发模式：无 config.json 时回退到 core/config_local.py
 # ============================================================
-from core.config_local import ACCOUNTS  # noqa: E402
+CONFIG_JSON = RUNTIME_DIR / "config.json"
+
+
+def _load_local_config():
+    """返回 (accounts, user_name)"""
+    if CONFIG_JSON.exists():
+        import json
+        try:
+            data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+            return data.get("accounts", []), data.get("user_name", "")
+        except Exception as e:
+            print(f"⚠ config.json 解析失败（{e}），将重新进入配置向导")
+            return [], ""
+    try:
+        from core.config_local import ACCOUNTS as _A
+        return list(_A), ""
+    except ImportError:
+        return [], ""
+
+
+ACCOUNTS, USER_NAME = _load_local_config()
 
 # ============================================================
 # 7. 脚本行为

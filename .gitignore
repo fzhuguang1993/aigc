@@ -26,6 +26,8 @@ outputs/
 
 # ========== 敏感配置（本地配置不上传） ==========
 core/config_local.py
+# 首次运行向导生成的本地配置（姓名/接口地址，随机器生成，不入库）
+config.json
 
 # ========== 业务数据与素材（含商业机密/版权图片） ==========
 *.xlsx
@@ -36,6 +38,11 @@ material/
 /test_integration.py
 /test_script_extractor.py
 /test_write_to_script.py
+
+# ========== 打包产物 ==========
+build/
+dist/
+*.spec
 
 # ========== 大体积测试素材 ==========
 test/audios/

@@ -11,7 +11,8 @@ from core.config import (
     EXCEL_PATH, SHEET_TASK, SHEET_NAME_RULE,
     COL_ID, COL_PRODUCT, COL_PROMPT, COL_SCRIPT, COL_STATUS, COL_ACCOUNT,
     COL_JOB_ID, COL_OUTPUT, COL_URL, COL_RUNS, COL_SUCCESS, COL_CANCEL,
-    COL_SCRIPT_TEXT, COL_NAME, ASSET_DIR, DOWNLOAD_DIR, DEFAULT_PRODUCT
+    COL_SCRIPT_TEXT, COL_NAME, ASSET_DIR, DOWNLOAD_DIR, DEFAULT_PRODUCT,
+    USER_NAME
 )
 from core.logger import raw_info, raw_warning, raw_error
 
@@ -68,6 +69,9 @@ def update_row(row_idx, **fields):
 
 
 def load_name_rule():
+    # 优先使用本地配置的姓名（首次运行向导 config.json 中填写）
+    if USER_NAME:
+        return USER_NAME
     with _excel_lock:
         try:
             df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME_RULE)
