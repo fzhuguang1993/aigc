@@ -1,0 +1,44 @@
+# Group 4: 产品图 + KOL 图 + KOL 图 (1+2)
+
+## 脚本 4.1: 产品 + 贾乃亮 1 + 贾乃亮 2
+
+**文件名**: script_4_1_product_kol1_kol2.txt
+
+```
+subject_definitions: <Subject 1> is a joint celebrity endorsement scene with two celebrities. Both should appear naturally and discuss the product together.
+
+dialogue: 
+<d>[Chinese] 贾乃亮：这款产品太棒了！</d>
+<d>[Chinese] 另一位明星：我也在用，效果很好！</d>
+<d>[English] Celebrity 1: This product is amazing! Celebrity 2: I use it too, great results!</d>
+```
+
+---
+
+## 脚本 4.2: 产品 + 贾乃亮 2 + 贾乃亮 3
+
+**文件名**: script_4_2_product_kol2_kol3.txt
+
+```
+subject_definitions: <Subject 1> is a team recommendation scene with multiple celebrities. Celebrities interact naturally while promoting the product.
+
+dialogue: 
+<d>[Chinese] 明星 A：我们团队都在用！</d>
+<d>[Chinese] 明星 B：确实好用，值得信赖！</d>
+<d>[English] Star A: Our whole team uses it! Star B: Really good, trustworthy!</d>
+```
+
+---
+
+## 脚本 4.3: 产品 + 贾乃亮 1 + 贾乃亮 3
+
+**文件名**: script_4_3_product_kol1_kol3.txt
+
+```
+subject_definitions: <Subject 1> is a celebrity duet endorsement. Two celebrities share their experience with the product in a conversational manner.
+
+dialogue: 
+<d>[Chinese] 明星甲：强烈推荐这款！</d>
+<d>[Chinese] 明星乙：亲测有效，放心购买！</d>
+<d>[English] Star A: Highly recommend this! Star B: Tried it myself, safe to buy!</d>
+```

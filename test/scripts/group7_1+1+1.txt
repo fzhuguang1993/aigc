@@ -1,0 +1,41 @@
+# Group 7: 产品图 + KOL 图 + 视频 (1+1+1)
+
+## 脚本 7.1: 产品 + 贾乃亮 1 + 视频 1
+
+**文件名**: script_7_1_product_kol1_video1.txt
+
+```
+subject_definitions: <Subject 1> is a celebrity video endorsement with product focus. Celebrity appears alongside product while video demonstrates usage.
+
+dialogue: 
+<d>[Chinese] 贾乃亮：看我用这款产品的效果！</d>
+<d>[English] Jacky: Watch me use this product!</d>
+```
+
+---
+
+## 脚本 7.2: 产品 + 贾乃亮 2 + 视频 2
+
+**文件名**: script_7_2_product_kol2_video2.txt
+
+```
+subject_definitions: <Subject 1> is a tutorial with celebrity and product showcase. Celebrity guides viewers through product usage with visual demonstration.
+
+dialogue: 
+<d>[Chinese] 明星演示：手把手教你使用！</d>
+<d>[English] Star demo: Step by step tutorial!</d>
+```
+
+---
+
+## 脚本 7.3: 产品 + 贾乃亮 3 + 视频 3
+
+**文件名**: script_7_3_product_kol3_video3.txt
+
+```
+subject_definitions: <Subject 1> is a feature showcase with star and product. Celebrity explains key features while video shows them in action.
+
+dialogue: 
+<d>[Chinese] 明星讲解：三大功能详解！</d>
+<d>[English] Star explains: Three features detailed!</d>
+```

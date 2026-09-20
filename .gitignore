@@ -1,0 +1,51 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ========== IDE ==========
+.idea/
+.vscode/
+*.iml
+
+# ========== 系统文件 ==========
+.DS_Store
+Thumbs.db
+
+# ========== 日志与输出 ==========
+logs/
+outputs/
+*.log
+
+# ========== 敏感配置（本地配置不上传） ==========
+core/config_local.py
+
+# ========== 业务数据与素材（含商业机密/版权图片） ==========
+*.xlsx
+material/
+
+# ========== 临时调试脚本（仅本地保留） ==========
+/voice_clone.py
+/test_integration.py
+/test_script_extractor.py
+/test_write_to_script.py
+
+# ========== 大体积测试素材 ==========
+test/audios/
+test/videos/
+test/kol/
+test/product/
+test/outputs/
+*.mp4
+*.mp3
+*.wav
+
+# ========== Jupyter ==========
+.ipynb_checkpoints/

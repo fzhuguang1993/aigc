@@ -1,0 +1,41 @@
+# Group 1: 产品图 + KOL 图 (1+1)
+
+## 脚本 1.1: 产品 + 贾乃亮 1
+
+**文件名**: script_1_1_product_kol1.txt
+
+```
+subject_definitions: <Subject 1> is a celebrity endorsement scene featuring the product. The celebrity should hold the product naturally and speak directly to camera with confident expression.
+
+dialogue: 
+<d>[Chinese] 大家好，我是贾乃亮。今天给大家推荐这款产品，非常好用！</d>
+<d>[English] Hello everyone, I'm Jacky. Today I recommend this product, it's very good!</d>
+```
+
+---
+
+## 脚本 1.2: 产品 + 贾乃亮 2
+
+**文件名**: script_1_2_product_kol2.txt
+
+```
+subject_definitions: <Subject 1> is a celebrity endorsement scene featuring the product. The celebrity should present the product professionally with enthusiastic tone.
+
+dialogue: 
+<d>[Chinese] 大家好，我是贾乃亮。这款产品我亲测有效，强烈推荐！</d>
+<d>[English] Hello everyone, I'm Jacky. This product works great, highly recommend!</d>
+```
+
+---
+
+## 脚本 1.3: 产品 + 贾乃亮 3
+
+**文件名**: script_1_3_product_kol3.txt
+
+```
+subject_definitions: <Subject 1> is a celebrity testimonial scene. The celebrity holds the product close to camera and speaks with genuine satisfaction.
+
+dialogue: 
+<d>[Chinese] 大家好，我是贾乃亮。用了这款产品，效果真的不一样！</d>
+<d>[English] Hello everyone, I'm Jacky. After using this product, the results are amazing!</d>
+```

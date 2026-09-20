@@ -1,0 +1,47 @@
+# Group 3: 产品图 + 音频 (1+1)
+
+## 脚本 3.1: 产品 + 音频 1
+
+**文件名**: script_3_1_product_audio1.txt
+
+```
+subject_definitions: <Subject 1> is a product advertisement with voiceover. The product is shown prominently while audio provides commentary.
+
+audio_file: audios/audio_1.mp3
+
+dialogue: 
+<d>[Chinese] 旁白：这款产品是您的最佳选择！</d>
+<d>[English] Voiceover: This product is your best choice!</d>
+```
+
+---
+
+## 脚本 3.2: 产品 + 音频 2
+
+**文件名**: script_3_2_product_audio2.txt
+
+```
+subject_definitions: <Subject 1> is a testimonial video with product focus. Product is displayed while audio shares user experience.
+
+audio_file: audios/audio_2.mp3
+
+dialogue: 
+<d>[Chinese] 旁白：用户一致好评，销量领先！</d>
+<d>[English] Voiceover: Highly rated by users, sales leader!</d>
+```
+
+---
+
+## 脚本 3.3: 产品 + 音频 3
+
+**文件名**: script_3_3_product_audio3.txt
+
+```
+subject_definitions: <Subject 1> is a promotional video featuring the product. Product is highlighted while audio delivers special offer message.
+
+audio_file: audios/audio_3.mp3
+
+dialogue: 
+<d>[Chinese] 旁白：限时优惠，立即购买！</d>
+<d>[English] Voiceover: Limited time offer, buy now!</d>
+```

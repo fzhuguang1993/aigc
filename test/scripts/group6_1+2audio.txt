@@ -1,0 +1,50 @@
+# Group 6: 产品图 + 音频 + 音频 (1+2)
+
+## 脚本 6.1: 产品 + 音频 1 + 音频 2
+
+**文件名**: script_6_1_product_audio1_audio2.txt
+
+```
+subject_definitions: <Subject 1> is a dual voiceover presentation with product focus. Product is displayed prominently while two audio tracks provide complementary information.
+
+audio_files: [audios/audio_1.mp3, audios/audio_2.mp3]
+
+dialogue: 
+<d>[Chinese] 旁白 1：产品介绍</d>
+<d>[Chinese] 旁白 2：用户评价</d>
+<d>[English] VO 1: Product intro | VO 2: User review</d>
+```
+
+---
+
+## 脚本 6.2: 产品 + 音频 2 + 音频 3
+
+**文件名**: script_6_2_product_audio2_audio3.txt
+
+```
+subject_definitions: <Subject 1> is a testimonial combo with product showcase. Product remains visible while audio combines market feedback and promotion.
+
+audio_files: [audios/audio_2.mp3, audios/audio_3.mp3]
+
+dialogue: 
+<d>[Chinese] 旁白 1：市场反馈</d>
+<d>[Chinese] 旁白 2：促销信息</d>
+<d>[English] VO 1: Market feedback | VO 2: Promotion info</d>
+```
+
+---
+
+## 脚本 6.3: 产品 + 音频 1 + 音频 3
+
+**文件名**: script_6_3_product_audio1_audio3.txt
+
+```
+subject_definitions: <Subject 1> is a mixed media ad featuring the product. Product is highlighted while audio delivers benefits message followed by purchase guide.
+
+audio_files: [audios/audio_1.mp3, audios/audio_3.mp3]
+
+dialogue: 
+<d>[Chinese] 旁白 1：产品优势</d>
+<d>[Chinese] 旁白 2：购买引导</d>
+<d>[English] VO 1: Product benefits | VO 2: Purchase guide</d>
+```

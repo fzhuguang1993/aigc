@@ -1,0 +1,47 @@
+# Group 8: 产品图 + KOL 图 + 音频 (1+1+1)
+
+## 脚本 8.1: 产品 + 贾乃亮 1 + 音频 1
+
+**文件名**: script_8_1_product_kol1_audio1.txt
+
+```
+subject_definitions: <Subject 1> is a celebrity voiceover ad with product focus. Celebrity appears on screen while audio provides promotional message.
+
+audio_file: audios/audio_1.mp3
+
+dialogue: 
+<d>[Chinese] 贾乃亮：这款产品太值得购买了！</d>
+<d>[English] Jacky: This product is worth buying!</d>
+```
+
+---
+
+## 脚本 8.2: 产品 + 贾乃亮 2 + 音频 2
+
+**文件名**: script_8_2_product_kol2_audio2.txt
+
+```
+subject_definitions: <Subject 1> is a testimonial with celebrity and audio. Celebrity shares experience while audio reinforces key message.
+
+audio_file: audios/audio_2.mp3
+
+dialogue: 
+<d>[Chinese] 贾乃亮：大家都说好才是真的好！</d>
+<d>[English] Jacky: If everyone says it's good, it really is!</d>
+```
+
+---
+
+## 脚本 8.3: 产品 + 贾乃亮 3 + 音频 3
+
+**文件名**: script_8_3_product_kol3_audio3.txt
+
+```
+subject_definitions: <Subject 1> is a promotional spot with star and product. Celebrity delivers special offer message synchronized with audio.
+
+audio_file: audios/audio_3.mp3
+
+dialogue: 
+<d>[Chinese] 贾乃亮：限时特惠，不要错过！</d>
+<d>[English] Jacky: Limited special offer, don't miss out!</d>
+```

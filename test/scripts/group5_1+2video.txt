@@ -1,0 +1,41 @@
+# Group 5: 产品图 + 视频 + 视频 (1+2)
+
+## 脚本 5.1: 产品 + 视频 1 + 视频 2
+
+**文件名**: script_5_1_product_video1_video2.txt
+
+```
+subject_definitions: <Subject 1> is a multi-scene product showcase with dynamic video backgrounds. Product remains prominent while videos show different usage scenarios.
+
+dialogue: 
+<d>[Chinese] 产品展示：从使用到效果，一目了然！</d>
+<d>[English] Product demo: From usage to results, clear at a glance!</d>
+```
+
+---
+
+## 脚本 5.2: 产品 + 视频 2 + 视频 3
+
+**文件名**: script_5_2_product_video2_video3.txt
+
+```
+subject_definitions: <Subject 1> is a comprehensive tutorial with multiple video clips. Product is featured throughout while videos demonstrate various aspects.
+
+dialogue: 
+<d>[Chinese] 完整教程：三步搞定产品使用！</d>
+<d>[English] Complete tutorial: Master the product in 3 steps!</d>
+```
+
+---
+
+## 脚本 5.3: 产品 + 视频 1 + 视频 3
+
+**文件名**: script_5_3_product_video1_video3.txt
+
+```
+subject_definitions: <Subject 1> is a highlight reel featuring the product. Product is showcased alongside key moments from multiple videos.
+
+dialogue: 
+<d>[Chinese] 精彩集锦：产品亮点全呈现！</d>
+<d>[English] Highlights: All product features showcased!</d>
+```

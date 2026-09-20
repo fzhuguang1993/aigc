@@ -1,0 +1,41 @@
+# Group 2: 产品图 + 视频 (1+1)
+
+## 脚本 2.1: 产品 + 视频 1
+
+**文件名**: script_2_1_product_video1.txt
+
+```
+subject_definitions: <Subject 1> is a product demonstration scene with dynamic video background. The product is prominently displayed while the video shows usage scenarios.
+
+dialogue: 
+<d>[Chinese] 看看这个产品的使用效果，非常简单方便！</d>
+<d>[English] Look at this product's effect, so simple and convenient!</d>
+```
+
+---
+
+## 脚本 2.2: 产品 + 视频 2
+
+**文件名**: script_2_2_product_video2.txt
+
+```
+subject_definitions: <Subject 1> is a product tutorial scene. The product appears in foreground while video demonstrates step-by-step usage.
+
+dialogue: 
+<d>[Chinese] 三分钟学会使用这款产品，超级简单！</d>
+<d>[English] Learn to use this product in 3 minutes, super easy!</d>
+```
+
+---
+
+## 脚本 2.3: 产品 + 视频 3
+
+**文件名**: script_2_3_product_video3.txt
+
+```
+subject_definitions: <Subject 1> is a product feature showcase with video clips. Product is highlighted while video shows key features in action.
+
+dialogue: 
+<d>[Chinese] 这款产品的三大核心功能，让你爱不释手！</d>
+<d>[English] Three core features of this product that you'll love!</d>
+```
