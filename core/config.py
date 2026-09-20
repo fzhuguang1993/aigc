@@ -82,6 +82,34 @@ def _load_local_config():
 ACCOUNTS, USER_NAME = _load_local_config()
 
 # ============================================================
+# 6.1 口播脚本 AI 检测接口（可选，规范卡配套功能用）
+#     不配置也能用：本地规则检测（禁用词/价格口径/必含话术）。
+#     配置后「AI 智能检测」会把 脚本+规范卡+风控政策 发给大模型做语义级审查。
+#     写法一：config.json 加 "script_check": {"enabled": true, "url": "...", "api_key": "...", "model": "..."}
+#     写法二：core/config_local.py 定义 SCRIPT_CHECK = {...}
+# ============================================================
+
+def _load_script_check():
+    if CONFIG_JSON.exists():
+        import json
+        try:
+            data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+            cfg = data.get("script_check") or {}
+            if cfg:
+                return cfg
+        except Exception:
+            pass
+    try:
+        from core.config_local import SCRIPT_CHECK
+        return dict(SCRIPT_CHECK)
+    except Exception:
+        return {}
+
+
+SCRIPT_CHECK = {"enabled": False, "url": "", "api_key": "", "model": "",
+                **_load_script_check()}
+
+# ============================================================
 # 7. 脚本行为
 # ============================================================
 POLL_INTERVAL = 5

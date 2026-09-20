@@ -8,8 +8,9 @@ from datetime import datetime
 from core.setup_wizard import ensure_config
 ensure_config()
 
-from core.config import EXCEL_PATH, ACCOUNTS, DOWNLOAD_DIR, DEFAULT_DURATION, USER_NAME
+from core.config import ACCOUNTS, DOWNLOAD_DIR, DEFAULT_DURATION, USER_NAME
 from core.logger import raw_info, raw_warning
+from store import db
 from registry.manager import health_monitor_worker
 from workers.poll import start_poll_threads
 from console.app import interactive_loop
@@ -20,11 +21,12 @@ current_duration = DEFAULT_DURATION
 
 def main():
     raw_info(f"启动 {datetime.now().isoformat()}")
+    db.init()
     
     # 汇总启动信息为极简格式
     info_parts = [
         f"姓名={USER_NAME or '未配置'}",
-        f"Excel={EXCEL_PATH.split('/')[-1]}",
+        f"数据库={'data/aigc.db'}",
         f"账号={'/'.join([a['name'] for a in ACCOUNTS])}",
         f"下载={DOWNLOAD_DIR.split('/')[-1]}",
         f"时长={current_duration}秒"

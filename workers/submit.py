@@ -3,12 +3,25 @@ worker_submit.py —— 提交逻辑（带背压 + 负载均衡）
 """
 from pathlib import Path
 
-from core.config import MODE, LORA_BY_MODE, REFERENCE_IMAGES, ASSET_DIR, MAX_RETRY, ACCOUNTS as CONFIG_ACCOUNTS, DEFAULT_DURATION, KOL_DIR
+from core.config import MODE, LORA_BY_MODE, ASSET_DIR, MAX_RETRY, ACCOUNTS as CONFIG_ACCOUNTS, DEFAULT_DURATION
 from core.logger import Ctx
 from core.api_client import upload_asset, submit_job
-from utils.excel_utils import load_tasks, update_row, COL_RUNS, COL_STATUS, COL_ACCOUNT, COL_JOB_ID
+from store import task_store, product_store
+from store.task_store import COL_RUNS, COL_STATUS, COL_ACCOUNT, COL_JOB_ID
 from registry.manager import REG, invalidate_load_cache, get_account, pick_account
 from workers.scan import mark_submitted
+
+# 运行时参数（GUI/控制台通过 set_runtime_options 写入，提交时读取）
+# 注意：row_idx 语义已从 Excel 行号改为数据库任务ID
+SELECTED_DURATION = DEFAULT_DURATION
+SELECTED_KOL = None
+
+
+def set_runtime_options(duration=None, kol=None):
+    global SELECTED_DURATION, SELECTED_KOL
+    if duration is not None:
+        SELECTED_DURATION = duration
+    SELECTED_KOL = kol
 
 
 def resolve_path(name):
@@ -16,17 +29,19 @@ def resolve_path(name):
     return p if p.is_absolute() else (Path(ASSET_DIR) / p)
 
 
-def build_payload(base, prompt, ctx, kol=None):
+def build_payload(base, prompt, ctx, kol=None, product=None):
     loras = [LORA_BY_MODE.get(MODE, "")] if LORA_BY_MODE.get(MODE) else []
-    refs = REFERENCE_IMAGES if MODE == "r2v" else []
-    
-    # 添加 KOL 图片（如果选择了）
+    # 参考图：产品中心该品名的图片优先，未建产品时回退旧全局配置
+    refs = product_store.images_for_product(product) if MODE == "r2v" else []
+
+    # 添加 KOL 图片（产品中心登记优先，material/KOL 目录回退）
     if kol:
-        kol_path = f"{KOL_DIR}/{kol}.png"
-        kol_p = Path(kol_path)
-        if kol_p.exists():
+        kol_path = product_store.kol_image(kol)
+        if kol_path:
             refs.append(kol_path)
             ctx.info(f"使用 KOL: {kol}")
+        else:
+            ctx.warning(f"KOL「{kol}」未找到形象图，已忽略")
 
     inputs = {"prompt": prompt}
     ref_ids = []
@@ -44,7 +59,7 @@ def build_payload(base, prompt, ctx, kol=None):
 
     params = {
         "width": 768, "height": 1376,
-        "duration": DEFAULT_DURATION, "seed": -1,
+        "duration": SELECTED_DURATION, "seed": -1,
         "loras": [{"name": n} for n in loras],
     }
     return {"feature": "minimax-h3", "mode": MODE,
@@ -55,15 +70,14 @@ def do_submit(row_idx, product, prompt):
     acc = pick_account()
     ctx = Ctx(row=row_idx, account=acc.name)
 
-    # 从全局变量获取选中的 KOL
-    from console.app import selected_kol
-    kol = selected_kol
+    # 从运行时参数获取选中的 KOL
+    kol = SELECTED_KOL
 
     ctx.debug(f"等待 {acc.name} 信号量（并发={acc.concurrency}）")
     acc.sem.acquire()
     try:
         try:
-            payload = build_payload(acc.base, prompt, ctx, kol)
+            payload = build_payload(acc.base, prompt, ctx, kol, product)
         except Exception as e:
             ctx.error(f"组装 payload 异常：{e}")
             return None, str(e), acc.name
@@ -79,13 +93,15 @@ def do_submit(row_idx, product, prompt):
                     invalidate_load_cache(acc.name)
                     mark_submitted(row_idx)
 
-                    df = load_tasks()
-                    runs = int(df.at[row_idx, COL_RUNS] or 0) + 1
-                    update_row(row_idx,
-                               **{COL_RUNS: runs,
-                                  COL_STATUS: "submitted",
-                                  COL_ACCOUNT: acc.name,
-                                  COL_JOB_ID: job_id})
+                    task = task_store.get_task(row_idx) or {}
+                    runs = int(task.get("runs") or 0) + 1
+                    task_store.update_row(row_idx,
+                                          **{COL_RUNS: runs,
+                                             COL_STATUS: "submitted",
+                                             COL_ACCOUNT: acc.name,
+                                             COL_JOB_ID: job_id})
+                    task_store.record_run_start(row_idx, task.get("num", ""),
+                                                product, acc.name, job_id)
                     return job_id, None, acc.name
                 ctx.error(f"提交失败：{err}")
             except Exception as e:

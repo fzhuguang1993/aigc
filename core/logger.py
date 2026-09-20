@@ -63,7 +63,7 @@ class Ctx:
     def _prefix(self):
         parts = []
         if self.row is not None:
-            parts.append(f"行{self.row + 1}")
+            parts.append(f"任务{self.row}")
         if self.account:
             parts.append(self.account)
         parts.append(self.job_id[:8] if self.job_id else "-")

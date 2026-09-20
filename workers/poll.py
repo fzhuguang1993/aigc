@@ -5,9 +5,11 @@ import time
 import threading
 from pathlib import Path
 
-from core.config import POLL_INTERVAL
-from utils.excel_utils import load_tasks, save_tasks, COL_STATUS, COL_OUTPUT, COL_URL, COL_SUCCESS, COL_CANCEL
-from core.api_client import query_job, get_outputs
+from core.config import POLL_INTERVAL, EXTRACT_SCRIPT_ENABLED, MIN_DURATION_FOR_SCRIPT
+from store import task_store
+from store.task_store import (COL_STATUS, COL_OUTPUT, COL_URL, COL_SUCCESS,
+                              COL_CANCEL, COL_SCRIPT_TEXT)
+from core.api_client import query_job, get_outputs, extract_script
 from core.logger import Ctx, raw_error
 from registry.manager import REG, get_account
 import processors.video_processor as processor
@@ -52,55 +54,50 @@ def poll_worker_for_account(acc_name):
                 last_print[t["job_id"]] = key
 
             if st in {"completed", "failed", "cancelled"}:
-                # 任务完成，汇总处理
-                local_paths, full_urls = [], []
-                summary_parts = [f"{st}"]
-                
+                # 任务终态：回写数据库 + 执行记录
                 if st == "completed":
                     try:
                         outs = get_outputs(acc.base, t["job_id"])
                         local_paths, full_urls = processor.process_outputs(
                             outs, acc.base, t["row_idx"], t["job_id"],
                             t["product"], ctx)
-                        
-                        # 汇总下载信息
-                        download_count = len(local_paths)
-                        
-                        # 回写 Excel
-                        df = load_tasks()
-                        i = t["row_idx"]
-                        df.at[i, COL_STATUS] = str(st)
-                        df.at[i, COL_OUTPUT] = "; ".join(local_paths)
-                        df.at[i, COL_URL] = "; ".join(full_urls)
-                        df.at[i, COL_SUCCESS] = int(df.at[i, COL_SUCCESS] or 0) + 1
-                        save_tasks(df)
-                        
-                        # 一条日志汇总所有信息
-                        summary_parts = [f"{st}"]
-                        summary_parts.append(f"下载{download_count}个")
-                        summary_parts.append("Excel 已回写")
-                        ctx.info(" | ".join(summary_parts))
-                        
+
+                        task_store.update_row(t["row_idx"], **{
+                            COL_STATUS: st,
+                            COL_OUTPUT: "; ".join(local_paths),
+                            COL_URL: "; ".join(full_urls)})
+                        task_store.bump(t["row_idx"], COL_SUCCESS)
+                        task_store.record_run_end(t["job_id"], st,
+                                                  output="; ".join(local_paths))
+
+                        # 时长达标才提取口播（失败静默，不影响主流程）
+                        try:
+                            from workers.submit import SELECTED_DURATION
+                            if EXTRACT_SCRIPT_ENABLED and \
+                                    SELECTED_DURATION >= MIN_DURATION_FOR_SCRIPT:
+                                script, err = extract_script(acc.base, t["prompt"])
+                                if script:
+                                    task_store.update_row(t["row_idx"],
+                                                          **{COL_SCRIPT_TEXT: script})
+                        except Exception:
+                            pass
+
+                        ctx.info(f"{st} | 下载{len(local_paths)}个 | 记录已回写")
                     except Exception as e:
+                        task_store.update_row(t["row_idx"], **{COL_STATUS: "error"})
+                        task_store.record_run_end(t["job_id"], "error", error=str(e))
                         ctx.error(f"下载/处理异常：{e}")
-                        summary_parts.append(f"失败：{e}")
-                        ctx.info(" | ".join(summary_parts))
 
                 elif st == "cancelled":
-                    # 取消任务
-                    df = load_tasks()
-                    i = t["row_idx"]
-                    df.at[i, COL_STATUS] = str(st)
-                    df.at[i, COL_CANCEL] = int(df.at[i, COL_CANCEL] or 0) + 1
-                    save_tasks(df)
-                    summary_parts.append("Excel 已回写")
-                    ctx.info(" | ".join(summary_parts))
+                    task_store.update_row(t["row_idx"], **{COL_STATUS: st})
+                    task_store.bump(t["row_idx"], COL_CANCEL)
+                    task_store.record_run_end(t["job_id"], st)
+                    ctx.info(st)
                 else:  # failed
-                    df = load_tasks()
-                    i = t["row_idx"]
-                    df.at[i, COL_STATUS] = str(st)
-                    save_tasks(df)
-                    ctx.info(" | ".join(summary_parts))
+                    task_store.update_row(t["row_idx"], **{COL_STATUS: st})
+                    task_store.record_run_end(t["job_id"], st,
+                                              error=str(s.get("error", "")))
+                    ctx.info(st)
 
                 REG.remove(t["job_id"])
                 last_print.pop(t["job_id"], None)

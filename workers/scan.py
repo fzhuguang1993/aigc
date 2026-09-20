@@ -1,7 +1,7 @@
 """
-worker_scan.py —— 手动扫描新行
+worker_scan.py —— 手动扫描新行（数据源：SQLite task_store）
 """
-from utils.excel_utils import scan_new_rows as scan_new_rows_impl
+from store.task_store import scan_new_rows as scan_new_rows_impl
 from registry.manager import REG
 
 
@@ -40,5 +40,5 @@ def print_new_rows():
     print(f"\n检测到 {len(rows)} 个新项目：")
     for i, (row_idx, info) in enumerate(rows, 1):
         prompt_short = str(info["提示词"])[:50].replace("\n", " ")
-        print(f"  {i}. 行{row_idx + 1}  品名={info['品名']}  提示词={prompt_short}")
+        print(f"  {i}. 任务{row_idx}  品名={info['品名']}  提示词={prompt_short}")
     return rows

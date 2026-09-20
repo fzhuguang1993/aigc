@@ -32,6 +32,13 @@ config.json
 # ========== 业务数据与素材（含商业机密/版权图片） ==========
 *.xlsx
 material/
+# SQLite 任务数据库（真实业务数据，不入库）
+data/
+# 导入导出产物（任务表/执行记录 Excel）
+exports/
+# 临时诊断输出
+_err.log
+_out.log
 
 # ========== 临时调试脚本（仅本地保留） ==========
 /voice_clone.py

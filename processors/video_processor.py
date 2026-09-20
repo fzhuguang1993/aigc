@@ -6,9 +6,10 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-from core.config import DOWNLOAD_DIR, DEFAULT_PRODUCT
-from utils.excel_utils import load_name_rule, sanitize, build_filename
+from core.config import DOWNLOAD_DIR, DEFAULT_PRODUCT, USER_NAME
+from utils.excel_utils import sanitize, build_filename
 from core.api_client import download_to
+from store import task_store
 
 
 def build_full_url(base, rel_url):
@@ -38,17 +39,18 @@ def download_with_retry(url, save_path, ctx):
 
 
 def process_outputs(outs, base, row_idx, job_id, product, ctx):
-    """处理视频输出，汇总日志"""
-    name = load_name_rule()
+    """处理视频输出，汇总日志（row_idx 现为数据库任务ID）"""
+    name = USER_NAME
     complete_time = datetime.now()
     date_str = complete_time.strftime("%m%d")
 
-    from utils.excel_utils import load_tasks
-    df = load_tasks()
+    task = task_store.get_task(row_idx) or {}
     try:
-        num = int(float(df.at[row_idx, "编号"]))
+        num = int(float(task.get("num") or 0))
     except Exception:
-        num = row_idx + 1
+        num = 0
+    if not num:
+        num = row_idx
 
     items = outs.get("outputs", []) if isinstance(outs, dict) else []
     local_paths, full_urls = [], []
