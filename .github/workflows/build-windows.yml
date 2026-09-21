@@ -1,4 +1,4 @@
-# 推送 tag（如 v1.0.0）或在 Actions 页面手动触发 workflow_dispatch，
+# 推送 tag（如 v1.0.2）或在 Actions 页面手动触发 workflow_dispatch，
 # 云端 windows-latest 自动打包两个 exe，产物在 Summary 页的 artifact「aigc-windows-exe」下载。
 name: Build Windows exe
 
@@ -20,17 +20,35 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt pyinstaller
 
+      # 真实接口凭证不入库（core/config_local.py 已被 gitignore），仓库里只有
+      # 占位符。要把地址/Key 编进分发给同事的 exe，就得在仓库 Settings → Secrets
+      # 里放一份（secret 名 CONFIG_LOCAL_PY）；没配时仍然照常打包，
+      # 只是 exe 里素材提取接口显示“⚠ 未配置”（视频生成不受影响，
+      # 那部分由同事首次启动的向导写 config.json）。
+      - name: Restore local config from secrets
+        shell: bash
+        env:
+          CONFIG_LOCAL_PY: ${{ secrets.CONFIG_LOCAL_PY }}
+        run: |
+          if [ -z "$CONFIG_LOCAL_PY" ]; then
+            echo "::warning::secret CONFIG_LOCAL_PY 未配置：打出的 exe 不内置提取接口地址"
+            printf '# empty stub: CONFIG_LOCAL_PY secret not provided\n' > core/config_local.py
+          else
+            printf '%s\n' "$CONFIG_LOCAL_PY" > core/config_local.py
+            echo "✓ 已写入 core/config_local.py（仅存于构建器，不外泄）"
+          fi
+
       - name: Build GUI (no console)
         run: >
           pyinstaller --noconfirm --onefile --noconsole --name "AIGC视频助手"
           --icon=assets\app.ico --add-data "assets\app.ico;assets"
-          --hidden-import=openpyxl desktop.py
+          --hidden-import=openpyxl --hidden-import=core.config_local desktop.py
 
       - name: Build CLI (console)
         run: >
           pyinstaller --noconfirm --onefile --console --name "AIGC视频助手-命令行"
           --icon=assets\app.ico --add-data "assets\app.ico;assets"
-          --hidden-import=openpyxl main.py
+          --hidden-import=openpyxl --hidden-import=core.config_local main.py
 
       - uses: actions/upload-artifact@v4
         with:
