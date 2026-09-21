@@ -871,7 +871,8 @@ class MaterialPanel(BasePanel):
         outer.addWidget(self.api_base_box)
 
         tip = QLabel("uid/key 与名单变更无需重新打包：改上方配置、重新导入名单即生效；"
-                     "接口地址默认隐藏，需维护人在本页键盘盲输口令才会出现输入框；"
+                     "接口地址默认隐藏，需维护人在本页键盘盲输口令才会出现输入框，"
+                     "填好保存后自动收起（下次再改需重新输口令）；"
                      "文案成功后追加到同目录「文案样本库.csv」（积累样本，后期喂大模型学写脚本）")
         tip.setObjectName("InlineTip")
         outer.addWidget(tip)
@@ -957,8 +958,18 @@ class MaterialPanel(BasePanel):
             QMessageBox.warning(self, "保存失败", str(e))
             return
         self._load_api()
+        # 地址改完立即藏回去：下次再改还得重新盲输口令，避免维护人区一直摊开
+        if self._base_unlocked:
+            self._relock_api_base()
         self._append_log("✓ 接口配置已保存，下次提取立即生效"
-                         + ("（含接口地址）" if base else ""))
+                         + ("（含接口地址，已重新隐藏）" if base else ""))
+
+    def _relock_api_base(self):
+        """收回维护人区：清空密文框、复位口令缓冲，下次须重新盲输口令才出现"""
+        self.ed_api_base.setText("")        # 不把地址残留在控件里
+        self.api_base_box.setVisible(False)
+        self._base_unlocked = False
+        self._key_buf = ""
 
     def _wl_files(self):
         from core.config import API_TEXT_DIR
