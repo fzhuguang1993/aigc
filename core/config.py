@@ -64,6 +64,21 @@ LOG_RETENTION_DAYS = 7
 CONFIG_JSON = RUNTIME_DIR / "config.json"
 
 
+def _normalize_account_base(url):
+    """账号 base 兜底归一化：去尾斜杠、补 /api/v1 后缀。
+    手写/旧版 config.json 常漏后缀，导致 POST 打到服务根路径返回 405。"""
+    url = str(url).strip().rstrip("/")
+    if url and not url.endswith("/api/v1"):
+        url += "/api/v1"
+    return url
+
+
+def _normalized_accounts(accounts):
+    return [{**a, "base": _normalize_account_base(a["base"])}
+            if isinstance(a, dict) and a.get("base") else a
+            for a in accounts]
+
+
 def _load_local_config():
     """返回 (accounts, user_name)"""
     if CONFIG_JSON.exists():
@@ -81,7 +96,8 @@ def _load_local_config():
         return [], ""
 
 
-ACCOUNTS, USER_NAME = _load_local_config()
+_accounts, USER_NAME = _load_local_config()
+ACCOUNTS = _normalized_accounts(_accounts)
 
 # ============================================================
 # 6.1 口播脚本 AI 检测接口（可选，规范卡配套功能用）
