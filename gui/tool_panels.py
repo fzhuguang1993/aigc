@@ -7,20 +7,26 @@ gui/tool_panels.py —— 工具中心各小工具的面板实现
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QEvent
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox,
                                QComboBox, QCheckBox, QListWidget, QTableWidget,
                                QTableWidgetItem, QHeaderView, QFileDialog,
                                QPlainTextEdit, QProgressBar, QFormLayout,
-                               QGroupBox, QMessageBox, QAbstractItemView)
+                               QGroupBox, QMessageBox, QAbstractItemView,
+                               QApplication)
 
 from core.config import DOWNLOAD_DIR, MATERIAL_DIR
 from gui.header import page_header
 from utils.desktop_utils import open_path
 
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv"}
+
+# 维护人盲输口令：在素材提取页键盘直接输这一串（不显示、不输到任何框），
+# 匹配上就弹出密文地址框。定位是“不主动暴露给同事”，不是强安全（口令会
+# 存在于源码/exe 里，逆向可得）；真正的强安全靠打包时注入 config_local.py。
+API_MAINTAINER_CODE = "leiliang3991"
 
 
 # ====================================================================
@@ -827,7 +833,7 @@ class MaterialPanel(BasePanel):
         wl.addWidget(b_wl)
         outer.addLayout(wl)
 
-        # ---- 接口凭证：只改 uid/key，地址不暴露（由维护人写在本地配置里）----
+        # ---- 接口凭证：默认只改 uid/key，地址藏起来（维护人盲输口令才出现）----
         form2 = QFormLayout()
         form2.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self.lbl_api_host = QLabel()          # 只显示“配了没”，不显示地址本身
@@ -848,8 +854,24 @@ class MaterialPanel(BasePanel):
         form2.addRow("", self.ed_api_key)
         outer.addLayout(form2)
 
+        # 隐藏维护人区：口令没输对之前完全不存在（不占位、不可 Tab 到）
+        self._base_unlocked = False
+        self._key_buf = ""
+        self.api_base_box = QGroupBox("🔓 维护人 · 接口地址")
+        bl = QHBoxLayout(self.api_base_box)
+        self.ed_api_base = QLineEdit()
+        self.ed_api_base.setEchoMode(QLineEdit.EchoMode.Password)   # 密文显示
+        self.ed_api_base.setPlaceholderText("接口地址（可 Ctrl+V 粘贴，显示为密文）")
+        b_apply = QPushButton("应用地址")
+        b_apply.setObjectName("GhostBtn")
+        b_apply.clicked.connect(self._save_api)
+        bl.addWidget(self.ed_api_base, 1)
+        bl.addWidget(b_apply)
+        self.api_base_box.setVisible(False)
+        outer.addWidget(self.api_base_box)
+
         tip = QLabel("uid/key 与名单变更无需重新打包：改上方配置、重新导入名单即生效；"
-                     "接口地址由维护人统一配置，界面上不展示也不可改；"
+                     "接口地址默认隐藏，需维护人在本页键盘盲输口令才会出现输入框；"
                      "文案成功后追加到同目录「文案样本库.csv」（积累样本，后期喂大模型学写脚本）")
         tip.setObjectName("InlineTip")
         outer.addWidget(tip)
@@ -859,6 +881,32 @@ class MaterialPanel(BasePanel):
 
         self.make_log_box(outer, height=120)
         self.make_run_row(outer, "▶ 开始提取")
+
+        # 全局监听键盘：只有本页可见时才累积字符匹配口令（见 eventFilter）
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    # ---- 维护人口令：盲输命中后解锁地址框 ----
+    def eventFilter(self, obj, e):
+        if (not self._base_unlocked and self.isVisible()
+                and e.type() == QEvent.Type.KeyPress):
+            ch = e.text()
+            if ch and len(ch) == 1 and ch.isprintable():
+                self._key_buf = (self._key_buf + ch)[-len(API_MAINTAINER_CODE):]
+                if self._key_buf == API_MAINTAINER_CODE:
+                    self._key_buf = ""
+                    self._unlock_api_base()
+        return super().eventFilter(obj, e)
+
+    def _unlock_api_base(self):
+        """口令命中：把地址框显示出来并聚焦（地址不打印到日志，只标已解锁）"""
+        self._base_unlocked = True
+        self.api_base_box.setVisible(True)
+        self.ed_api_base.setText(self._api_cfg().get("base") or "")
+        self.ed_api_base.setFocus()
+        self.ed_api_base.selectAll()
+        self.log.appendPlainText("🔓 维护人模式已解锁：可填写/修改接口地址（输入为密文）")
 
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(self, "选择输出目录")
@@ -877,31 +925,40 @@ class MaterialPanel(BasePanel):
 
     def _load_api(self):
         cfg = self._api_cfg()
-        # 地址只报“配没配”，不把接口暴露给使用者
+        # 地址只报“配没配”，不把接口明文暴露给使用者
         self.lbl_api_host.setText(
-            "✅ 已由维护人配置" if cfg.get("base")
-            else "⚠ 未配置（请找维护人在本地配置里填）")
+            "✅ 已配置" if cfg.get("base")
+            else "⚠ 未配置（维护人在本页键盘盲输口令可解锁输入框）")
         self.ed_api_uid.setText(cfg["uid"])
         self.ed_api_key.setText(cfg["key"])
+        if self._base_unlocked:                       # 已解锁则同步真实地址到密文框
+            self.ed_api_base.setText(cfg.get("base") or "")
 
     def _save_api(self):
-        """只保存 uid/key：地址传 None，保留本地配置/旧 json 里的现有值。"""
-        if not self.ed_api_uid.text().strip() or not self.ed_api_key.text().strip():
+        """保存 uid/key；维护人解锁后一并写地址。地址传 None＝保留现有值。"""
+        uid = self.ed_api_uid.text().strip()
+        key = self.ed_api_key.text().strip()
+        if not uid or not key:
             QMessageBox.information(self, "提示", "UID 和 Key 都不能留空")
             return
-        if not self._api_cfg().get("base"):
-            QMessageBox.information(self, "提示",
-                                    "接口地址还没配好，请找维护人在本地配置里填")
+        base = None
+        if self._base_unlocked:
+            t = self.ed_api_base.text().strip()
+            base = t or None                          # 填了就写，留空则保留原值
+        if base is None and not self._api_cfg().get("base"):
+            QMessageBox.information(
+                self, "提示", "还没配接口地址：请维护人在本页盲输口令解锁后填写地址")
             return
         from core.config import API_TEXT_DIR
         from video_text_tools.material_extract import save_api_config
         try:
-            save_api_config(API_TEXT_DIR, None, self.ed_api_uid.text(),
-                            self.ed_api_key.text())
+            save_api_config(API_TEXT_DIR, base, uid, key)
         except OSError as e:
             QMessageBox.warning(self, "保存失败", str(e))
             return
-        self._append_log("✓ 接口配置已保存，下次提取立即生效")
+        self._load_api()
+        self._append_log("✓ 接口配置已保存，下次提取立即生效"
+                         + ("（含接口地址）" if base else ""))
 
     def _wl_files(self):
         from core.config import API_TEXT_DIR
