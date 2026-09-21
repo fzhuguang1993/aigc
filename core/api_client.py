@@ -31,15 +31,16 @@ def _request(method, url, timeout=30, **kwargs):
 
 
 def upload_asset(base, file_path, asset_type="image"):
+    # 元组超时：连接 10 秒（地址错时快速失败），大文件读取仍给 300 秒
     with open(file_path, "rb") as f:
-        r = _request("POST", f"{base}/assets", timeout=300,
+        r = _request("POST", f"{base}/assets", timeout=(10, 300),
                      params={"asset_type": asset_type}, files={"file": f})
     return r.json()["asset_id"]
 
 
 def submit_job(base, payload):
     """提交生成任务，返回任务 JSON（含 job_id）。失败抛 ApiError。"""
-    return _request("POST", f"{base}/jobs", timeout=60, json=payload).json()
+    return _request("POST", f"{base}/jobs", timeout=(10, 60), json=payload).json()
 
 
 def query_job(base, job_id):
