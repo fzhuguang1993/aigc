@@ -11,8 +11,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-# 必须早于任何 core.* 导入（RUNTIME_DIR 在 config 导入时固化）
-os.environ["AIGC_HOME"] = tempfile.mkdtemp(prefix="aigc_test_")
+# 必须早于任何 core.* 导入（RUNTIME_DIR / CONFIG_DIR 在 config 导入时固化）
+_AIGC_TEST_HOME = tempfile.mkdtemp(prefix="aigc_test_")
+os.environ["AIGC_HOME"] = _AIGC_TEST_HOME
+# 凭证配置家也隔到临时目录，避免测试写到真实 %APPDATA%
+os.environ["AIGC_CONFIG_DIR"] = str(Path(_AIGC_TEST_HOME) / "_config")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest  # noqa: E402

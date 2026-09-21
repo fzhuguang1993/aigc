@@ -130,3 +130,44 @@ def test_range_stats_none_covers_all_history():
         [d["d"] for d in st["daily"]]), "逐日按日期升序"
     assert len(st["daily"]) == 2, "累计口径只列有记录的天，不补几年空白 0"
     assert st["days"] is None
+
+
+# ---------------- 日汇报（今日 vs 昨日、分产品、时长分桶）----------------
+
+def _add_task_with_run(product, duration, status, day):
+    """建一条带时长的任务并追一行当日执行记录（runs 只存执行耗时，
+    视频时长从 tasks.duration join 得到）"""
+    from store import db
+    tid = ts.add_task("1", product, f"提示词_{product}_{day}_{status}_{duration}")
+    ts.update_row(tid, **{"时长": duration})
+    db.execute(
+        "INSERT INTO runs(task_id,num,product,account,job_id,status,started_at)"
+        " VALUES(?,?,?,?,?,?,?)",
+        (tid, "1", product, "acc1", f"j-{product}-{day}-{status}-{duration}",
+         status, f"{day} 10:00:00"))
+    return tid
+
+
+def test_daily_report_stats_buckets_and_mom():
+    from datetime import date, timedelta
+    today = date.today().isoformat()
+    yest = (date.today() - timedelta(days=1)).isoformat()
+
+    # 今日：A 15s 成功 / A 5s 失败 / B 8s 成功 / C 0s(时长未知) 成功
+    _add_task_with_run("A", 15, "completed", today)
+    _add_task_with_run("A", 5, "failed", today)
+    _add_task_with_run("B", 8, "completed", today)
+    _add_task_with_run("C", 0, "completed", today)
+    # 昨日：A 12s 成功 / B 20s 失败
+    _add_task_with_run("A", 12, "completed", yest)
+    _add_task_with_run("B", 20, "failed", yest)
+
+    st = ts.daily_report_stats()
+    assert st["date"] == today
+    assert st["total"] == 4 and st["ok"] == 3          # 含时长未知的 C
+    assert st["y_total"] == 2 and st["y_ok"] == 1
+    assert st["long"] == 1 and st["short"] == 2        # C(0s) 不进任何时长桶
+    assert st["y_long"] == 2 and st["y_short"] == 0
+    prods = {p: (r, o) for p, r, o in st["products"]}
+    assert prods["A"] == (2, 1) and prods["B"] == (1, 1) and prods["C"] == (1, 1)
+    assert st["products"][0][0] == "A", "按运行次数降序，A(2次) 排最前"

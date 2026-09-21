@@ -2,3 +2,4 @@ pandas
 openpyxl
 requests
 PySide6>=6.6
+cryptography>=41.0

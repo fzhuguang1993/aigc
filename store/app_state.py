@@ -7,16 +7,15 @@ store/app_state.py —— 界面偏好的轻量持久化（不进数据库、不
 - 也不能写 config.json：那是使用者手填的接口配置，程序回写容易连带把
   账号地址/key 一起覆盖掉。
 
-存法：RUNTIME_DIR/ui_state.json，写临时文件 + os.replace 原子改名，
+存法：CONFIG_DIR/ui_state.json（隐藏配置家），写临时文件 + os.replace 原子改名，
 避免同时开两个实例时把文件写成半截。
 """
 import json
 import os
-from pathlib import Path
 
-from core.config import RUNTIME_DIR
+from core.config import CONFIG_DIR
 
-STATE_FILE = Path(RUNTIME_DIR) / "ui_state.json"
+STATE_FILE = CONFIG_DIR / "ui_state.json"
 
 
 def _load():

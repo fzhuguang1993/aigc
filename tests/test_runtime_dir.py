@@ -29,7 +29,16 @@ def test_runtime_dir_follows_exe_when_frozen(monkeypatch, tmp_path):
 def test_wizard_and_config_share_one_runtime_dir():
     # 两边各算一套曾经一个跟 cwd、一个跟 exe，导致向导写的配置读不到
     assert config.RUNTIME_DIR is paths.RUNTIME_DIR
+    assert config.CONFIG_DIR is paths.CONFIG_DIR
     assert setup_wizard.CONFIG_JSON == config.CONFIG_JSON
+
+
+def test_credential_configs_all_live_under_config_dir():
+    """凭证类配置（主配置/界面状态/素材接口）都落在隐藏配置家，同一口径。"""
+    from store import app_state
+    assert config.CONFIG_JSON == paths.CONFIG_DIR / "config.json"
+    assert app_state.STATE_FILE.parent == paths.CONFIG_DIR
+    assert Path(config.API_TEXT_DIR) == paths.CONFIG_DIR / "api_text"
 
 
 def test_material_api_defaults_are_empty():

@@ -63,3 +63,7 @@ test/outputs/
 
 # ========== Jupyter ==========
 .ipynb_checkpoints/
+
+# ========== 备份归档（整项目压缩包，不入库） ==========
+*.rar
+*.7z

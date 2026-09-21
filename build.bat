@@ -41,10 +41,12 @@ echo  BUILD OK. Outputs in dist\ :
 echo    AIGC*-GUI exe   (no console window)
 echo    AIGC* CLI exe   (console version)
 echo  To distribute: put the exe together with a material\ folder.
-echo  First run opens a setup dialog (name + API addresses), saved to
-echo  config.json NEXT TO THE EXE (data/, logs/, outputs/ also live there -
-echo  launching from another folder no longer creates a second, empty copy).
-echo  Re-configure: delete config.json next to the exe and start again.
+echo  First run opens a setup dialog (name + API addresses).
+echo  CREDENTIALS (config.json / ui_state.json / api_text) are saved to the
+echo  HIDDEN folder  %%APPDATA%%\AIGC视频助手  (NOT next to the exe).
+echo  Products (data/, logs/, outputs/, material/) still live next to the exe,
+echo  so launching from another folder never creates a second, empty copy.
+echo  Re-configure: delete config.json inside %%APPDATA%%\AIGC视频助手 and restart.
 echo ============================================================
 goto :eof
 

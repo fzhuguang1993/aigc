@@ -24,6 +24,16 @@ def _delta_text(cur, prev, up_is_good=True):
     return f"{arrow} {abs(pct):.0f}% 较上期", good
 
 
+def _mom(cur, prev):
+    """环比昨日：箭头+百分比；昨日为 0 时给文字，避免除零/无穷。"""
+    if prev == 0 and cur == 0:
+        return "持平"
+    if prev == 0:
+        return "昨日无"
+    pct = (cur - prev) / prev * 100
+    return f"{'▲' if pct >= 0 else '▼'}{abs(pct):.0f}%"
+
+
 class DashboardPage(QWidget):
     # None 代表「全部」：从第一条记录累计至今，永不清零
     _RANGES = (1, 7, 14, 30, 90, None)
@@ -50,7 +60,8 @@ class DashboardPage(QWidget):
         head.addWidget(self.cb_range)
         self.b_copy = QPushButton("📋 复制进度汇报")
         self.b_copy.setObjectName("GhostBtn")
-        self.b_copy.setToolTip("把当前时间范围的执行统计复制成文字，直接粘贴到群里/文档里汇报")
+        self.b_copy.setToolTip("把「今日截至目前 vs 昨日」的执行统计复制成文字汇报，"
+                               "含总量/环比、分产品、视频时长（≥10s/<10s）分桶；直接粘贴到群里")
         self.b_copy.clicked.connect(self._copy_report)
         head.addWidget(self.b_copy)
         lay.addLayout(head)
@@ -169,10 +180,9 @@ class DashboardPage(QWidget):
             return "与上期持平", None
         return _delta_text(c, p, up_is_good)
 
-    # ---------- 一键复制进度汇报 ----------
+    # ---------- 一键复制进度汇报（今日截至目前 vs 昨日，不受时间范围选择器影响） ----------
     def _copy_report(self):
         from datetime import datetime
-        days = self._days()
         name, ok = QInputDialog.getText(
             self, "进度汇报", "汇报人姓名：",
             text=getattr(self, "_reporter", "") or USER_NAME or "")
@@ -180,28 +190,40 @@ class DashboardPage(QWidget):
             return                      # 用户取消
         name = name.strip() or USER_NAME or "XX"
         self._reporter = name
-        st = task_store.report_stats(days)
-        scope = self._scope(days)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st = task_store.daily_report_stats()
+        now = datetime.now()
+        date_cn = f"{now.year}年{now.month}月{now.day}日"
+        clock = now.strftime("%H:%M")
 
-        if st["multi"] and st["multi"][0][0] >= 2:
-            multi = "、".join(f"其中{cnt}条跑了{times}次"
-                              for times, cnt in st["multi"] if times >= 2)
-        else:
-            multi = "均为单次执行"
-        if st["total"]:
-            tops, rest = st["products"][:3], st["products"][3:]
-            prod = "，".join(f"{p}占比{cnt / st['total'] * 100:.0f}%"
-                             for p, cnt in tops)
-            if rest:
-                other = sum(cnt for _, cnt in rest)
-                prod += f"，其余{len(rest)}个品占比{other / st['total'] * 100:.0f}%"
-        else:
-            prod = "暂无执行记录"
+        total, okc = st["total"], st["ok"]
+        rate = f"{okc / total * 100:.0f}%" if total else "—"
+        known = st["long"] + st["short"]
+        lp = f"{st['long'] / known * 100:.0f}%" if known else "—"
+        sp = f"{st['short'] / known * 100:.0f}%" if known else "—"
 
-        text = (f"姓名：{name}，截至目前{now}，"
-                f"{'累计' if days is None else scope}执行{st['total']}条，"
-                f"成功{st['ok']}条，{multi}。{prod}。")
+        lines = [
+            "📊 AIGC 数据汇报",
+            f"姓名：{name}",
+            f"日期：{date_cn}（截至目前 {clock}）",
+            "",
+            "【总体】",
+            f"　总运行 {total} 次 ｜ 成功 {okc} 次 ｜ 成功率 {rate}",
+            f"　环比昨日：运行 {_mom(total, st['y_total'])}，成功 {_mom(okc, st['y_ok'])}",
+            "",
+            "【分产品】",
+        ]
+        if st["products"]:
+            for p, runs, oks in st["products"]:
+                lines.append(f"　{p}：跑 {runs} 次，成功 {oks} 次")
+        else:
+            lines.append("　今日暂无执行记录")
+        lines += [
+            "",
+            "【视频时长】",
+            f"　10 秒以上：{st['long']} 条，占比 {lp} ｜ 环比昨日 {_mom(st['long'], st['y_long'])}",
+            f"　10 秒以下：{st['short']} 条，占比 {sp} ｜ 环比昨日 {_mom(st['short'], st['y_short'])}",
+        ]
+        text = "\n".join(lines)
         QGuiApplication.clipboard().setText(text)
         self.b_copy.setText("✓ 已复制到剪切板")
         QTimer.singleShot(2500, lambda: self.b_copy.setText("📋 复制进度汇报"))

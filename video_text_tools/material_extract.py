@@ -121,9 +121,52 @@ def guess_platform(url):
 
 
 # ---------------- 接口配置（地址/uid/key 运行时可换） ----------------
-def resolve_api_config(api_dir, defaults):
+# 接口地址密文存储：用「使用人姓名」(config.USER_NAME) 作盐，PBKDF2-HMAC-SHA256
+# 派生 Fernet 密钥加密 base 后再写盘，api_config.json 里不再躺着明文接口地址。
+# 只有本机 config.json 姓名一致才解得开——拷这份 json 到别的机器/换名即用不了。
+# secret 为空时退回明文（未配置姓名的兜底），旧明文配置也仍可正常读取。
+_ENC_PREFIX = "enc:v1:"
+_KDF_SALT = b"aigc.material.api.v1"
+_KDF_ITERATIONS = 200_000
+
+
+def _fernet(secret):
+    """由使用人姓名派生对称密钥（PBKDF2-HMAC-SHA256 → Fernet）"""
+    import base64
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=_KDF_SALT,
+                     iterations=_KDF_ITERATIONS).derive(str(secret).encode("utf-8"))
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def encrypt_value(plain, secret):
+    """加密单个值；secret 缺失或值已加密则原样返回"""
+    plain = (plain or "").strip()
+    if not secret or not plain or plain.startswith(_ENC_PREFIX):
+        return plain
+    return _ENC_PREFIX + _fernet(secret).encrypt(plain.encode("utf-8")).decode("ascii")
+
+
+def decrypt_value(token, secret):
+    """解密单个值；非密文原样返回；姓名不符/损坏返回空串（按未配置处理）"""
+    token = (token or "").strip()
+    if not token.startswith(_ENC_PREFIX):
+        return token
+    if not secret:
+        return ""
+    try:
+        return _fernet(secret).decrypt(
+            token[len(_ENC_PREFIX):].encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def resolve_api_config(api_dir, defaults, secret=None):
     """生效配置 = api_config.json（工具界面保存）覆盖程序默认值；
-    文件不存在/损坏时原样返回 defaults，不阻断提取。"""
+    文件不存在/损坏时原样返回 defaults，不阻断提取。
+    base 若为密文，用 secret（使用人姓名）解密；解不开就当未配置（保留默认）。"""
     cfg = dict(defaults)
     try:
         j = json.loads((Path(api_dir) / "api_config.json").read_text(encoding="utf-8"))
@@ -131,18 +174,24 @@ def resolve_api_config(api_dir, defaults):
         return cfg
     if not isinstance(j, dict):
         return cfg
-    for k in ("base", "uid", "key"):
+    base = str(j.get("base") or "").strip()
+    if base:
+        base = decrypt_value(base, secret) if base.startswith(_ENC_PREFIX) else base
+        if base:
+            cfg["base"] = base
+    for k in ("uid", "key"):
         v = str(j.get(k) or "").strip()
         if v:
             cfg[k] = v
     return cfg
 
 
-def save_api_config(api_dir, base, uid, key):
+def save_api_config(api_dir, base, uid, key, secret=None):
     """把接口凭证写入 api_config.json（下次提取立即生效）。
 
     base 传 None ＝保留文件里已有的接口地址：界面上不再让人改地址，
-    但旧版本存过的地址不能被这次保存冲掉。"""
+    但旧版本存过的地址不能被这次保存冲掉。
+    给了 secret（使用人姓名）时接口地址以密文落盘；无 secret 则明文兜底。"""
     d = Path(api_dir)
     d.mkdir(parents=True, exist_ok=True)
     f = d / "api_config.json"
@@ -156,7 +205,7 @@ def save_api_config(api_dir, base, uid, key):
     cfg["uid"] = (uid or "").strip()
     cfg["key"] = (key or "").strip()
     if base is not None:
-        cfg["base"] = base.strip().rstrip("/")
+        cfg["base"] = encrypt_value(base.strip().rstrip("/"), secret)
     f.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

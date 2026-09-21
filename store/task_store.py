@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from core.config import RUNTIME_DIR
+from core.config import EXPORT_DIR as EXPORT_DIR_STR
 from store import db
 
 COL_ID = "编号"; COL_PRODUCT = "品名"; COL_PROMPT = "提示词"
@@ -31,7 +31,7 @@ EXPORT_COLUMNS = ["编号", "品名", "提示词", "脚本", "备注", "口播�
                   "状态", "时长", "执行用时", "账号", "job_id",
                   "输出", "URL", "运行次数", "成功次数", "取消次数", "更新时间"]
 
-EXPORT_DIR = RUNTIME_DIR / "exports"
+EXPORT_DIR = Path(EXPORT_DIR_STR)   # 模板/导出目录：可在设置里改，默认运行目录 exports/
 
 
 def _now():
@@ -378,6 +378,62 @@ def report_stats(days=1):
     prods = Counter((r["product"] or "未填品名").strip() or "未填品名" for r in rows)
     return {"total": total, "ok": ok, "multi": dist,
             "products": prods.most_common(), "days": days}
+
+
+def daily_report_stats():
+    """日汇报（今日截至目前 vs 昨日）：总量/成功 + 分产品 + 视频时长分桶。
+
+    时长桶用任务的 tasks.duration（视频秒数）；runs.duration 是执行耗时，不能用。
+    时长未知（<=0）只计总量、不落进两个时长桶。占比分母＝长+短（有明确时长的）。
+    """
+    from collections import defaultdict
+    from datetime import date, timedelta
+    today = date.today().isoformat()
+    yest = (date.today() - timedelta(days=1)).isoformat()
+    rows = db.query(
+        "SELECT substr(r.started_at,1,10) d, r.product product, r.status status,"
+        " COALESCE(t.duration, 0) vdur"
+        " FROM runs r LEFT JOIN tasks t ON t.id = r.task_id"
+        " WHERE substr(r.started_at,1,10) IN (?, ?)", (today, yest))
+
+    def _blank():
+        return {"total": 0, "ok": 0, "long": 0, "short": 0,
+                "products": defaultdict(lambda: [0, 0])}
+    agg = {today: _blank(), yest: _blank()}
+    for r in rows:
+        a = agg.get(r["d"])
+        if a is None:
+            continue
+        a["total"] += 1
+        ok = r["status"] == "completed"
+        if ok:
+            a["ok"] += 1
+        try:
+            vdur = int(r["vdur"] or 0)
+        except (TypeError, ValueError):
+            vdur = 0
+        if vdur >= 10:
+            a["long"] += 1
+        elif vdur > 0:
+            a["short"] += 1
+        p = (r["product"] or "").strip() or "未填品名"
+        slot = a["products"][p]
+        slot[0] += 1
+        if ok:
+            slot[1] += 1
+
+    cur, prev = agg[today], agg[yest]
+    # 分产品：按 运行次数降序 → 成功数降序 → 品名，次数多的排前
+    products = sorted(((p, n[0], n[1]) for p, n in cur["products"].items()),
+                      key=lambda x: (-x[1], -x[2], x[0]))
+    return {
+        "date": today,
+        "total": cur["total"], "ok": cur["ok"],
+        "y_total": prev["total"], "y_ok": prev["ok"],
+        "long": cur["long"], "short": cur["short"],
+        "y_long": prev["long"], "y_short": prev["short"],
+        "products": products,
+    }
 
 
 def export_tasks(fmt="excel", path=None):

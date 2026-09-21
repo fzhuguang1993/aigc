@@ -43,7 +43,8 @@ def test_non_dict_content_is_ignored(tmp_path, monkeypatch):
 
 
 def test_unwritable_path_returns_false(tmp_path, monkeypatch):
-    """写不进去（只读目录等）只返回 False，不抛异常打断界面操作"""
-    monkeypatch.setattr(app_state, "STATE_FILE", tmp_path / "不存在的目录" / "x.json")
-    (tmp_path / "不存在的目录").mkdir(mode=0o500)      # 只读目录，里面建不了文件
+    """写不进去（目标目录位置被普通文件占住等）只返回 False，不抛异常打断界面操作"""
+    blocker = tmp_path / "不存在的目录"
+    blocker.write_text("", encoding="utf-8")   # 用普通文件占住父目录位置，跨平台都写不进去
+    monkeypatch.setattr(app_state, "STATE_FILE", blocker / "x.json")
     assert app_state.set_value("exec_params", {"duration": 5}) is False

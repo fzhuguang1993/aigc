@@ -9,7 +9,40 @@ from pathlib import Path
 #    可用环境变量 AIGC_HOME 显式指定（自动化测试/多实例场景）。
 #    口径单实在 core/paths.py：首次运行向导要赶在 config.json 生成前用同一把尺子。
 # ============================================================
-from core.paths import RUNTIME_DIR  # noqa: E402  (re-export，供历史 `from core.config import RUNTIME_DIR` 使用)
+from core.paths import RUNTIME_DIR, CONFIG_DIR  # noqa: E402  (re-export，供历史 `from core.config import RUNTIME_DIR` 使用)
+
+# ============================================================
+# 0.1 配置家与 config.json 底座（先于目录常量，供各段共用）
+#     凭证类配置落在隐藏目录 CONFIG_DIR（默认 %APPDATA%\AIGC视频助手）。
+# ============================================================
+import json as _json
+
+CONFIG_JSON = CONFIG_DIR / "config.json"
+_JSON_CACHE = None
+
+
+def _json_data():
+    """一次性读取并缓存 config.json 原始 dict，供账号/脚本检测/调度参数/输出目录共用。"""
+    global _JSON_CACHE
+    if _JSON_CACHE is None:
+        data = {}
+        if CONFIG_JSON.exists():
+            try:
+                loaded = _json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception as e:
+                print(f"⚠ config.json 解析失败（{e}），将重新进入配置向导")
+                data = {}
+        _JSON_CACHE = data
+    return _JSON_CACHE
+
+
+def _resolve_dir(key, default):
+    """输出目录 = config.json 的 paths.<key> 覆盖；留空/缺省回退运行目录默认。"""
+    paths = _json_data().get("paths")
+    v = str((paths or {}).get(key, "") if isinstance(paths, dict) else "").strip()
+    return v or default
 
 # ============================================================
 # 1. Excel 文件位置
@@ -44,9 +77,10 @@ COL_NAME = "姓名"
 ASSET_DIR = str(RUNTIME_DIR)
 
 # ============================================================
-# 3. 视频下载目录（运行目录下自动创建 outputs/）
+# 3. 视频下载 / 模板导出目录（默认在运行目录下，可在设置里改到别处）
 # ============================================================
-DOWNLOAD_DIR = str(RUNTIME_DIR / "outputs")
+DOWNLOAD_DIR = _resolve_dir("output", str(RUNTIME_DIR / "outputs"))
+EXPORT_DIR = _resolve_dir("export", str(RUNTIME_DIR / "exports"))
 
 # ============================================================
 # 5. 日志（运行目录下自动创建 logs/）
@@ -58,10 +92,10 @@ LOG_RETENTION_DAYS = 7
 
 # ============================================================
 # 6. 本地用户配置
-#    分发模式：运行目录下的 config.json（首次运行向导自动生成，含姓名与账号接口）
+#    分发模式：隐藏配置家 CONFIG_DIR 下的 config.json（见 0.1，含姓名与账号接口）
 #    开发模式：无 config.json 时回退到 core/config_local.py
+#    （CONFIG_JSON 已在 0.1 定义，此处只保留分段说明）
 # ============================================================
-CONFIG_JSON = RUNTIME_DIR / "config.json"
 
 
 def _normalize_account_base(url):
@@ -82,13 +116,8 @@ def _normalized_accounts(accounts):
 def _load_local_config():
     """返回 (accounts, user_name)"""
     if CONFIG_JSON.exists():
-        import json
-        try:
-            data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
-            return data.get("accounts", []), data.get("user_name", "")
-        except Exception as e:
-            print(f"⚠ config.json 解析失败（{e}），将重新进入配置向导")
-            return [], ""
+        data = _json_data()
+        return data.get("accounts", []), data.get("user_name", "")
     try:
         from core.config_local import ACCOUNTS as _A
         return list(_A), ""
@@ -109,14 +138,9 @@ ACCOUNTS = _normalized_accounts(_accounts)
 
 def _load_script_check():
     if CONFIG_JSON.exists():
-        import json
-        try:
-            data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
-            cfg = data.get("script_check") or {}
-            if cfg:
-                return cfg
-        except Exception:
-            pass
+        cfg = _json_data().get("script_check") or {}
+        if cfg:
+            return cfg
     try:
         from core.config_local import SCRIPT_CHECK
         return dict(SCRIPT_CHECK)
@@ -169,12 +193,8 @@ SUBMIT_JITTER = (0.4, 1.2)
 def _override_from_config_json():
     global SUBMIT_GATE, GATE_WAIT_TIMEOUT, GATE_POLL_INTERVAL
     global LOAD_TIE_BAND, LOAD_CACHE_TTL, JOBS_LIMIT
-    if not CONFIG_JSON.exists():
-        return
-    try:
-        import json
-        data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
-    except Exception:
+    data = _json_data()
+    if not data:
         return
     _vars = {"SUBMIT_GATE": "submit_gate", "GATE_WAIT_TIMEOUT": "gate_wait_timeout",
              "GATE_POLL_INTERVAL": "gate_poll_interval", "LOAD_TIE_BAND": "load_tie_band",
@@ -203,8 +223,8 @@ WIDTH = 768
 HEIGHT = 1376
 SEED = -1
 
-# 参考图片配置
-MATERIAL_DIR = str(RUNTIME_DIR / "material")
+# 参考图片配置（素材目录可在设置里改，默认运行目录 material/）
+MATERIAL_DIR = _resolve_dir("material", str(RUNTIME_DIR / "material"))
 REFERENCE_IMAGES = [
     f"{MATERIAL_DIR}/诺特兰德益生菌.png",
 ]
@@ -255,13 +275,13 @@ DEFAULT_PRODUCT = "未知品名"
 # type=dsp 去水印解析 / type=wenan 文案提取。
 # 接口地址不入库、不进界面：真实值只写在本机 core/config_local.py
 # （已被 .gitignore 忽略，打包 exe 时会被编译进去），戒了“拷仓库就等于拿到接口”。
-# 实际生效值优先读 material/api_text/api_config.json（工具界面“保存接口配置”写入）。
+# 实际生效值优先读 CONFIG_DIR/api_text/api_config.json（工具界面“保存接口配置”写入）。
 # 接口返回的直链域名白名单（video/image.txt）不随代码分发，
 # 由使用者首次使用工具时导入（见 MaterialPanel 引导）。
 MATERIAL_API_BASE = ""
 MATERIAL_API_UID = ""
 MATERIAL_API_KEY = ""
-API_TEXT_DIR = f"{MATERIAL_DIR}/api_text"
+API_TEXT_DIR = str(CONFIG_DIR / "api_text")   # 接口凭证/白名单：随配置进隐藏目录，独立于可搬移的素材目录
 
 # 允许 config_local 同名覆盖（接口地址/key 变更时不必改代码重打包）
 try:

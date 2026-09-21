@@ -107,6 +107,37 @@ def test_resolve_save_api_config(tmp_path):
     assert me.resolve_api_config(tmp_path, defaults) == defaults
 
 
+def test_save_api_config_encrypts_base_with_name(tmp_path):
+    """给了使用人姓名：接口地址以密文落盘，同名才解得开，换名/无密钥回退默认"""
+    import json
+    defaults = {"base": "https://api.default", "uid": "u0", "key": "k0"}
+    me.save_api_config(tmp_path, "https://api.secret/", "u1", "k1", secret="张三")
+    raw = json.loads((tmp_path / "api_config.json").read_text(encoding="utf-8"))
+    # 盘上是密文，绝不允许出现明文地址
+    assert raw["base"].startswith("enc:") and "api.secret" not in raw["base"]
+    # 姓名一致：解得开，末尾斜杠已归一化
+    assert me.resolve_api_config(tmp_path, defaults, secret="张三")["base"] \
+        == "https://api.secret"
+    # 姓名不符 / 不给姓名：解不开 → 回退默认，不泄露
+    assert me.resolve_api_config(tmp_path, defaults, secret="李四")["base"] \
+        == "https://api.default"
+    assert me.resolve_api_config(tmp_path, defaults)["base"] == "https://api.default"
+    # uid/key 仍明文可读（本次只硬防护接口地址）
+    cfg = me.resolve_api_config(tmp_path, defaults, secret="张三")
+    assert cfg["uid"] == "u1" and cfg["key"] == "k1"
+
+
+def test_encrypt_value_roundtrip_and_guards():
+    """encrypt/decrypt 基础契约：无密钥＝明文；非密文原样返回；错密钥解为空串"""
+    assert me.encrypt_value("https://a", "") == "https://a"          # 无姓名→不加密
+    assert me.encrypt_value("", "张三") == ""                        # 空值→原样
+    tok = me.encrypt_value("https://a", "张三")
+    assert tok.startswith("enc:") and me.encrypt_value(tok, "张三") == tok  # 不双重加密
+    assert me.decrypt_value(tok, "张三") == "https://a"
+    assert me.decrypt_value(tok, "李四") == ""                       # 错密钥
+    assert me.decrypt_value("https://plain", "张三") == "https://plain"  # 非密文透传
+
+
 def test_call_parse_api_uses_configured_uid_key(monkeypatch):
     """接口参数来自生效配置（验证 uid/key 替换真的会透传到请求）"""
     seen = {}
@@ -149,7 +180,7 @@ def test_extract_one_full(monkeypatch, tmp_path):
     assert names == ["好物推荐：维生素B族.mp4", "好物推荐：维生素B族.txt",
                      "好物推荐：维生素B族_图1.jpg"]
     assert notes == []
-    assert "每天两条，肠道通畅" in (tmp_path / "好物推荐：维生素B族.txt").read_text()
+    assert "每天两条，肠道通畅" in (tmp_path / "好物推荐：维生素B族.txt").read_text(encoding="utf-8")
 
 
 def test_extract_one_blocks_offlist_domain(monkeypatch, tmp_path):

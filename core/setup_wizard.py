@@ -1,13 +1,14 @@
-"""
+r"""
 setup_wizard.py —— 首次运行配置向导
-在程序运行目录下生成 config.json，之后运行直接读取，不再询问。
-重新配置：删除 config.json 后再启动即可。
+在隐藏配置家 CONFIG_DIR（默认 %APPDATA%\AIGC视频助手）生成 config.json，之后直接读取。
+重新配置：删除该 config.json 后再启动即可。
 """
 import json
 
-from core.paths import RUNTIME_DIR   # 与 core.config.RUNTIME_DIR 同一把尺子
+from core.paths import CONFIG_DIR, ensure_config_home
 
-CONFIG_JSON = RUNTIME_DIR / "config.json"
+ensure_config_home()                     # 保证隐藏配置家已建好（幂等）
+CONFIG_JSON = CONFIG_DIR / "config.json"   # 与 core.config.CONFIG_JSON 同一把尺子
 
 
 def _normalize_base(url):
@@ -86,6 +87,7 @@ def ensure_config():
                          "base": base, "concurrency": 1})
 
     data = {"user_name": user_name, "accounts": accounts}
+    CONFIG_JSON.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                            encoding="utf-8")
     print("\n" + "=" * 52)

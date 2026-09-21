@@ -2,16 +2,28 @@
 gui/pages_settings.py —— 设置（编辑 config.json，保存后需重启软件生效）
 """
 import json
+import os
+from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
-                               QHeaderView, QMessageBox, QCheckBox, QApplication)
+                               QHeaderView, QMessageBox, QCheckBox, QApplication,
+                               QFileDialog, QInputDialog)
 
-from core.config import CONFIG_JSON, USER_NAME, ACCOUNTS, SCRIPT_CHECK
+from core.config import (CONFIG_JSON, USER_NAME, ACCOUNTS, SCRIPT_CHECK,
+                         DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR)
 from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header
+from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT
+
+
+def _same_path(a, b):
+    """判断两个目录字符串是否指向同一处（Windows 忽略大小写/分隔符）。"""
+    return os.path.normcase(os.path.normpath(str(a))) == \
+        os.path.normcase(os.path.normpath(str(b)))
 
 
 class _CheckWorker(QThread):
@@ -91,6 +103,33 @@ class SettingsPage(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
 
+        # ---------- 输出目录：默认隐藏，Alt+R（Mac ⌘+R）口令解锁后才出现（不暴露入口） ----------
+        self._dirs_unlocked = False
+        self.dirs_box = QWidget()
+        dbox = QVBoxLayout(self.dirs_box)
+        dbox.setContentsMargins(0, 0, 0, 0)
+        dbox.setSpacing(8)
+        dbox.addWidget(QLabel("输出目录（留空＝用默认，修改保存后重启生效）："))
+        self._dir_edits = {}
+        for key, label, cur, dft in (
+                ("output", "视频输出", DOWNLOAD_DIR, str(RUNTIME_DIR / "outputs")),
+                ("export", "模板/导出", EXPORT_DIR, str(RUNTIME_DIR / "exports")),
+                ("material", "素材目录", MATERIAL_DIR, str(RUNTIME_DIR / "material"))):
+            r = QHBoxLayout()
+            r.addWidget(QLabel(label + "："))
+            ed = QLineEdit("" if _same_path(cur, dft) else cur)
+            ed.setPlaceholderText("默认：" + dft)
+            ed.setProperty("default", dft)
+            b = QPushButton("浏览…")
+            b.setObjectName("GhostBtn")
+            b.clicked.connect(lambda _=False, e=ed: self._pick_dir(e))
+            r.addWidget(ed, 1)
+            r.addWidget(b)
+            dbox.addLayout(r)
+            self._dir_edits[key] = ed
+        self.dirs_box.setVisible(False)
+        lay.addWidget(self.dirs_box)
+
         lay.addWidget(QLabel("API 服务地址（一个地址 = 一个账号，双击单元格可编辑）："))
         self.acc_table = QTableWidget(0, 3)
         self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数"])
@@ -155,8 +194,41 @@ class SettingsPage(QWidget):
         crow.addWidget(self.ed_ai_model)
         lay.addLayout(crow)
 
+        # 维护人入口：Alt+R（Mac ⌘+R）唤出口令框，验证通过才显示「输出目录」；
+        # 仅当停在设置页时激活（show/hideEvent 开关），避免别处误触。
+        self._sc_dirs = QShortcut(QKeySequence(MAINTAINER_SHORTCUT), self)
+        self._sc_dirs.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._sc_dirs.activated.connect(self._summon_dirs)
+        self._sc_dirs.setEnabled(False)
+
     def refresh(self):
         pass  # 不自动覆盖用户正在编辑的内容
+
+    # ---------- 维护人入口：口令解锁隐藏的「输出目录」 ----------
+    def _summon_dirs(self):
+        if self._dirs_unlocked:               # 已展开则不重复要口令
+            return
+        code, ok = QInputDialog.getText(self, "维护人验证", "请输入维护人口令：",
+                                        QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        if code == API_MAINTAINER_CODE:
+            self.dirs_box.setVisible(True)
+            self._dirs_unlocked = True
+        else:
+            QMessageBox.warning(self, "口令错误", "维护人口令不正确")
+
+    def _relock_dirs(self):
+        self.dirs_box.setVisible(False)
+        self._dirs_unlocked = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sc_dirs.setEnabled(True)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._sc_dirs.setEnabled(False)
 
     # ---------- 数据装载 ----------
     def _load_current(self):
@@ -176,6 +248,12 @@ class SettingsPage(QWidget):
         r = self.acc_table.currentRow()
         if r >= 0:
             self.acc_table.removeRow(r)
+
+    def _pick_dir(self, ed):
+        start = ed.text().strip() or ed.property("default") or str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, "选择目录", start)
+        if d:
+            ed.setText(d)
 
     def _rows(self):
         out = []
@@ -268,6 +346,18 @@ class SettingsPage(QWidget):
             "api_key": self.ed_ai_key.text().strip(),
             "model": self.ed_ai_model.text().strip(),
         }
+        # 输出目录：只存与默认不同的自定义值；全空则删除 paths 键（回到默认）
+        paths = {}
+        for key, ed in self._dir_edits.items():
+            v = ed.text().strip()
+            if v and not _same_path(v, ed.property("default")):
+                paths[key] = v
+        if paths:
+            data["paths"] = paths
+        else:
+            data.pop("paths", None)
         CONFIG_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                encoding="utf-8")
+        if self._dirs_unlocked:            # 保存后收回隐藏，下次再改需重新按口令
+            self._relock_dirs()
         QMessageBox.information(self, "已保存", "设置已保存，重启软件后生效")
