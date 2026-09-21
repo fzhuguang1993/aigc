@@ -12,18 +12,24 @@ from core.config import RUNTIME_DIR
 from store import db
 
 COL_ID = "编号"; COL_PRODUCT = "品名"; COL_PROMPT = "提示词"
+COL_SCRIPT = "脚本"; COL_STORYBOARD = "分镜数"
 COL_STATUS = "状态"; COL_ACCOUNT = "账号"; COL_JOB_ID = "job_id"
 COL_OUTPUT = "输出"; COL_URL = "URL"; COL_DURATION = "时长"
 COL_RUNS = "运行次数"; COL_SUCCESS = "成功次数"; COL_CANCEL = "取消次数"
 COL_SCRIPT_TEXT = "口播文案"; COL_UPDATED = "更新时间"
 
-_CN2DB = {"编号": "num", "品名": "product", "提示词": "prompt", "状态": "status",
-          "账号": "account", "job_id": "job_id", "输出": "output", "URL": "url",
+_CN2DB = {"编号": "num", "品名": "product", "提示词": "prompt",
+          "脚本": "script", "分镜数": "storyboard",
+          "状态": "status", "账号": "account", "job_id": "job_id",
+          "输出": "output", "URL": "url",
           "运行次数": "runs", "成功次数": "success", "取消次数": "cancels",
-          "口播文案": "script_text", "更新时间": "updated_at", "时长": "duration"}
+          "口播文案": "script_text", "更新时间": "updated_at", "时长": "duration",
+          "备注": "remark"}
 
-EXPORT_COLUMNS = ["编号", "品名", "提示词", "状态", "时长", "执行用时", "账号", "job_id",
-                  "输出", "URL", "运行次数", "成功次数", "取消次数", "口播文案", "更新时间"]
+# 全字段导出（与导入模板列对齐，方便导出→修改→再导入闭环）
+EXPORT_COLUMNS = ["编号", "品名", "提示词", "脚本", "备注", "口播文案", "分镜数",
+                  "状态", "时长", "执行用时", "账号", "job_id",
+                  "输出", "URL", "运行次数", "成功次数", "取消次数", "更新时间"]
 
 EXPORT_DIR = RUNTIME_DIR / "exports"
 
@@ -54,14 +60,20 @@ def list_tasks_df():
     for cn, en in _CN2DB.items():
         df[cn] = df[en]
     text_cols = [c for c in df.columns
-                 if c not in ("id", "runs", "success", "cancels", "duration", "_id")]
+                 if c not in ("id", "runs", "success", "cancels", "duration",
+                              "storyboard", "_id", "分镜数")]
     if len(df):
         df[text_cols] = df[text_cols].fillna("").astype(str)
     df["_id"] = df["id"]
-    # 派生列：最后一次有用时的执行的耗时（秒）
-    durs = {r["task_id"]: int(r["duration"] or 0) for r in db.query(
-        "SELECT task_id, duration FROM runs WHERE duration > 0 AND id IN "
-        "(SELECT MAX(id) FROM runs GROUP BY task_id)")}
+    # 派生列：执行用时（秒）——优先取最近一次成功执行，没有成功过再取最近终态
+    durs = {}
+    for sql in (
+            "SELECT task_id, duration FROM runs WHERE status='completed' AND duration > 0 "
+            "AND id IN (SELECT MAX(id) FROM runs WHERE status='completed' GROUP BY task_id)",
+            "SELECT task_id, duration FROM runs WHERE duration > 0 AND status!='running' "
+            "AND id IN (SELECT MAX(id) FROM runs WHERE status!='running' GROUP BY task_id)"):
+        for r in db.query(sql):
+            durs.setdefault(r["task_id"], int(r["duration"] or 0))
     df["执行用时"] = [int(durs.get(i, 0)) for i in df["_id"]] if len(df) \
         else pd.Series([], dtype=int)
     return df
@@ -72,11 +84,24 @@ def get_task(task_id):
     return rows[0] if rows else None
 
 
-def add_task(num, product, prompt):
+def filter_choices():
+    """筛选下拉的候选值（任务多了光靠搜索拦不住）。"""
+    def _distinct(col):
+        vals = {(r[col] or "").strip() for r in
+                db.query(f"SELECT DISTINCT {col} FROM tasks")}
+        vals.discard("")
+        return sorted(vals)
+    return {"products": _distinct("product"), "scripts": _distinct("script"),
+            "remarks": _distinct("remark")}
+
+
+def add_task(num, product, prompt, script="", script_text="", storyboard=0, remark=""):
+    """新建任务。品名/脚本允许为空（通版素材不关联任何产品/脚本）"""
     return db.execute(
-        "INSERT INTO tasks(num, product, prompt, updated_at, prompt_changed_at) "
-        "VALUES(?,?,?,?,?)",
-        (str(num), product, prompt, _now(), _now_precise()))
+        "INSERT INTO tasks(num, product, prompt, script, script_text, storyboard, "
+        "remark, updated_at, prompt_changed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (str(num), product, prompt, script, script_text, int(storyboard or 0),
+         remark, _now(), _now_precise()))
 
 
 def update_row(task_id, **fields):
@@ -163,6 +188,22 @@ def record_run_end(job_id, status, output="", error=""):
                (status, now, dur, output, error, job_id))
 
 
+def attach_run_result(job_id, output=None, error=None):
+    """终态打点之后补录产物/错误（如生成结束后才完成的下载），
+    不改 finished_at/duration，保证“执行用时”不被后置动作污染。"""
+    sets, args = [], []
+    if output is not None:
+        sets.append("output=?")
+        args.append(output)
+    if error is not None:
+        sets.append("error=?")
+        args.append(error)
+    if not sets:
+        return
+    args.append(job_id)
+    db.execute(f"UPDATE runs SET {','.join(sets)} WHERE job_id=?", args)
+
+
 def list_runs(limit=1000):
     return db.query("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))
 
@@ -170,31 +211,51 @@ def list_runs(limit=1000):
 # ---------------- 导入 / 导出 ----------------
 
 def import_from_excel(path, sheet="Sheet"):
-    """把任务 Excel 导入数据库（列：编号/品名/提示词）。
+    """把任务 Excel 导入数据库（全字段：编号/品名/提示词/脚本/口播文案/分镜数）。
 
+    品名/脚本允许留空（通版素材不关联产品/脚本）。
     按提示词去重：与库中已有任务、文件内部重复的提示词都不再追加。
-    返回 (导入条数, 跳过重复条数)。
+    返回 (导入条数, 跳过重复条数, 本次文件涉及的任务ID列表)——第三项除新建任务外，
+    也包含提示词已在库里而被跳过的旧任务，上传旧提示词时也能直接定位到那批任务。
     """
     df = pd.read_excel(path, sheet_name=sheet)
-    existing = {(r["prompt"] or "").strip()
-                for r in db.query("SELECT prompt FROM tasks")}
+    by_prompt = {}
+    for r in db.query("SELECT id, prompt FROM tasks"):
+        by_prompt.setdefault((r["prompt"] or "").strip(), r["id"])
     seen = set()
     count = dup = 0
+    hit_ids = []
     for _, row in df.iterrows():
         prompt = str(row.get("提示词", "") or "").strip()
         if not prompt or prompt in ("nan", "None"):
             continue
-        if prompt in existing or prompt in seen:
+        if prompt in by_prompt or prompt in seen:
             dup += 1
+            old = by_prompt.get(prompt)
+            if old is not None and int(old) not in hit_ids:
+                hit_ids.append(int(old))      # 旧提示词早就在库里：一样定位
             continue
         seen.add(prompt)
-        add_task(row.get("编号", ""), str(row.get("品名", "") or ""), prompt)
+
+        def _s(col):
+            v = str(row.get(col, "") or "").strip()
+            return "" if v in ("nan", "None") else v
+
+        try:
+            story = int(float(row.get("分镜数", 0) or 0))
+        except (TypeError, ValueError):
+            story = 0
+        tid = add_task(row.get("编号", ""), _s("品名"), prompt, script=_s("脚本"),
+                       script_text=_s("口播文案"), storyboard=story,
+                       remark=_s("备注"))
+        if tid:
+            hit_ids.append(int(tid))
         count += 1
-    return count, dup
+    return count, dup, hit_ids
 
 
 def write_import_template(path=None):
-    """生成批量导入模板（带示例行，提示词支持单元格内换行），返回文件路径"""
+    """生成批量导入模板（全字段，带示例行，提示词支持单元格内换行），返回文件路径"""
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     if not path:
         path = str(EXPORT_DIR / "导入模板.xlsx")
@@ -202,16 +263,25 @@ def write_import_template(path=None):
         {"编号": 1, "品名": "示例-诺特兰德益生菌",
          "提示词": "第一行：场景描述（例：明亮客厅，男明星手持产品）\n"
                   "第二行：动作/口播内容（例：对镜头说：每天一条，肠道通畅）\n"
-                  "第三行：镜头/字幕要求（例：产品logo特写，字幕：久坐党必备）"},
-        {"编号": 2, "品名": "示例-品名写法自由",
-         "提示词": "删掉示例行，一行一个提示词，直接从第三行开始填写即可。"},
+                  "第三行：镜头/字幕要求（例：产品logo特写，字幕：久坐党必备）",
+         "脚本": "自定义脚本（人物/场景/分镜拆解等，自己填）\n"
+                "口播文案不用写：执行时自动从提示词识别",
+         "备注": "任务多了随手标一句：已过审 / 待重拍 / 只发视频号…（可导入可导出）",
+         "口播文案": "", "分镜数": ""},
+        {"编号": 2, "品名": "",   # 品名可留空：通版素材不关联产品
+         "提示词": "工厂流水线空镜，传送带特写，无产品。品名/脚本都可留空。",
+         "脚本": "", "备注": "", "口播文案": "", "分镜数": ""},
+        {"编号": 3, "品名": "示例-手写口播",
+         "提示词": "对镜头说：\"换季免疫力，每天两粒\"，字幕同步。",
+         "脚本": "一个脚本可绑多条提示词：导入后用任务中心「批量绑定脚本」统一关联",
+         "备注": "", "口播文案": "换季免疫力，每天两粒", "分镜数": 3},
     ])
     with pd.ExcelWriter(path, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="Sheet")
         ws = w.sheets["Sheet"]
-        ws.column_dimensions["A"].width = 8
-        ws.column_dimensions["B"].width = 24
-        ws.column_dimensions["C"].width = 90
+        for col, width in (("A", 8), ("B", 22), ("C", 60), ("D", 36),
+                           ("E", 24), ("F", 24), ("G", 8)):
+            ws.column_dimensions[col].width = width
     return path
 
 
@@ -231,16 +301,24 @@ def _sum_row(rows):
 
 
 def range_stats(days=7):
-    """BI 看板数据：近 N 天汇总 + 环比上 N 天 + 逐日明细（缺失日补 0）+ 线路分布"""
+    """BI 看板数据：近 N 天汇总 + 环比上 N 天 + 逐日明细（缺失日补 0）+ 线路分布
+
+    days=None 代表「全部」：从第一条记录累计至今（永不清零）。
+    没有上一个等长周期可比，prev 全 0，看板据此隐掉环比。"""
     from datetime import date, timedelta
-    today = date.today()
-    cur_start = (today - timedelta(days=days - 1)).isoformat()
-    prev_start = (today - timedelta(days=2 * days - 1)).isoformat()
+    today = date.today().isoformat()
+    t0 = "0000-01-01"
+    if days is None:
+        cur_start, prev_start = t0, None
+    else:
+        cur_start = (date.today() - timedelta(days=days - 1)).isoformat()
+        prev_start = (date.today() - timedelta(days=2 * days - 1)).isoformat()
 
     cur = _sum_row(db.query(_RANGE + " >= ? AND substr(started_at,1,10) <= ?",
-                            (cur_start, today.isoformat())))
-    prev = _sum_row(db.query(_RANGE + " >= ? AND substr(started_at,1,10) < ?",
-                             (prev_start, cur_start)))
+                            (cur_start, today)))
+    prev = (_sum_row(db.query(_RANGE + " >= ? AND substr(started_at,1,10) < ?",
+                             (prev_start, cur_start))) if prev_start
+            else {"total": 0, "ok": 0, "fail": 0, "cancel": 0, "avg_dur": 0})
     running = db.query("SELECT COUNT(*) c FROM runs WHERE status='running'")[0]["c"]
 
     daily_rows = db.query(
@@ -250,12 +328,22 @@ def range_stats(days=7):
         " FROM runs WHERE substr(started_at,1,10) >= ? GROUP BY d", (cur_start,))
     by_day = {r["d"]: r for r in daily_rows}
     daily = []
-    for i in range(days - 1, -1, -1):
-        d = (today - timedelta(days=i)).isoformat()
-        r = by_day.get(d, {})
-        daily.append({"d": d, "total": int(r.get("total") or 0),
-                      "ok": int(r.get("ok") or 0), "fail": int(r.get("fail") or 0),
-                      "cancel": int(r.get("cancel") or 0)})
+    if days is None:
+        # 累计口径下把每一天都补零会拉出一条长空白：只列有记录的那些天
+        # （图轴取最近 60 个有记录日，再多就不好看也不需要）
+        for d in sorted(by_day)[-60:]:
+            r = by_day[d]
+            daily.append({"d": d, "total": int(r.get("total") or 0),
+                          "ok": int(r.get("ok") or 0),
+                          "fail": int(r.get("fail") or 0),
+                          "cancel": int(r.get("cancel") or 0)})
+    else:
+        for i in range(days - 1, -1, -1):
+            d = (date.today() - timedelta(days=i)).isoformat()
+            r = by_day.get(d, {})
+            daily.append({"d": d, "total": int(r.get("total") or 0),
+                          "ok": int(r.get("ok") or 0), "fail": int(r.get("fail") or 0),
+                          "cancel": int(r.get("cancel") or 0)})
 
     accounts = db.query(
         "SELECT account, COUNT(*) total, SUM(status='completed') ok"
@@ -269,11 +357,14 @@ def range_stats(days=7):
 
 
 def report_stats(days=1):
-    """进度汇报用：区间内执行总量/成功数 + 每条任务执行次数分布 + 品名占比"""
+    """进度汇报用：区间内执行总量/成功数 + 每条任务执行次数分布 + 品名占比
+
+    days=None ＝全部历史累计（汇报口径变成“累计”）。"""
     from collections import Counter
     from datetime import date, timedelta
     end = date.today().isoformat()
-    start = (date.today() - timedelta(days=days - 1)).isoformat()
+    start = "0000-01-01" if days is None else \
+        (date.today() - timedelta(days=days - 1)).isoformat()
     rows = db.query(
         "SELECT COALESCE(NULLIF(num, ''), 'task:' || task_id) k,"
         " product, status FROM runs"

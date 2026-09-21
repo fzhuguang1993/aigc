@@ -16,8 +16,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPlainTextEdit, QProgressBar, QFormLayout,
                                QGroupBox, QMessageBox, QAbstractItemView)
 
-from core.config import DOWNLOAD_DIR
+from core.config import DOWNLOAD_DIR, MATERIAL_DIR
 from gui.header import page_header
+from utils.desktop_utils import open_path
 
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv"}
 
@@ -767,6 +768,252 @@ class TracePanel(BasePanel):
 
 
 # ====================================================================
+# 7. 素材提取（分享链接 → 去水印视频/图集/文案）
+# ====================================================================
+class MaterialPanel(BasePanel):
+    """合并自原「文案提取/视频提取」两个预留接口：一条链接同时拿
+    去水印成品与文案。直链域名白名单读 material/api_text/ 外部文件，
+    每次执行重新加载——CDN 域名变了只需换 txt，不用改代码。"""
+
+    def _build(self, outer):
+        outer.addWidget(page_header("素材提取",
+                                    "粘贴唞喑/筷手分享文案（可多行批量）：一键提取去水印视频、图集、文案",
+                                    icon="🧲"))
+
+        self.ed_input = QPlainTextEdit()
+        self.ed_input.setPlaceholderText(
+            "每行一条分享文案，链接会自动识别，例如：\n"
+            "7.99 复制打开抖音，看看作品 https://v.douyin.com/xxxx/\n"
+            "https://www.kuaishou.com/f/xxxx")
+        self.ed_input.setFixedHeight(96)
+        outer.addWidget(self.ed_input)
+
+        row = QHBoxLayout()
+        self.ck_video = QCheckBox("去水印视频")
+        self.ck_video.setChecked(True)
+        self.ck_text = QCheckBox("文案")
+        self.ck_text.setChecked(True)
+        self.ck_images = QCheckBox("图集")
+        self.ck_images.setChecked(True)
+        row.addWidget(self.ck_video)
+        row.addWidget(self.ck_text)
+        row.addWidget(self.ck_images)
+        row.addStretch(1)
+        b_open = QPushButton("📂 打开输出目录")
+        b_open.setObjectName("GhostBtn")
+        b_open.clicked.connect(lambda: open_path(self.ed_out.text().strip()))
+        row.addWidget(b_open)
+        outer.addLayout(row)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.ed_out = QLineEdit(str(Path(MATERIAL_DIR) / "素材提取"))
+        b = QPushButton("浏览…")
+        b.setObjectName("GhostBtn")
+        b.clicked.connect(self._pick_out)
+        r2 = QHBoxLayout()
+        r2.addWidget(self.ed_out, 1)
+        r2.addWidget(b)
+        form.addRow("保存到：", r2)
+        outer.addLayout(form)
+
+        # ---- 域名白名单：由使用者首次使用时导入，不随代码分发 ----
+        wl = QHBoxLayout()
+        self.lbl_wl = QLabel()                      # 实时状态：已导入(条数)/未导入
+        b_wl = QPushButton("📤 导入/更新域名名单")
+        b_wl.setObjectName("GhostBtn")
+        b_wl.clicked.connect(self._import_lists)
+        wl.addWidget(self.lbl_wl, 1)
+        wl.addWidget(b_wl)
+        outer.addLayout(wl)
+
+        # ---- 接口凭证：只改 uid/key，地址不暴露（由维护人写在本地配置里）----
+        form2 = QFormLayout()
+        form2.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.lbl_api_host = QLabel()          # 只显示“配了没”，不显示地址本身
+        self.lbl_api_host.setStyleSheet("font-size:12px; color:#646A73;"
+                                        " background:transparent;")
+        self.ed_api_uid = QLineEdit()
+        self.ed_api_key = QLineEdit()
+        self.ed_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        b_save = QPushButton("💾 保存接口配置")
+        b_save.setObjectName("GhostBtn")
+        b_save.clicked.connect(self._save_api)
+        r3 = QHBoxLayout()
+        r3.addWidget(b_save)
+        r3.addStretch(1)
+        form2.addRow("接口地址：", self.lbl_api_host)
+        form2.addRow("UID：", self.ed_api_uid)
+        form2.addRow("Key：", r3)
+        form2.addRow("", self.ed_api_key)
+        outer.addLayout(form2)
+
+        tip = QLabel("uid/key 与名单变更无需重新打包：改上方配置、重新导入名单即生效；"
+                     "接口地址由维护人统一配置，界面上不展示也不可改；"
+                     "文案成功后追加到同目录「文案样本库.csv」（积累样本，后期喂大模型学写脚本）")
+        tip.setObjectName("InlineTip")
+        outer.addWidget(tip)
+
+        self._load_api()                            # 生效值 = api_config.json > 程序默认
+        self._refresh_wl()
+
+        self.make_log_box(outer, height=120)
+        self.make_run_row(outer, "▶ 开始提取")
+
+    def _pick_out(self):
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if d:
+            self.ed_out.setText(d)
+
+    # ---- 接口配置与白名单维护 ----
+    def _api_cfg(self):
+        """当前生效的接口配置（工具界面保存的 json 覆盖程序默认值）"""
+        from core.config import (MATERIAL_API_BASE, MATERIAL_API_UID,
+                                 MATERIAL_API_KEY, API_TEXT_DIR)
+        from video_text_tools.material_extract import resolve_api_config
+        return resolve_api_config(API_TEXT_DIR, {"base": MATERIAL_API_BASE,
+                                                 "uid": MATERIAL_API_UID,
+                                                 "key": MATERIAL_API_KEY})
+
+    def _load_api(self):
+        cfg = self._api_cfg()
+        # 地址只报“配没配”，不把接口暴露给使用者
+        self.lbl_api_host.setText(
+            "✅ 已由维护人配置" if cfg.get("base")
+            else "⚠ 未配置（请找维护人在本地配置里填）")
+        self.ed_api_uid.setText(cfg["uid"])
+        self.ed_api_key.setText(cfg["key"])
+
+    def _save_api(self):
+        """只保存 uid/key：地址传 None，保留本地配置/旧 json 里的现有值。"""
+        if not self.ed_api_uid.text().strip() or not self.ed_api_key.text().strip():
+            QMessageBox.information(self, "提示", "UID 和 Key 都不能留空")
+            return
+        if not self._api_cfg().get("base"):
+            QMessageBox.information(self, "提示",
+                                    "接口地址还没配好，请找维护人在本地配置里填")
+            return
+        from core.config import API_TEXT_DIR
+        from video_text_tools.material_extract import save_api_config
+        try:
+            save_api_config(API_TEXT_DIR, None, self.ed_api_uid.text(),
+                            self.ed_api_key.text())
+        except OSError as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+            return
+        self._append_log("✓ 接口配置已保存，下次提取立即生效")
+
+    def _wl_files(self):
+        from core.config import API_TEXT_DIR
+        d = Path(API_TEXT_DIR)
+        return d / "video.txt", d / "image.txt"
+
+    def _refresh_wl(self):
+        from video_text_tools.material_extract import load_allowed_hosts
+        fv, fi = self._wl_files()
+        nv = len(load_allowed_hosts(fv)) if fv.exists() else -1
+        ni = len(load_allowed_hosts(fi)) if fi.exists() else -1
+        def fmt(n):
+            return "未导入" if n < 0 else ("空!" if n == 0 else f"{n} 条")
+        ok = nv > 0 and ni > 0
+        self.lbl_wl.setText(
+            f"{'✅' if ok else '⚠️'} 直链域名白名单：视频 {fmt(nv)} · 图片 {fmt(ni)}"
+            "（下载的直链只认名单内域名）")
+        self.lbl_wl.setStyleSheet(
+            "font-size:12px; color:#00A870; background:transparent;" if ok else
+            "font-size:12px; color:#D83931; background:transparent;")
+
+    def _import_lists(self):
+        """依次导入两份名单（复制为规范文件名）；中途取消则保留已导入的"""
+        import shutil
+        fv, fi = self._wl_files()
+        for dst, label in ((fv, "视频短链域名名单"), (fi, "图片短链域名名单")):
+            src, _ = QFileDialog.getOpenFileName(
+                self, f"选择{label} txt（一行一个域名，取消则跳过）",
+                str(Path.home()), "文本文件 (*.txt);;所有文件 (*)")
+            if not src:
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+            except OSError as e:
+                QMessageBox.warning(self, "导入失败", f"{label}：{e}")
+                break
+        self._refresh_wl()
+
+    def _task(self):
+        from video_text_tools import material_extract as me
+        urls = me.extract_share_urls(self.ed_input.toPlainText())
+        if not urls:
+            QMessageBox.information(self, "提示", "没找到有效的分享链接，请检查粘贴内容")
+            return None
+        if not (self.ck_video.isChecked() or self.ck_text.isChecked()
+                or self.ck_images.isChecked()):
+            QMessageBox.information(self, "提示", "请至少勾选一种要提取的内容")
+            return None
+        out_dir = Path(self.ed_out.text().strip() or str(Path(MATERIAL_DIR) / "素材提取"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        corpus = out_dir / "文案样本库.csv"      # 追加式样本库，跨批次沉淀
+        want = (self.ck_video.isChecked(), self.ck_text.isChecked(),
+                self.ck_images.isChecked())
+
+        # 首次使用引导：白名单缺失/为空时提醒导入（名单不随代码分发，由使用者上传）
+        fv, fi = self._wl_files()
+        if want[0] or want[2]:
+            missing = [n for n, f in (("视频", fv), ("图片", fi))
+                       if not me.load_allowed_hosts(f)]
+            if missing:
+                r = QMessageBox.question(
+                    self, "导入直链域名白名单",
+                    "尚未导入有效的域名白名单（" + "、".join(missing) + "）。\n"
+                    "没有名单时下载不做域名限制，不安全也不推荐。\n\n现在导入吗？")
+                if r == QMessageBox.StandardButton.Yes:
+                    self._import_lists()
+                    if [n for n, f in (("视频", fv), ("图片", fi))
+                            if not me.load_allowed_hosts(f)]:
+                        return None          # 仍未导入齐：回去补，不带着风险跑
+
+        cfg = self._api_cfg()                # 启动前固化配置快照，透传功能层
+
+        def fn(log, progress, should_stop):
+            from core.config import API_TEXT_DIR
+            # 每次执行重读白名单：重新导入后立即生效
+            hosts_v = me.load_allowed_hosts(Path(API_TEXT_DIR) / "video.txt")
+            hosts_i = me.load_allowed_hosts(Path(API_TEXT_DIR) / "image.txt")
+            if not hosts_v:
+                log("⚠ 视频域名名单为空：本次不做视频域名限制")
+            saved, fails = [], 0
+            for i, u in enumerate(urls):
+                if should_stop():
+                    log("⏹ 已停止")
+                    break
+                log(f"[{i + 1}/{len(urls)}] {u}")
+                try:
+                    files, notes = me.extract_one(
+                        u, cfg["base"], cfg["uid"], cfg["key"],
+                        out_dir, hosts_v, hosts_i,
+                        want_video=want[0], want_text=want[1], want_images=want[2],
+                        corpus_file=corpus if want[1] else None,
+                        log=log, should_stop=should_stop)
+                    saved += files
+                    for n in notes:
+                        log(f"  ⚠ {n}")
+                except Exception as e:
+                    fails += 1
+                    log(f"  ✗ 失败：{e}")
+                progress(i + 1, len(urls), "")
+            return {"saved": saved, "fails": fails, "total": len(urls)}
+        return fn
+
+    def on_result(self, res):
+        if isinstance(res, dict):
+            self._append_log(f"提取完成：落盘 {len(res['saved'])} 个文件，"
+                             f"失败 {res['fails']}/{res['total']} 条 → {self.ed_out.text()}")
+            if res["saved"]:
+                open_path(self.ed_out.text())
+
+
+# ====================================================================
 # 面板登记表（pages_tools 按名称取 factory）
 # ====================================================================
 def _safe_factory(builder):
@@ -787,4 +1034,5 @@ PANEL_FACTORIES = {
     "批量粘贴录入": _safe_factory(BatchInputPanel),
     "SMB 上传": _safe_factory(SmbPanel),
     "视频溯源": _safe_factory(TracePanel),
+    "素材提取": _safe_factory(MaterialPanel),
 }

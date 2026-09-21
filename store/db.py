@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS tasks(
   output TEXT DEFAULT '', url TEXT DEFAULT '',
   runs INTEGER DEFAULT 0, success INTEGER DEFAULT 0, cancels INTEGER DEFAULT 0,
   script_text TEXT DEFAULT '', updated_at TEXT DEFAULT '',
-  duration INTEGER DEFAULT 0, prompt_changed_at TEXT DEFAULT ''
+  duration INTEGER DEFAULT 0, prompt_changed_at TEXT DEFAULT '',
+  script TEXT DEFAULT '', storyboard INTEGER DEFAULT 0,
+  remark TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS runs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +53,10 @@ _MIGRATIONS = (
     "ALTER TABLE tasks ADD COLUMN duration INTEGER DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN prompt_changed_at TEXT DEFAULT ''",
     "ALTER TABLE runs ADD COLUMN duration INTEGER DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN script TEXT DEFAULT ''",
+    "ALTER TABLE tasks ADD COLUMN storyboard INTEGER DEFAULT 0",
+    # 备注：使用者自己标的管理记号（“已过审”“待重拍”…），不参与业务逻辑
+    "ALTER TABLE tasks ADD COLUMN remark TEXT DEFAULT ''",
 )
 
 

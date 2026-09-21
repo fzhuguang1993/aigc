@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QComboBox, QPushButton, QSizePolicy, QInputDialog)
 
 from core.config import USER_NAME
-from store import task_store
+from store import app_state, task_store
 from gui.header import page_header, Card, KpiCard
 from gui.widgets import LoadingOverlay
 from gui.charts import TrendChart, DonutChart, HBarChart, C_OK, C_OK2, C_FAIL, C_FAIL2, C_CANCEL, C_CANCEL2
@@ -25,6 +25,9 @@ def _delta_text(cur, prev, up_is_good=True):
 
 
 class DashboardPage(QWidget):
+    # None 代表「全部」：从第一条记录累计至今，永不清零
+    _RANGES = (1, 7, 14, 30, 90, None)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
@@ -36,9 +39,14 @@ class DashboardPage(QWidget):
         head.addWidget(page_header("数据看板", "执行量 · 成功率 · 趋势 · 线路分布"), 1)
         head.addWidget(QLabel("时间范围"))
         self.cb_range = QComboBox()
-        self.cb_range.addItems(["今日", "近 7 天", "近 14 天", "近 30 天", "近 90 天"])
-        self.cb_range.setCurrentIndex(1)
-        self.cb_range.currentIndexChanged.connect(self.refresh)
+        self.cb_range.addItems(["今日", "近 7 天", "近 14 天", "近 30 天",
+                                "近 90 天", "全部（累计）"])
+        # 记住上次选的范围：不记就会“看累计→重启→又回到近 7 天”，
+        # 数字变少会被当成“统计清零了”（先设值再接信号，避免构造时触发 refresh）
+        saved = app_state.get("dash_range")
+        self.cb_range.setCurrentIndex(saved if isinstance(saved, int)
+                                      and 0 <= saved < len(self._RANGES) else 1)
+        self.cb_range.currentIndexChanged.connect(self._on_range)
         head.addWidget(self.cb_range)
         self.b_copy = QPushButton("📋 复制进度汇报")
         self.b_copy.setObjectName("GhostBtn")
@@ -88,31 +96,46 @@ class DashboardPage(QWidget):
         self._loading = LoadingOverlay(self)
 
     def _days(self):
-        return [1, 7, 14, 30, 90][self.cb_range.currentIndex()]
+        return self._RANGES[self.cb_range.currentIndex()]
+
+    def _on_range(self):
+        app_state.set_value("dash_range", self.cb_range.currentIndex())
+        self.refresh()
+
+    @staticmethod
+    def _scope(days):
+        return ("累计（全部）" if days is None
+                else "今日" if days == 1 else f"近 {days} 天")
 
     def refresh(self):
         st = task_store.range_stats(self._days())
         self._st = st
         cur, prev = st["cur"], st["prev"]
         days = st["days"]
-        scope = "今日" if days == 1 else f"近 {days} 天"
+        scope = self._scope(days)
+        cum = days is None        # 累计口径没有“上一个等长周期”，环比全部隐掉
 
-        self.k_total.set_value(cur["total"], *self._cmp(cur["total"], prev["total"], True))
-        self.k_ok.set_value(cur["ok"], *self._cmp(cur["ok"], prev["ok"], True))
+        def cmp(c, p, up_is_good):
+            return ("累计至今", None) if cum else self._cmp(c, p, up_is_good)
+
+        self.k_total.set_value(cur["total"], *cmp(cur["total"], prev["total"], True))
+        self.k_ok.set_value(cur["ok"], *cmp(cur["ok"], prev["ok"], True))
         dt, up = _delta_text(round(cur["rate"]), round(prev["rate"]), True) \
             if prev["total"] else ("", None)
-        self.k_rate.set_value(f"{cur['rate']}%", dt if prev["total"] else
-                              ("—" if not cur["total"] else "全部基于本期"), up)
-        self.k_fail.set_value(cur["fail"], *self._cmp(cur["fail"], prev["fail"], False))
-        self.k_cancel.set_value(cur["cancel"], *self._cmp(cur["cancel"], prev["cancel"], False))
+        self.k_rate.set_value(f"{cur['rate']}%", "累计至今" if cum else
+                              (dt if prev["total"] else
+                               ("—" if not cur["total"] else "全部基于本期")), up)
+        self.k_fail.set_value(cur["fail"], *cmp(cur["fail"], prev["fail"], False))
+        self.k_cancel.set_value(cur["cancel"], *cmp(cur["cancel"], prev["cancel"], False))
         run = st["running"]
         self.k_run.set_value(run, "云端生成中" if run else "空闲")
         # 成功执行的平均用时（秒），与上期对比，越短越好
         avg_c, avg_p = cur.get("avg_dur") or 0, prev.get("avg_dur") or 0
         dt, up = _delta_text(round(avg_c), round(avg_p), False) if avg_p else ("", None)
         self.k_dur.set_value(f"{avg_c:.0f}秒" if avg_c else "—",
-                             dt if (avg_p and avg_c) else
-                             ("—" if not avg_c else "均基于本期"), up)
+                             "累计至今" if cum else
+                             (dt if (avg_p and avg_c) else
+                              ("—" if not avg_c else "均基于本期")), up)
 
         self.trend.title = f"每日执行趋势 · {scope}（成功/失败/取消 堆叠）"
         self.trend.set_data(st["daily"])
@@ -158,7 +181,7 @@ class DashboardPage(QWidget):
         name = name.strip() or USER_NAME or "XX"
         self._reporter = name
         st = task_store.report_stats(days)
-        scope = "今日" if days == 1 else f"近 {days} 天"
+        scope = self._scope(days)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if st["multi"] and st["multi"][0][0] >= 2:
@@ -177,7 +200,8 @@ class DashboardPage(QWidget):
             prod = "暂无执行记录"
 
         text = (f"姓名：{name}，截至目前{now}，"
-                f"{scope}执行{st['total']}条，成功{st['ok']}条，{multi}。{prod}。")
+                f"{'累计' if days is None else scope}执行{st['total']}条，"
+                f"成功{st['ok']}条，{multi}。{prod}。")
         QGuiApplication.clipboard().setText(text)
         self.b_copy.setText("✓ 已复制到剪切板")
         QTimer.singleShot(2500, lambda: self.b_copy.setText("📋 复制进度汇报"))

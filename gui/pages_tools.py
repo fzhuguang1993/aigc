@@ -6,9 +6,9 @@ gui/pages_tools.py —— 工具中心
   2. 在下方 TOOLS 里加一条卡片信息（factory 传 None 显示为「规划中」）。
 功能逻辑一律放 video_text_tools 包（纯功能、无 UI），本层只做界面。
 """
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                               QScrollArea, QSizePolicy, QDialog)
+                               QScrollArea, QSizePolicy, QDialog, QGridLayout)
 
 from gui.header import page_header
 from gui.tool_panels import PANEL_FACTORIES
@@ -21,9 +21,12 @@ TOOLS = [
     ("批量粘贴录入", "⌨", "剪贴板多行文本逐行自动粘贴（需辅助功能授权）", "批量粘贴录入"),
     ("SMB 上传", "📤", "成品视频批量上传到公司共享盘（需配置服务器账号）", "SMB 上传"),
     ("视频溯源", "🔎", "溯源码池取码、按规则重命名并入库（需内网 MySQL）", "视频溯源"),
+    ("素材提取", "🧲", "粘贴唞喑/筷手分享链接：提取去水印视频、图集、文案", "素材提取"),
     ("素材瘦身", "🗜", "把参考图批量压缩到接口要求的大小，避免上传失败", None),
     ("文案查重", "🔍", "提示词相似度检查，防止一批任务生成的视频互相雷同", None),
 ]
+
+CARD_W, CARD_H, GRID_GAP = 250, 150, 14
 
 
 class ToolCard(QWidget):
@@ -105,21 +108,43 @@ class ToolsPage(QWidget):
         area.setWidgetResizable(True)
         area.setStyleSheet("QScrollArea { border:none; background:transparent; }")
         holder = QWidget()
-        grid = QHBoxLayout(holder)
-        grid.setSpacing(14)
-        grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        # 网格排版：按窗口宽度自动换行（以前是一整排 QHBoxLayout，卡片多了一行不换行）
+        self._grid = QGridLayout(holder)
+        self._grid.setSpacing(GRID_GAP)
+        self._grid.setContentsMargins(4, 8, 4, 8)
+        self._cards = []
+        self._cols = 0
         for name, icon, desc, fac_name in TOOLS:
             factory = PANEL_FACTORIES.get(fac_name) if fac_name else None
             card = ToolCard(name, icon, desc, factory, self._open)
             card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            grid.addWidget(card)
-        grid.addStretch(1)
+            self._cards.append(card)
         area.setWidget(holder)
+        self._area = area
         lay.addWidget(area, 1)
+        QTimer.singleShot(0, self._relayout)      # 首次显示按实际宽度排一次
 
         tip = QLabel("有想要的实用小工具？告诉维护人，排期上架～")
         tip.setObjectName("PageTip")
         lay.addWidget(tip)
+
+    def _relayout(self):
+        """卡片按视口宽度自动分列，放不下一行就换行"""
+        w = self._area.viewport().width()
+        cols = max(1, (w - 8 + GRID_GAP) // (CARD_W + GRID_GAP))
+        if cols == self._cols:
+            return
+        self._cols = cols
+        while self._grid.count():
+            self._grid.takeAt(0)               # 只移布局项，卡片控件仍由 self._cards 持有
+        for i, card in enumerate(self._cards):
+            self._grid.addWidget(card, i // cols, i % cols,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._grid.setRowStretch(self._grid.rowCount(), 1)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        QTimer.singleShot(0, self._relayout)   # 防抖：拖拽窗口时合并重排
 
     def _open(self, card):
         """点击卡片：已有窗口则前置，否则新建"""

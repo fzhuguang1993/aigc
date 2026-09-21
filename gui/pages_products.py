@@ -225,6 +225,7 @@ class ProductsPage(QWidget):
 
     def rebuild(self, keep=None):
         cur = keep if keep is not None else self.current_id()
+        exp = self._expanded_roles()        # 记住重建前的展开态，重建后恢复
         self.tree.blockSignals(True)
         self.tree.clear()
         for ptype, glabel in [(ps.TYPE_PRODUCT, "📦 产品"), (ps.TYPE_KOL, "🎤 KOL 形象")]:
@@ -249,17 +250,42 @@ class ProductsPage(QWidget):
                         fn.setData(0, Qt.ItemDataRole.UserRole, ("file", p["id"], kind, fpath))
                         fn.setToolTip(0, "双击预览 · 右键更多操作")
                         kn.addChild(fn)
-            root.setExpanded(len(items) <= 6)
+                node.setExpanded(("item", p["id"]) in exp)
+            # 首次构建无展开记录：产品少时默认展开方便浏览；
+            # 有过记录则完全尊重用户状态（否则规范卡关回来后树会“收缩且展不开”）
+            if not exp:
+                root.setExpanded(len(items) <= 6)
+            else:
+                root.setExpanded(("root", ptype) in exp)
         self.tree.blockSignals(False)
-        # 恢复选中
+        # 恢复选中，并把选中节点的整条祖先链展开（定时重建后视图不“丢”）
         if cur is not None:
             node = self._find_item(cur)
             if node:
                 self.tree.setCurrentItem(node)
+                it = node.parent()              # 只展开祖先链；节点自身收起状态尊重用户
+                while it is not None:
+                    it.setExpanded(True)
+                    it = it.parent()
                 if self.tree.currentItem() is None:   # blockSignals 期间不触发 _on_pick
                     self._show_detail(ps.get_product(cur))
         elif self.tree.topLevelItemCount():
             self.tree.expandAll()
+
+    def _expanded_roles(self):
+        """收集当前树里处于展开态的节点 role（root/item），用于重建后恢复"""
+        out = set()
+
+        def walk(it):
+            for i in range(it.childCount()):
+                ch = it.child(i)
+                if ch.isExpanded():
+                    role = ch.data(0, Qt.ItemDataRole.UserRole)
+                    if role and role[0] in ("root", "item"):
+                        out.add(tuple(role))
+                walk(ch)
+        walk(self.tree.invisibleRootItem())
+        return out
 
     def _find_item(self, pid):
         def walk(it):

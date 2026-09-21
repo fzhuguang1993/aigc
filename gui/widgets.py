@@ -132,10 +132,11 @@ def _highlight_cjk_html(text):
 
 
 class HoverPreview(QScrollArea):
-    """悬停预览浮层：限宽自动换行、超长可滚动、保留原文换行排版。
+    """全文预览浮层：限宽自动换行、超长可滚动、保留原文换行排版。
 
-    防抖隐藏：鼠标从单元格移向浮层时会短暂离开表格，hide_soon() 延时检查，
-    只要光标在浮层内或 keep_rect（表格区域）内就保持显示。
+    两种模式：
+    - 钉住（show_pinned）：单击/空格唤起，Popup 模式抓取键盘，任意键关闭、点其它地方也关闭；
+    - 悬停（show_at + hide_soon）：保留旧延时防抖机制，钉住模式下不生效。
     """
 
     WIDTH = 460
@@ -164,6 +165,7 @@ class HoverPreview(QScrollArea):
         self.setFixedWidth(self.WIDTH)
         self.setMaximumHeight(self.MAX_H)
         self._keep_rect = None                             # 全局坐标：视为“未离开”的区域
+        self._pinned = False                # 钉住模式（单击/空格唤起）中
         self._hide_timer = QTimer(self)                    # 延时隐藏检查
         self._hide_timer.setSingleShot(True)
         self._hide_timer.setInterval(self.HIDE_DELAY)
@@ -172,10 +174,11 @@ class HoverPreview(QScrollArea):
     def set_keep_rect(self, rect):
         self._keep_rect = rect
 
-    def show_at(self, text, pos, rich_text=False):
-        if not text or not text.strip():
-            self.hide()
-            return
+    @property
+    def pinned(self):
+        return self._pinned
+
+    def _render(self, text, rich_text):
         self._hide_timer.stop()
         if rich_text:
             # 富文本：中文字高亮，换行用 <br> 还原
@@ -187,11 +190,36 @@ class HoverPreview(QScrollArea):
         self.label.adjustSize()
         h = min(self.label.sizeHint().height() + 24, self.MAX_H)
         self.setFixedHeight(h)
+
+    def show_pinned(self, text, pos, rich_text=True):
+        """单击/空格唤起：钉住显示，任意键关闭（Popup 模式自带键盘抓取）"""
+        if not text or not text.strip():
+            self.hide()
+            return
+        self._pinned = True
+        self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._render(text, rich_text)
+        self.move(self.clamp_to_screen(pos))
+        self.show()
+        self.setFocus()                         # Popup 模式下确保键盘事件进浮层
+
+    def show_at(self, text, pos, rich_text=False):
+        if not text or not text.strip():
+            self.hide()
+            return
+        if self._pinned:
+            return                              # 已钉住：悬停不覆盖正在阅读的内容
+        if self.windowFlags() & Qt.WindowType.Popup:
+            # 上一次钉住关闭后恢复 ToolTip 标志（不抢焦点、不自动关闭）
+            self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self._render(text, rich_text)
         self.move(self.clamp_to_screen(pos))
         self.show()
 
     def hide_soon(self):
-        """不立即隐藏：给鼠标留出移入浮层的时间"""
+        """不立即隐藏：给鼠标留出移入浮层的时间；钉住模式不打扰"""
+        if self._pinned:
+            return
         if self.isVisible():
             self._hide_timer.start()
 
@@ -205,7 +233,19 @@ class HoverPreview(QScrollArea):
 
     def hide(self):
         self._hide_timer.stop()
+        was_pinned = self._pinned
+        self._pinned = False
         super().hide()
+        if was_pinned:
+            # 恢复 ToolTip 标志，不影响下次悬停模式
+            self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+
+    def keyPressEvent(self, e):
+        if self._pinned:
+            e.accept()
+            self.hide()          # 钉住模式下：再按任意键关闭
+            return
+        super().keyPressEvent(e)
 
     def clamp_to_screen(self, pos):
         """防止浮层超出屏幕右侧/底部"""

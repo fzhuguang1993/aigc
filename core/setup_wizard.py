@@ -4,11 +4,10 @@ setup_wizard.py —— 首次运行配置向导
 重新配置：删除 config.json 后再启动即可。
 """
 import json
-import os
-from pathlib import Path
 
-# 与 core.config 的 RUNTIME_DIR 保持一致（支持 AIGC_HOME 环境变量覆盖）
-CONFIG_JSON = Path(os.environ.get("AIGC_HOME") or Path.cwd()) / "config.json"
+from core.paths import RUNTIME_DIR   # 与 core.config.RUNTIME_DIR 同一把尺子
+
+CONFIG_JSON = RUNTIME_DIR / "config.json"
 
 
 def _normalize_base(url):
@@ -57,7 +56,7 @@ def ensure_config():
 
     print("=" * 52)
     print("  欢迎使用 AIGC 视频生成助手 —— 首次运行配置")
-    print("  （配置将保存到当前目录 config.json，之后无需再填）")
+    print(f"  （配置将保存到 {CONFIG_JSON}，之后无需再填）")
     print("=" * 52)
 
     user_name = ""

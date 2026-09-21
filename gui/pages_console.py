@@ -12,7 +12,6 @@ from gui.header import page_header
 
 HEADERS = ["账号", "线路状态", "接口地址", "并发上限", "本地进行中", "剩余槽位",
            "健康检查连败", "云端负载(实时)"]
-_RUN_STATES = ("queued", "running", "starting")
 
 
 class ConsolePage(QWidget):
@@ -28,7 +27,8 @@ class ConsolePage(QWidget):
                                   icon="📡"), 1)
         b_cloud = QPushButton("🔄 查询云端负载")
         b_cloud.setObjectName("GhostBtn")
-        b_cloud.setToolTip("向每条线路查询云端进行中任务数（结果缓存约 5 秒，接口关闭时显示为 -）")
+        b_cloud.setToolTip("向每条线路查询云端进行中任务数（结果缓存约 5 秒）；"
+                           "接口不可用时降级为仅本机计数，并标⚠提醒")
         b_cloud.clicked.connect(self._fetch_cloud)
         top.addWidget(b_cloud)
         lay.addLayout(top)
@@ -53,18 +53,26 @@ class ConsolePage(QWidget):
         self._cloud = {}   # name -> 云端负载 or None
 
     def refresh(self):
-        from registry.manager import ACCOUNTS, REG
+        from registry.manager import ACCOUNTS, REG, is_active
         rows = REG.active()
         self.table.setRowCount(len(ACCOUNTS))
         sum_run = 0
         for i, acc in enumerate(ACCOUNTS):
             run = sum(1 for t in rows if t["account"] == acc.name
-                      and t["status"] in _RUN_STATES)
+                      and is_active(t["status"]))
             sum_run += run
             cloud = self._cloud.get(acc.name)
+            if cloud is None:
+                cloud_txt, cloud_tip = "-", "尚未查询"
+            else:
+                load, src = cloud
+                cloud_txt = str(load) if src == "cloud" else f"{load} ⚠仅本机"
+                cloud_tip = ("含同事提交的任务" if src == "cloud" else
+                             "云端负载接口不可用，此数只统计了本机，"
+                             "看不到同事占了多少——选线会失真")
             vals = [acc.name, "🟢 正常" if acc.healthy else "🔴 故障", acc.base,
                     acc.concurrency, run, max(acc.concurrency - run, 0),
-                    acc.fail_count, "-" if cloud is None else cloud]
+                    acc.fail_count, cloud_txt]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
                 if c != 2:
@@ -73,18 +81,24 @@ class ConsolePage(QWidget):
                     item.setForeground(QColor("#1FA45C" if acc.healthy else "#E5484D"))
                 if c == 5 and int(v) == 0:
                     item.setForeground(QColor("#F5A623"))
+                if c == 7:
+                    item.setToolTip(cloud_tip)
+                    if cloud and cloud[1] != "cloud":
+                        item.setForeground(QColor("#E5484D"))
                 self.table.setItem(i, c, item)
+        degraded = sum(1 for v in self._cloud.values() if v and v[1] != "cloud")
         self.lbl_sum.setText(
             f"全部线路合计：本地进行中 {sum_run} 条 · "
-            f"健康线路 {sum(1 for a in ACCOUNTS if a.healthy)}/{len(ACCOUNTS)}")
+            f"健康线路 {sum(1 for a in ACCOUNTS if a.healthy)}/{len(ACCOUNTS)}"
+            + (f" · ⚠ {degraded} 条线路云端接口不可用，负载仅含本机" if degraded else ""))
 
     def _fetch_cloud(self):
-        """手动拉取云端负载（含 HTTP，接口关闭时快速失败显示 -）"""
-        from registry.manager import ACCOUNTS, get_account_load, invalidate_load_cache
+        """手动拉取云端负载（含 HTTP）；接口不可达时返回降级值并标记来源"""
+        from registry.manager import ACCOUNTS, measure_load, invalidate_load_cache
         invalidate_load_cache()
         for acc in ACCOUNTS:
             try:
-                self._cloud[acc.name] = get_account_load(acc)
+                self._cloud[acc.name] = measure_load(acc)
             except Exception:
                 self._cloud[acc.name] = None
         self.refresh()

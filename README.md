@@ -140,10 +140,13 @@ python main.py
 
 ### 关键约定
 
-- 所有数据路径基于**运行目录**（可用 `AIGC_HOME` 环境变量覆盖，默认 `Path.cwd()`），打包分发零改路径
+- 所有数据路径基于**运行目录**：打包版＝exe 所在目录，开发版＝仓库根（可用 `AIGC_HOME` 环境变量覆盖）。
+  故意**不用 `Path.cwd()`**——换目录启动会另建一份空库，看着像“统计不持久化”
 - `config.json` 加载优先级：运行目录 `config.json` → `core/config_local.py`
-- `core/__init__.py` 保持为空导入（避免在向导生成配置前缓存空配置）
-- 敏感信息（接口地址）只存在本地 `config.json` / `config_local.py`，均已 gitignore
+- `core/__init__.py` 保持为空导入（避免在向导生成配置前缓存空配置）；
+  运行目录口径单独放 `core/paths.py`，让向导与 config 用同一把尺子
+- 敏感信息（接口地址、素材解析 API 的 base/uid/key）只存在本地
+  `config.json` / `core/config_local.py`，均已 gitignore；**打包机必须有 `config_local.py`**
 - 提交选项通过 `SubmitOptions` 显式传参，worker 层禁止模块级可变全局态
 - 全部回退（fallback）链路与错误处理约定见 [docs/design-conventions.md](docs/design-conventions.md)
 

@@ -265,7 +265,7 @@ def handle_import_excel():
     from core.config import EXCEL_PATH
     path = safe_input(f"Excel 路径（回车使用默认 {EXCEL_PATH}）：").strip() or EXCEL_PATH
     try:
-        n, dup = task_store.import_from_excel(path)
+        n, dup, _hit_ids = task_store.import_from_excel(path)
         msg = f"✓ 已导入 {n} 条任务到数据库"
         if dup:
             msg += f"；跳过重复 {dup} 条（提示词已存在）"

@@ -5,15 +5,38 @@ import time
 import threading
 from pathlib import Path
 
-from core.config import POLL_INTERVAL, EXTRACT_SCRIPT_ENABLED, MIN_DURATION_FOR_SCRIPT
+from core.config import POLL_INTERVAL
 from store import task_store
-from store.task_store import (COL_STATUS, COL_OUTPUT, COL_URL, COL_SUCCESS,
-                              COL_CANCEL, COL_SCRIPT_TEXT)
+from store.task_store import COL_STATUS, COL_OUTPUT, COL_URL, COL_SUCCESS, COL_CANCEL
 from core.api_client import query_job, get_outputs
-from processors.script_extractor import extract_script_from_prompt
 from core.logger import Ctx, raw_error
 from registry.manager import REG, get_account
 import processors.video_processor as processor
+
+
+def _finalize_completed(acc, t):
+    """生成完成后下载产物并回写任务表。耗时大头（下载）放在打点之后做，
+    不阻塞同一轮里其他任务的终态时间戳，避免“用时”被拉长成累计值。"""
+    ctx = Ctx(row=t["row_idx"], account=acc.name, job_id=t["job_id"])
+    try:
+        outs = get_outputs(acc.base, t["job_id"])
+        local_paths, full_urls = processor.process_outputs(
+            outs, acc.base, t["row_idx"], t["job_id"],
+            t["product"], ctx)
+
+        task_store.update_row(t["row_idx"], **{
+            COL_STATUS: "completed",
+            COL_OUTPUT: "; ".join(local_paths),
+            COL_URL: "; ".join(full_urls)})
+        task_store.bump(t["row_idx"], COL_SUCCESS)
+        # 终态已在检测时刻录（record_run_end），这里只补产物路径
+        task_store.attach_run_result(t["job_id"], output="; ".join(local_paths))
+        # 口播文案/分镜数已在提交链路自动补齐（workers/submit.py）
+        ctx.info(f"completed | 下载{len(local_paths)}个 | 记录已回写")
+    except Exception as e:
+        task_store.update_row(t["row_idx"], **{COL_STATUS: "error"})
+        task_store.attach_run_result(t["job_id"], error=str(e))
+        ctx.error(f"下载/处理异常：{e}")
 
 
 def poll_worker_for_account(acc_name):
@@ -26,6 +49,7 @@ def poll_worker_for_account(acc_name):
             time.sleep(POLL_INTERVAL)
             continue
 
+        finished = []                      # 生成完成、待下载成品的 job
         for t in tasks:
             ctx = Ctx(row=t["row_idx"], account=acc.name, job_id=t["job_id"])
             try:
@@ -55,42 +79,10 @@ def poll_worker_for_account(acc_name):
                 last_print[t["job_id"]] = key
 
             if st in {"completed", "failed", "cancelled"}:
-                # 任务终态：回写数据库 + 执行记录
+                # 任务终态：先刻录时间戳（执行用时=提交→生成结束），再回写其他字段
                 if st == "completed":
-                    try:
-                        outs = get_outputs(acc.base, t["job_id"])
-                        local_paths, full_urls = processor.process_outputs(
-                            outs, acc.base, t["row_idx"], t["job_id"],
-                            t["product"], ctx)
-
-                        task_store.update_row(t["row_idx"], **{
-                            COL_STATUS: st,
-                            COL_OUTPUT: "; ".join(local_paths),
-                            COL_URL: "; ".join(full_urls)})
-                        task_store.bump(t["row_idx"], COL_SUCCESS)
-                        task_store.record_run_end(t["job_id"], st,
-                                                  output="; ".join(local_paths))
-
-                        # 时长达标才提取口播（本地正则提取，不走服务端接口；失败静默）
-                        try:
-                            duration = t.get("duration") or 0
-                            if EXTRACT_SCRIPT_ENABLED and \
-                                    duration >= MIN_DURATION_FOR_SCRIPT:
-                                script = extract_script_from_prompt(t["prompt"] or "")
-                                if script:
-                                    task_store.update_row(t["row_idx"],
-                                                          **{COL_SCRIPT_TEXT: script})
-                                    ctx.info(f"口播文案已提取："
-                                             f"{len(script.splitlines())} 句")
-                        except Exception as e:
-                            ctx.debug(f"口播提取异常：{type(e).__name__}")
-
-                        ctx.info(f"{st} | 下载{len(local_paths)}个 | 记录已回写")
-                    except Exception as e:
-                        task_store.update_row(t["row_idx"], **{COL_STATUS: "error"})
-                        task_store.record_run_end(t["job_id"], "error", error=str(e))
-                        ctx.error(f"下载/处理异常：{e}")
-
+                    task_store.record_run_end(t["job_id"], st)
+                    finished.append(t)     # 下载移到打点循环之后，不阻塞其他任务
                 elif st == "cancelled":
                     task_store.update_row(t["row_idx"], **{COL_STATUS: st})
                     task_store.bump(t["row_idx"], COL_CANCEL)
@@ -104,6 +96,9 @@ def poll_worker_for_account(acc_name):
 
                 REG.remove(t["job_id"])
                 last_print.pop(t["job_id"], None)
+
+        for t in finished:
+            _finalize_completed(acc, t)
 
         time.sleep(POLL_INTERVAL)
 
