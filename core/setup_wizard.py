@@ -19,6 +19,15 @@ def _normalize_base(url):
     return url
 
 
+def _missing_port(base):
+    """判断 URL 的 host 部分是否漏填端口（默认 80 几乎连不上，典型错误）"""
+    try:
+        host = base.split("//", 1)[1].split("/")[0]
+    except IndexError:
+        return False
+    return ":" not in host
+
+
 def _check_api(base):
     """快速检测接口是否可连通（5 秒超时，失败不阻断）"""
     try:
@@ -70,6 +79,9 @@ def ensure_config():
         base = _normalize_base(url)
         ok = _check_api(base)
         tip = "✓ 连通正常" if ok else "⚠ 暂时无法连通（已保存，可稍后检查网络或地址）"
+        if not ok and _missing_port(base):
+            tip += ("\n     ✖ 地址未填端口（会默认走 80，几乎必连不通），"
+                    "API 服务通常是 7860 端口，如：http://192.168.0.1:7860")
         print(f"   已添加: {base}  [{tip}]")
         accounts.append({"name": f"acc{len(accounts) + 1}",
                          "base": base, "concurrency": 1})
