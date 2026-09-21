@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from core.config import USER_NAME
 from store import task_store
 from gui.header import page_header, Card, KpiCard
+from gui.widgets import LoadingOverlay
 from gui.charts import TrendChart, DonutChart, HBarChart, C_OK, C_OK2, C_FAIL, C_FAIL2, C_CANCEL, C_CANCEL2
 
 
@@ -83,6 +84,8 @@ class DashboardPage(QWidget):
         self.hbar_card.add(self.hbar, 1)
         lay.addWidget(self.hbar_card, 2)
 
+        self._loading = LoadingOverlay(self)
+
     def _days(self):
         return [1, 7, 14, 30, 90][self.cb_range.currentIndex()]
 
@@ -113,6 +116,20 @@ class DashboardPage(QWidget):
             center_text=f"{cur['rate']}%", center_sub="成功率")
         self.hbar.title = f"各线路执行分布 · {scope}"
         self.hbar.set_data(st["accounts"])
+
+    # ---------- 首次进入：先亮遮罩，再做重刷新（多聚合查询 + 三图重绘较慢） ----------
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not getattr(self, "_first_shown", False):
+            self._first_shown = True
+            self._loading.show_overlay()
+            QTimer.singleShot(50, self._first_load)
+
+    def _first_load(self):
+        try:
+            self.refresh()
+        finally:
+            self._loading.hide_overlay()
 
     @staticmethod
     def _cmp(c, p, up_is_good):

@@ -3,7 +3,7 @@ gui/dialogs.py —— 新建 / 编辑任务弹窗、搜索替换弹窗
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                                QPlainTextEdit, QPushButton, QHBoxLayout, QLabel,
-                               QCheckBox, QComboBox)
+                               QCheckBox, QComboBox, QMessageBox)
 
 from store import product_store
 
@@ -43,11 +43,17 @@ class TaskDialog(QDialog):
 
         btns = QHBoxLayout()
         btns.addStretch(1)
+        btn_to_products = QPushButton("去产品中心建档")
+        btn_to_products.setObjectName("GhostBtn")
+        btn_to_products.setToolTip("跳到产品中心新建产品并上传参考图")
+        btn_to_products.clicked.connect(self._goto_products)
         btn_cancel = QPushButton("取消")
         btn_cancel.setObjectName("GhostBtn")
         btn_cancel.clicked.connect(self.reject)
         btn_ok = QPushButton("保 存")
         btn_ok.clicked.connect(self.accept)
+        btns.addWidget(btn_to_products)
+        btns.addStretch(1)
         btns.addWidget(btn_cancel)
         btns.addWidget(btn_ok)
         lay.addLayout(btns)
@@ -59,8 +65,45 @@ class TaskDialog(QDialog):
             self.lbl_ref.setText(f"📎 产品中心已登记 {n} 张参考图，提交时自动上传")
         elif name and name in product_store.product_names():
             self.lbl_ref.setText("⚠ 该产品还没登记参考图（可去产品中心补充）")
+        elif name:
+            self.lbl_ref.setText(f"🆕 「{name}」尚未建档，保存时会提示是否新建产品")
         else:
             self.lbl_ref.setText("")
+
+    def _goto_products(self):
+        """从弹窗直接跳到产品中心（顺手建档后保存任务并关窗）"""
+        parent = self.parentWidget()
+        while parent is not None and not hasattr(parent, "page_products"):
+            parent = parent.parentWidget()
+        if parent is None:
+            return
+        text = self.ed_product.currentText().strip()
+        if text and text not in product_store.product_names():
+            product_store.add_product(text)      # 顺手建档，省去重复输入
+        parent.pages.setCurrentWidget(parent.page_products)
+        nav = getattr(parent, "nav", None)
+        if nav is not None:
+            nav.setCurrentRow(1)
+        self.done(QDialog.DialogCode.Accepted)   # 不走 accept()，避免重复弹建档提示
+
+    def accept(self):
+        """保存前检查：品名未在产品中心建档时，提示是否新建"""
+        name = self.ed_product.currentText().strip()
+        if name and name not in product_store.product_names():
+            r = QMessageBox.question(
+                self, "产品尚未建档",
+                f"「{name}」还不在产品中心里。\n"
+                "建档后可上传参考图（提交任务时自动上传）。\n\n"
+                "是否现在在产品中心新建该产品？")
+            if r == QMessageBox.StandardButton.Yes:
+                product_store.add_product(name)
+                self.ed_product.blockSignals(True)
+                self.ed_product.clear()
+                self.ed_product.addItems(product_store.product_names())
+                self.ed_product.setCurrentText(name)
+                self.ed_product.blockSignals(False)
+                self.lbl_ref.setText("⚠ 新建产品还没有参考图，建议去产品中心补充")
+        super().accept()
 
     def data(self):
         return {"num": self.ed_num.text().strip(),

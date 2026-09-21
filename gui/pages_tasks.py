@@ -3,8 +3,6 @@ gui/pages_tasks.py —— 任务中心
 分页表格 · 图形进度条 · 视频双击预览 · 右键打开位置 · 悬停预览浮层 ·
 搜索/替换/日期筛选 · 扫描新任务 · 导入导出（含模板）
 """
-import os
-import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal, Qt, QDate, QPoint
@@ -16,6 +14,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 
 from registry.manager import REG
 from store import task_store, product_store
+from utils.desktop_utils import reveal_in_folder
 from workers.submit import do_submit, SubmitOptions
 from gui.dialogs import TaskDialog, FindReplaceDialog
 from gui.delegates import ProgressDelegate, ProgressRole
@@ -77,7 +76,10 @@ class TasksPage(QWidget):
         b_scan = QPushButton("🔍 扫描新任务")
         b_del = QPushButton("🗑 删除")
         b_io = QPushButton("📁 导入/导出")
-        b_io.setMenu(self._build_io_menu())
+        # 注意：QPushButton.setMenu 配合全局样式表会导致点击无反应，改为手动弹出菜单
+        self._io_menu = self._build_io_menu()
+        b_io.clicked.connect(
+            lambda: self._io_menu.exec(b_io.mapToGlobal(QPoint(0, b_io.height()))))
         b_fields = QPushButton("⚟ 字段管理")
         b_fields.setObjectName("GhostBtn")
         b_fields.setToolTip("控制显示哪些列，拖动表头可直接调整列顺序")
@@ -215,7 +217,7 @@ class TasksPage(QWidget):
 
     # ============ 导入/导出菜单 ============
     def _build_io_menu(self):
-        m = QMenu()
+        m = QMenu(self)
         m.addAction("📥 从 Excel 导入任务", self._import_excel)
         m.addAction("📄 下载导入模板", self._download_template)
         m.addSeparator()
@@ -232,7 +234,7 @@ class TasksPage(QWidget):
             if QMessageBox.question(self, "模板已生成",
                                     f"{path}\n\n是否打开所在文件夹？") \
                     == QMessageBox.StandardButton.Yes:
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+                reveal_in_folder(path)
         except Exception as e:
             QMessageBox.critical(self, "生成失败", str(e))
 
@@ -501,7 +503,7 @@ class TasksPage(QWidget):
         item = self.table.item(r, COL_OUT)
         path = item.data(Qt.ItemDataRole.UserRole + 2) if item else ""
         if path and Path(path).exists():
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            reveal_in_folder(path)
         else:
             QMessageBox.information(self, "提示", "输出文件不存在或已被移动")
 
@@ -661,8 +663,11 @@ class TasksPage(QWidget):
         if not path:
             return
         try:
-            n = task_store.import_from_excel(path)
-            self.lbl_tip.setText(f"已导入 {n} 条任务")
+            n, dup = task_store.import_from_excel(path)
+            msg = f"已导入 {n} 条任务"
+            if dup:
+                msg += f"；跳过重复 {dup} 条（提示词已存在）"
+            self.lbl_tip.setText(msg)
             self._goto_first_page()
             self.refresh()
         except Exception as e:

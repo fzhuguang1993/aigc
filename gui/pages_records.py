@@ -2,7 +2,7 @@
 gui/pages_records.py —— 执行记录 + 实时日志
 勾选框列 · 字段管理（显示/隐藏 + 拖拽排序）· 列排序 · 搜索 · 日期筛选 · 导出选中
 """
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTableWidget, QTableWidgetItem, QHeaderView,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 from store import task_store
 from gui import log_sink
 from gui.header import page_header
+from gui.widgets import LoadingOverlay
 from gui.tablekit import FieldManagerDialog, apply_field_layout, enable_drag_with_lock
 
 DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间", "输出文件", "错误信息"]
@@ -109,6 +110,22 @@ class RecordsPage(QWidget):
         lay.addWidget(self.log, 1)
 
         self._checked_rows = {}     # {run行数据id: row dict} 勾选保留
+        self._loading = LoadingOverlay(self)
+        self._first_shown = False
+
+    # ---------- 首次进入：先亮遮罩，再做重刷新 ----------
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not self._first_shown:
+            self._first_shown = True
+            self._loading.show_overlay()
+            QTimer.singleShot(50, self._first_load)
+
+    def _first_load(self):
+        try:
+            self.refresh()
+        finally:
+            self._loading.hide_overlay()
 
     # ---------- 筛选 ----------
     def _toggle_date_filter(self, on):

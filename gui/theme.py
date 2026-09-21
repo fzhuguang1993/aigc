@@ -60,10 +60,15 @@ QWidget#Sidebar QPushButton { font-size: 12px; }
 QWidget#ToolCard { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 12px; }
 QWidget#ToolCard:hover { border-color: #3370FF; }
 
-QTreeWidget, QListWidget { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 10px; }
-QTreeWidget::item, QListWidget::item { padding: 4px 2px; border-radius: 6px; }
-QTreeWidget::item:selected, QListWidget::item:selected { background: #EAF1FF; color: #1F2329; }
+QTreeWidget, QListWidget { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 10px;
+    outline: 0; }
+QTreeWidget::item { height: 30px; padding: 4px 6px; margin: 1px 6px; border-radius: 8px; }
+QTreeWidget::item:hover { background: #F2F6FF; }
+QTreeWidget::item:selected { background: #3370FF; color: #FFFFFF; }
+QListWidget::item { padding: 4px 2px; border-radius: 6px; }
+QListWidget::item:selected { background: #EAF1FF; color: #1F2329; }
 QListWidget { outline: 0; }
+QTreeWidget::branch { background: transparent; }
 """
 
 

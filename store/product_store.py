@@ -24,9 +24,13 @@ def _split(s):
     return [p for p in (s or "").split(";") if p.strip()]
 
 
-def product_dir(name):
+def _safe_dir(name):
     safe = re.sub(r'[\\/:*?"<>|]', "_", name or "未命名").strip() or "未命名"
-    d = Path(RUNTIME_DIR) / MATERIAL_DIR / "products" / safe
+    return Path(RUNTIME_DIR) / MATERIAL_DIR / "products" / safe
+
+
+def product_dir(name):
+    d = _safe_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -72,6 +76,38 @@ def add_product(name, ptype=TYPE_PRODUCT, note=""):
 
 def delete_product(pid):
     db.execute("DELETE FROM products WHERE id=?", (pid,))
+
+
+def rename_product(pid, new_name):
+    """产品/KOL 改名：同步迁移素材文件夹、改写登记路径，并同步未归档任务的品名。
+
+    重名抛 ValueError；成功返回 True，无变化返回 False。
+    """
+    p = get_product(pid)
+    new_name = (new_name or "").strip()
+    if not p or not new_name or new_name == p["name"]:
+        return False
+    dup = db.query("SELECT id FROM products WHERE type=? AND name=? AND id!=?",
+                   (p["type"], new_name, pid))
+    if dup:
+        raise ValueError(f"已存在同名「{new_name}」")
+    old_dir, new_dir = _safe_dir(p["name"]), _safe_dir(new_name)
+    if old_dir.exists() and not new_dir.exists():
+        shutil.move(str(old_dir), str(new_dir))
+    # 磁盘文件已随目录迁移：把登记路径里指向旧目录的前缀改写为新目录
+    updates = {}
+    for field in ("images", "videos", "audios"):
+        vals = _split(p[field])
+        updates[field] = ";".join(
+            str(new_dir / Path(v).name) if Path(v).parent == old_dir else v
+            for v in vals)
+    db.execute("UPDATE products SET name=?, images=?, videos=?, audios=?, updated_at=? "
+               "WHERE id=?",
+               (new_name, updates["images"], updates["videos"], updates["audios"],
+                _now(), pid))
+    # 引用该品名的任务一并改名，保证提交时参考图仍能自动匹配
+    db.execute("UPDATE tasks SET product=? WHERE product=?", (new_name, p["name"]))
+    return True
 
 
 def set_note(pid, note):

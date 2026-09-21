@@ -118,16 +118,27 @@ def list_runs(limit=1000):
 # ---------------- 导入 / 导出 ----------------
 
 def import_from_excel(path, sheet="Sheet"):
-    """把任务 Excel 导入数据库，返回导入条数（列：编号/品名/提示词）"""
+    """把任务 Excel 导入数据库（列：编号/品名/提示词）。
+
+    按提示词去重：与库中已有任务、文件内部重复的提示词都不再追加。
+    返回 (导入条数, 跳过重复条数)。
+    """
     df = pd.read_excel(path, sheet_name=sheet)
-    count = 0
+    existing = {(r["prompt"] or "").strip()
+                for r in db.query("SELECT prompt FROM tasks")}
+    seen = set()
+    count = dup = 0
     for _, row in df.iterrows():
         prompt = str(row.get("提示词", "") or "").strip()
         if not prompt or prompt in ("nan", "None"):
             continue
+        if prompt in existing or prompt in seen:
+            dup += 1
+            continue
+        seen.add(prompt)
         add_task(row.get("编号", ""), str(row.get("品名", "") or ""), prompt)
         count += 1
-    return count
+    return count, dup
 
 
 def write_import_template(path=None):

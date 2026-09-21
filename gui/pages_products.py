@@ -4,8 +4,6 @@ gui/pages_products.py —— 产品中心（树状素材库）
 右侧详情：紧凑分组展示，支持添加/移除登记。
 提交任务时按品名自动取参考图；KOL 按名称取形象图。
 """
-import os
-import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, Signal
@@ -16,6 +14,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QListWidgetItem, QAbstractItemView)
 
 from store import product_store as ps
+from utils.desktop_utils import open_path, reveal_in_folder
 from gui.header import page_header, Card
 from gui.widgets import VideoPlayerDialog, ImagePreviewDialog
 from gui.dialogs_spec import SpecCardDialog
@@ -131,6 +130,9 @@ class ProductsPage(QWidget):
         self.tree.setHeaderHidden(True)
         self.tree.setColumnCount(1)
         self.tree.setMinimumWidth(260)
+        self.tree.setIndentation(14)
+        # macOS 默认会在选中项上画焦点虚框，关掉后统一用 QSS 圆角高亮
+        self.tree.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
         self.tree.currentItemChanged.connect(self._on_pick)
@@ -369,13 +371,13 @@ class ProductsPage(QWidget):
 
     def _open_system(self, path):
         if Path(path).exists():
-            os.startfile(str(path))
+            open_path(path)
         else:
             QMessageBox.information(self, "提示", "文件不存在或已被移动")
 
     def _open_location(self, path):
         if Path(path).exists():
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            reveal_in_folder(path)
         else:
             QMessageBox.information(self, "提示", "文件不存在或已被移动")
 
@@ -478,13 +480,14 @@ class ProductsPage(QWidget):
             for kind, icon, label in _KINDS:
                 menu.addAction(f"{icon} 添加{label}", lambda _=False, k=kind: self._add_files(k, pid))
             menu.addSeparator()
+            menu.addAction("✏ 重命名", lambda: self._rename(pid))
             menu.addAction("🗑 删除该条目", lambda: self._delete(pid))
         elif role and role[0] == "root":
             menu.addAction("＋ 新建", lambda: self._create(role[1]))
         if menu.actions():
             menu.exec(self.tree.viewport().mapToGlobal(pos))
 
-    # ================= 新建 / 删除 =================
+    # ================= 新建 / 改名 / 删除 =================
     def _create(self, ptype):
         what = "产品" if ptype == ps.TYPE_PRODUCT else "KOL"
         name, ok = QInputDialog.getText(self, f"新建{what}", f"{what}名称：")
@@ -497,6 +500,30 @@ class ProductsPage(QWidget):
         pid = ps.add_product(name, ptype)
         self.rebuild(keep=pid)
         self.lbl_hint.setText(f"已创建{what}「{name}」，右键它可添加素材")
+
+    def _rename(self, pid):
+        p = ps.get_product(pid)
+        if not p:
+            return
+        what = "产品" if p["type"] == ps.TYPE_PRODUCT else "KOL"
+        name, ok = QInputDialog.getText(self, f"重命名{what}",
+                                        f"新名称（素材文件夹与相关任务的品名会一并更新）：",
+                                        text=p["name"])
+        name = name.strip()
+        if not ok or not name:
+            return
+        try:
+            changed = ps.rename_product(pid, name)
+        except ValueError as e:
+            QMessageBox.warning(self, "无法改名", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "改名失败", str(e))
+            return
+        self.rebuild(keep=pid if changed else None)
+        self._sig = None
+        if changed:
+            self.lbl_hint.setText(f"已改名为「{name}」，素材文件与相关任务已同步")
 
     def _delete_current(self):
         pid = self.current_id()

@@ -1,7 +1,6 @@
 """
 gui/main_window.py —— 主窗口：左侧导航 + 页面栈 + 状态栏，2 秒自动刷新
 """
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +11,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                                QListWidget, QStackedWidget, QLabel, QPushButton,
                                QMessageBox)
 
+from utils.desktop_utils import open_path
 from gui.pages_tasks import TasksPage
 from gui.pages_records import RecordsPage
 from gui.pages_settings import SettingsPage
@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         slay.addWidget(logo)
         self.nav = QListWidget()
         self.nav.setObjectName("NavList")
-        self.nav.addItems(["📋  任务中心", "🧩  产品中心", "📊  看板", "🕘  执行记录",
+        self.nav.addItems(["📋  任务中心", "🧩  产品中心", "📊  数据看板", "🕘  执行记录",
                            "📡  线路负载", "🛡  风控中心", "🧰  工具中心",
                            "📖  新手入门", "⚙️  设置"])
         slay.addWidget(self.nav, 1)
@@ -132,7 +132,7 @@ class MainWindow(QMainWindow):
         try:
             d = Path(DOWNLOAD_DIR)
             d.mkdir(parents=True, exist_ok=True)
-            os.startfile(str(d))
+            open_path(d)
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
 
@@ -153,7 +153,11 @@ class MainWindow(QMainWindow):
                 py = Path(sys.executable)
                 python = py.with_name("python.exe")
                 cmd = [str(python if python.exists() else py), "main.py"]
-            subprocess.Popen(cmd, cwd=str(RUNTIME_DIR),
-                             creationflags=subprocess.CREATE_NEW_CONSOLE)
+            kwargs = {}
+            if sys.platform.startswith("win"):
+                kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+            else:
+                kwargs["start_new_session"] = True   # 脱离 GUI 终端，独立运行
+            subprocess.Popen(cmd, cwd=str(RUNTIME_DIR), **kwargs)
         except Exception as e:
             QMessageBox.critical(self, "启动失败", str(e))

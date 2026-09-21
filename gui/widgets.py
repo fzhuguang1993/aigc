@@ -1,15 +1,16 @@
 """
 gui/widgets.py —— 视频/图片预览窗口 + 提示词悬停预览浮层（保留换行/限宽/可滚动）
 """
-import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint
-from PySide6.QtGui import QGuiApplication, QPixmap
+from PySide6.QtCore import Qt, QUrl, QPoint, QTimer
+from PySide6.QtGui import QGuiApplication, QPixmap, QPainter, QPen, QColor
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
                                QPushButton, QLabel, QWidget, QMessageBox, QStyle)
+
+from utils.desktop_utils import open_path
 
 
 def _fmt_ms(ms):
@@ -106,7 +107,7 @@ class ImagePreviewDialog(QDialog):
         bar.addStretch(1)
         b_open = QPushButton("📂 用系统默认程序打开")
         b_open.setObjectName("GhostBtn")
-        b_open.clicked.connect(lambda: os.startfile(str(file_path)))
+        b_open.clicked.connect(lambda: open_path(file_path))
         bar.addWidget(b_open)
         b_close = QPushButton("关闭")
         b_close.clicked.connect(self.accept)
@@ -160,3 +161,68 @@ class HoverPreview(QScrollArea):
         x = min(pos.x(), screen.right() - self.width() - 8)
         y = min(pos.y(), screen.bottom() - self.height() - 8)
         return QPoint(max(x, screen.left()), max(y, screen.top()))
+
+
+class _Spinner(QWidget):
+    """旋转弧线加载动画（纯 QPainter 绘制，无额外依赖）"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(26, 26)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self):
+        self._timer.start(60)
+
+    def stop(self):
+        self._timer.stop()
+
+    def _tick(self):
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#3370FF"), 4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        r = self.rect().adjusted(3, 3, -3, -3)
+        p.drawArc(r, (90 - self._angle) * 16, -270 * 16)
+        p.end()
+
+
+class LoadingOverlay(QWidget):
+    """轻量加载遮罩：盖在页面上，首次重查询刷新时显示转圈提示。
+
+    用法：页面 __init__ 里 self._loading = LoadingOverlay(self)；
+    showEvent 首次触发时 show_overlay()，再 QTimer.singleShot 延迟执行
+    重刷新，让遮罩先绘制一帧，完成后 hide_overlay()。
+    """
+
+    def __init__(self, host):
+        super().__init__(host)
+        self._host = host
+        self.setStyleSheet("background:rgba(250,251,252,225);")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch(1)
+        self.spinner = _Spinner(self)
+        lay.addWidget(self.spinner)
+        lbl = QLabel("加载中，请稍候…")
+        lbl.setStyleSheet("color:#646A73; font-size:13px; background:transparent;")
+        lay.addWidget(lbl)
+        lay.addStretch(1)
+        self.hide()
+
+    def show_overlay(self):
+        self.setGeometry(self._host.rect())
+        self.spinner.start()
+        self.show()
+        self.raise_()
+
+    def hide_overlay(self):
+        self.spinner.stop()
+        self.hide()

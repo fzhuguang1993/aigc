@@ -39,6 +39,7 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 |---|------|------|------|----------|
 | 1 | 运行时目录 | 环境变量 `AIGC_HOME` | 当前工作目录 `Path.cwd()` | `core/config.py: RUNTIME_DIR` |
 | 2 | 用户配置 | 运行目录 `config.json`（首运向导生成） | `core/config_local.py`（开发环境） | `core/config.py: _load_local_config` |
+| 2b | 账号 base 后缀 | 已是 `…/api/v1` 原样使用 | 缺失时加载端自动补齐（手写 config.json 漏后缀会 POST 打根路径返 405） | `core/config.py: _normalize_account_base` |
 | 3 | 文件命名姓名 | `config.json` 的 `user_name` | Excel「命名规则」sheet | `utils/excel_utils.py: load_name_rule` |
 | 4 | 参考图 | 产品中心该品名登记图片 | 无（为空则不带参考图提交） | `workers/submit.py: build_payload` |
 | 5 | KOL 形象图 | 产品中心登记 | `material/KOL` 目录 → 都找不到则忽略并告警 | `workers/submit.py: build_payload` + `store/product_store.py: kol_image` |

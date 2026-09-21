@@ -1,0 +1,38 @@
+# 推送 tag（如 v1.0.0）或在 Actions 页面手动触发 workflow_dispatch，
+# 云端 windows-latest 自动打包两个 exe，产物在 Summary 页的 artifact「aigc-windows-exe」下载。
+name: Build Windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build GUI (no console)
+        run: >
+          pyinstaller --noconfirm --onefile --noconsole --name "AIGC视频助手"
+          --icon=assets\app.ico --add-data "assets\app.ico;assets"
+          --hidden-import=openpyxl desktop.py
+
+      - name: Build CLI (console)
+        run: >
+          pyinstaller --noconfirm --onefile --console --name "AIGC视频助手-命令行"
+          --icon=assets\app.ico --add-data "assets\app.ico;assets"
+          --hidden-import=openpyxl main.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aigc-windows-exe
+          path: dist/*.exe
