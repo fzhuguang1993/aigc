@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 
 from registry.manager import REG
 from store import task_store, product_store
-from workers.submit import do_submit, set_runtime_options
+from workers.submit import do_submit, SubmitOptions
 from gui.dialogs import TaskDialog, FindReplaceDialog
 from gui.delegates import ProgressDelegate, ProgressRole
 from gui.widgets import VideoPlayerDialog, HoverPreview
@@ -45,13 +45,14 @@ class SubmitWorker(QThread):
     log_msg = Signal(str)
     all_done = Signal()
 
-    def __init__(self, items):
+    def __init__(self, items, options):
         super().__init__()
         self.items = items
+        self.options = options   # 提交瞬间的选项快照，避免全局态
 
     def run(self):
         for tid, product, prompt in self.items:
-            jid, err, acc = do_submit(tid, product, prompt)
+            jid, err, acc = do_submit(tid, product, prompt, self.options)
             if jid:
                 self.log_msg.emit(f"✓ 任务{tid} 已提交 [{acc}]")
             else:
@@ -210,10 +211,7 @@ class TasksPage(QWidget):
         b_run.clicked.connect(lambda: self._run(True))
         b_runall.clicked.connect(lambda: self._run(False))
         b_scan.clicked.connect(self._scan_new)
-        self.cb_duration.currentIndexChanged.connect(self._apply_options)
-        self.cb_kol.currentIndexChanged.connect(self._apply_options)
         b_fields.clicked.connect(self._manage_fields)
-        self._apply_options()
 
     # ============ 导入/导出菜单 ============
     def _build_io_menu(self):
@@ -319,8 +317,6 @@ class TasksPage(QWidget):
         idx = self.cb_kol.findText(cur_kol)
         self.cb_kol.setCurrentIndex(idx if idx >= 0 else 0)
         self.cb_kol.blockSignals(False)
-        set_runtime_options(kol=None if self.cb_kol.currentIndex() == 0
-                            else self.cb_kol.currentText())
         df = task_store.list_tasks_df()
         self._filtered = [(int(row["_id"]), row) for _, row in df.iterrows()
                           if self._match_filter(row)]
@@ -574,10 +570,11 @@ class TasksPage(QWidget):
             self.refresh()
 
     # ============ 操作 ============
-    def _apply_options(self):
-        dur = 5 + self.cb_duration.currentIndex()
-        kol = None if self.cb_kol.currentIndex() == 0 else self.cb_kol.currentText()
-        set_runtime_options(duration=dur, kol=kol)
+    def _current_options(self):
+        """从控件读取当前时长/KOL，生成提交选项快照"""
+        return SubmitOptions(
+            duration=5 + self.cb_duration.currentIndex(),
+            kol=None if self.cb_kol.currentIndex() == 0 else self.cb_kol.currentText())
 
     def _new_task(self):
         data = TaskDialog.ask(self)
@@ -653,7 +650,7 @@ class TasksPage(QWidget):
             self.lbl_tip.setText("没有可执行的任务：请确认已填写提示词，且任务尚未成功执行过")
             return
         self.lbl_tip.setText(f"正在提交 {len(items)} 个任务…")
-        self.worker = SubmitWorker(items)
+        self.worker = SubmitWorker(items, self._current_options())
         self.worker.log_msg.connect(lambda m: self.lbl_tip.setText(m))
         self.worker.all_done.connect(
             lambda: self.lbl_tip.setText("提交完成，云端生成中…进度条将实时更新，完成后自动下载到 outputs/"))

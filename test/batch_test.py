@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from core.config import DEFAULT_DURATION, MATERIAL_DIR, KOL_DIR
 from utils.excel_utils import load_tasks, update_row, COL_STATUS, COL_PRODUCT, COL_PROMPT
 from registry.manager import REG
-from workers.submit import do_submit
+from workers.submit import do_submit, SubmitOptions
 from console.app import select_product_and_kol
 from core.logger import Ctx, raw_info, raw_warning
 
@@ -219,7 +219,8 @@ def run_test(index, test_case):
     # 提交任务
     ctx = Ctx(row=row_idx, account="batch_test", job_id="")
     try:
-        jid, err, acc_name = do_submit(row_idx, selected_product, prompt)
+        jid, err, acc_name = do_submit(row_idx, selected_product, prompt,
+                                        SubmitOptions(duration=duration))
         
         if jid:
             print(f"✅ 提交成功 [{acc_name}] job_id={jid[:8]}...")

@@ -14,11 +14,12 @@ class Registry:
         self.lock = threading.Lock()
         self.tasks = {}
 
-    def add(self, job_id, row_idx, account, prompt, product):
+    def add(self, job_id, row_idx, account, prompt, product, duration=None):
         with self.lock:
             self.tasks[job_id] = {
                 "job_id": job_id, "row_idx": row_idx,
                 "account": account, "prompt": prompt, "product": product,
+                "duration": duration,
                 "status": "queued", "progress": 0,
             }
 

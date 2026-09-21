@@ -125,21 +125,33 @@ python main.py
 
 ```
 ├── main.py              # 入口：首运向导 → 健康检查 → 轮询线程 → 交互控制台
-├── core/                # config（路径/参数/账号）、api_client、logger、setup_wizard（首运向导）
-├── workers/             # scan 扫描 / submit 提交 / poll 轮询
+├── core/                # config（路径/参数/账号）、api_client（统一 ApiError）、logger、setup_wizard（首运向导）
+├── store/               # SQLite 持久化：db + task_store / product_store / risk_store
+├── workers/             # scan 扫描 / submit 提交（SubmitOptions+退避换线重试）/ poll 轮询
 ├── processors/          # video_processor 下载重命名 / script_extractor 口播提取
 ├── registry/            # 任务注册 + 账号健康 + 负载均衡
 ├── utils/               # excel_utils 读写
 ├── console/             # app.py 交互控制台（dd 菜单）
-└── docs/                # 各功能的设计说明文档
+├── gui/                 # PySide6 桌面界面（与 console 共用同一套内核）
+├── tests/               # pytest 回归测试（主链路断言，改内核必跑）
+└── docs/                # 设计文档（含 design-conventions.md 架构约定与回退规则）
 ```
 
 ### 关键约定
 
-- 所有数据路径基于**运行目录**（`Path.cwd()`），打包分发零改路径
+- 所有数据路径基于**运行目录**（可用 `AIGC_HOME` 环境变量覆盖，默认 `Path.cwd()`），打包分发零改路径
 - `config.json` 加载优先级：运行目录 `config.json` → `core/config_local.py`
 - `core/__init__.py` 保持为空导入（避免在向导生成配置前缓存空配置）
 - 敏感信息（接口地址）只存在本地 `config.json` / `config_local.py`，均已 gitignore
+- 提交选项通过 `SubmitOptions` 显式传参，worker 层禁止模块级可变全局态
+- 全部回退（fallback）链路与错误处理约定见 [docs/design-conventions.md](docs/design-conventions.md)
+
+### 跑回归测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q        # 改动提交/轮询/账号选择主链路后必跑，全绿再提交
+```
 
 ### 打包成 exe（发给同事）
 

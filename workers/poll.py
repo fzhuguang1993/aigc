@@ -70,12 +70,12 @@ def poll_worker_for_account(acc_name):
                         task_store.record_run_end(t["job_id"], st,
                                                   output="; ".join(local_paths))
 
-                        # 时长达标才提取口播（失败静默，不影响主流程）
+                        # 时长达标才提取口播（duration 取自提交时的任务注册信息；失败静默）
                         try:
-                            from workers.submit import SELECTED_DURATION
+                            duration = t.get("duration") or 0
                             if EXTRACT_SCRIPT_ENABLED and \
-                                    SELECTED_DURATION >= MIN_DURATION_FOR_SCRIPT:
-                                script, err = extract_script(acc.base, t["prompt"])
+                                    duration >= MIN_DURATION_FOR_SCRIPT:
+                                script = extract_script(acc.base, t["prompt"])
                                 if script:
                                     task_store.update_row(t["row_idx"],
                                                           **{COL_SCRIPT_TEXT: script})

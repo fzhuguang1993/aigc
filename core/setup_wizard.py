@@ -4,9 +4,11 @@ setup_wizard.py —— 首次运行配置向导
 重新配置：删除 config.json 后再启动即可。
 """
 import json
+import os
 from pathlib import Path
 
-CONFIG_JSON = Path.cwd() / "config.json"
+# 与 core.config 的 RUNTIME_DIR 保持一致（支持 AIGC_HOME 环境变量覆盖）
+CONFIG_JSON = Path(os.environ.get("AIGC_HOME") or Path.cwd()) / "config.json"
 
 
 def _normalize_base(url):

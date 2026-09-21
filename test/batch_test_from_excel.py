@@ -213,27 +213,25 @@ def submit_with_materials(row_idx, product, prompt, ref_text):
     # 提交任务
     for attempt in range(3):
         try:
-            resp, err = submit_job(acc.base, payload)
-            if err is None:
-                job_id = resp["job_id"]
-                ctx.job_id = job_id
-                ctx.info("提交成功")
-                REG.add(job_id, row_idx, acc.name, prompt, product)
-                invalidate_load_cache(acc.name)
-                mark_submitted(row_idx)
-                
-                df = load_tasks()
-                runs = int(df.at[row_idx, COL_RUNS] or 0) + 1
-                update_row(row_idx,
-                           **{COL_RUNS: runs,
-                              COL_STATUS: "submitted",
-                              COL_ACCOUNT: acc.name,
-                              COL_JOB_ID: job_id})
-                print(f"✅ 提交成功 [{acc.name}] job_id={job_id[:8]}...")
-                return True
-            ctx.error(f"提交失败：{err}")
+            resp = submit_job(acc.base, payload)
+            job_id = resp["job_id"]
+            ctx.job_id = job_id
+            ctx.info("提交成功")
+            REG.add(job_id, row_idx, acc.name, prompt, product)
+            invalidate_load_cache(acc.name)
+            mark_submitted(row_idx)
+
+            df = load_tasks()
+            runs = int(df.at[row_idx, COL_RUNS] or 0) + 1
+            update_row(row_idx,
+                       **{COL_RUNS: runs,
+                          COL_STATUS: "submitted",
+                          COL_ACCOUNT: acc.name,
+                          COL_JOB_ID: job_id})
+            print(f"✅ 提交成功 [{acc.name}] job_id={job_id[:8]}...")
+            return True
         except Exception as e:
-            ctx.error(f"提交异常：{e}")
+            ctx.error(f"提交失败：{e}")
         
         if attempt < 2:
             next_acc = pick_account()

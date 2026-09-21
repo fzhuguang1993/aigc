@@ -11,17 +11,22 @@ from core.config import (COL_PRODUCT, COL_PROMPT, DEFAULT_DURATION,
 from store import db, task_store
 from store.task_store import COL_ID, COL_STATUS, COL_RUNS
 from registry.manager import REG, ACCOUNTS, get_account, get_account_load
-from workers.submit import do_submit, cancel_one, set_runtime_options
+from workers.submit import do_submit, cancel_one, SubmitOptions
 from workers.scan import print_new_rows, SCAN
 from core.logger import raw_warning, raw_info
 from core.api_client import query_job
 
-# 当前视频时长（秒）——与 workers.submit 的运行时参数保持同步
+# 当前视频时长（秒）——控制台交互层自身的状态，提交时通过 SubmitOptions 显式传入
 current_duration = DEFAULT_DURATION
 
 # 当前选择的品名和 KOL
 selected_product = LAST_PRODUCT
 selected_kol = LAST_KOL
+
+
+def _current_options():
+    """提交时快照控制台当前选择（仅限单线程控制台使用）"""
+    return SubmitOptions(duration=current_duration, kol=selected_kol)
 
 
 def show_status():
@@ -134,7 +139,7 @@ def run_one_row(task_id, product, prompt):
             print("已取消")
             return
 
-    jid, err, acc_name = do_submit(task_id, product, prompt)
+    jid, err, acc_name = do_submit(task_id, product, prompt, _current_options())
     if jid:
         print(f"  ✓ 任务 {task_id} 提交成功 [{acc_name}]")
     else:
@@ -186,7 +191,7 @@ def _submit_by_ids(id_list):
             skip += 1
             continue
         product = str(task.get(COL_PRODUCT) or task["product"] or "").strip()
-        jid, err, acc_name = do_submit(tid, product, prompt)
+        jid, err, acc_name = do_submit(tid, product, prompt, _current_options())
         if jid:
             print(f"  ✓ 任务 {tid} 提交成功 [{acc_name}]")
             success += 1
@@ -249,7 +254,6 @@ def handle_duration_switch():
     duration_input = safe_input("输入 5 或 15：")
     if duration_input in ("5", "15"):
         current_duration = int(duration_input)
-        set_runtime_options(duration=current_duration)
         raw_info(f"已切换到 {current_duration} 秒模式")
     else:
         print("无效输入")
@@ -328,7 +332,6 @@ def select_product_and_kol():
 
     selected_product = product
     selected_kol = kol
-    set_runtime_options(kol=kol)
     print(f"\n✅ 已选择：{product} + {kol if kol else '无'}")
     return product, kol
 
