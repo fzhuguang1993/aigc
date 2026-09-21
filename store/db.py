@@ -17,12 +17,14 @@ CREATE TABLE IF NOT EXISTS tasks(
   status TEXT DEFAULT '', account TEXT DEFAULT '', job_id TEXT DEFAULT '',
   output TEXT DEFAULT '', url TEXT DEFAULT '',
   runs INTEGER DEFAULT 0, success INTEGER DEFAULT 0, cancels INTEGER DEFAULT 0,
-  script_text TEXT DEFAULT '', updated_at TEXT DEFAULT ''
+  script_text TEXT DEFAULT '', updated_at TEXT DEFAULT '',
+  duration INTEGER DEFAULT 0, prompt_changed_at TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS runs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id INTEGER, num TEXT, product TEXT, account TEXT, job_id TEXT,
-  status TEXT, started_at TEXT, finished_at TEXT, output TEXT, error TEXT
+  status TEXT, started_at TEXT, finished_at TEXT, output TEXT, error TEXT,
+  duration INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS products(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +48,9 @@ CREATE TABLE IF NOT EXISTS risk_rules(
 # 老库升级：列不存在时 ALTER 补上（重复执行安全）
 _MIGRATIONS = (
     "ALTER TABLE products ADD COLUMN spec TEXT DEFAULT ''",
+    "ALTER TABLE tasks ADD COLUMN duration INTEGER DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN prompt_changed_at TEXT DEFAULT ''",
+    "ALTER TABLE runs ADD COLUMN duration INTEGER DEFAULT 0",
 )
 
 

@@ -13,23 +13,35 @@ from store import db
 
 COL_ID = "编号"; COL_PRODUCT = "品名"; COL_PROMPT = "提示词"
 COL_STATUS = "状态"; COL_ACCOUNT = "账号"; COL_JOB_ID = "job_id"
-COL_OUTPUT = "输出"; COL_URL = "URL"
+COL_OUTPUT = "输出"; COL_URL = "URL"; COL_DURATION = "时长"
 COL_RUNS = "运行次数"; COL_SUCCESS = "成功次数"; COL_CANCEL = "取消次数"
 COL_SCRIPT_TEXT = "口播文案"; COL_UPDATED = "更新时间"
 
 _CN2DB = {"编号": "num", "品名": "product", "提示词": "prompt", "状态": "status",
           "账号": "account", "job_id": "job_id", "输出": "output", "URL": "url",
           "运行次数": "runs", "成功次数": "success", "取消次数": "cancels",
-          "口播文案": "script_text", "更新时间": "updated_at"}
+          "口播文案": "script_text", "更新时间": "updated_at", "时长": "duration"}
 
-EXPORT_COLUMNS = ["编号", "品名", "提示词", "状态", "账号", "job_id", "输出", "URL",
-                  "运行次数", "成功次数", "取消次数", "口播文案", "更新时间"]
+EXPORT_COLUMNS = ["编号", "品名", "提示词", "状态", "时长", "执行用时", "账号", "job_id",
+                  "输出", "URL", "运行次数", "成功次数", "取消次数", "口播文案", "更新时间"]
 
 EXPORT_DIR = RUNTIME_DIR / "exports"
 
 
 def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_precise():
+    # 含微秒：用于「提示词变更 vs 上次执行」同秒级比较，以及用时计算
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def _parse_ts(ts):
+    try:
+        return datetime.strptime(ts[:26], "%Y-%m-%d %H:%M:%S.%f")
+    except ValueError:                     # 兼容旧数据：秒精度无微秒尾巴
+        return datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
 
 
 # ---------------- 任务 CRUD ----------------
@@ -41,10 +53,17 @@ def list_tasks_df():
     df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     for cn, en in _CN2DB.items():
         df[cn] = df[en]
-    text_cols = [c for c in df.columns if c not in ("id", "runs", "success", "cancels", "_id")]
+    text_cols = [c for c in df.columns
+                 if c not in ("id", "runs", "success", "cancels", "duration", "_id")]
     if len(df):
         df[text_cols] = df[text_cols].fillna("").astype(str)
     df["_id"] = df["id"]
+    # 派生列：最后一次有用时的执行的耗时（秒）
+    durs = {r["task_id"]: int(r["duration"] or 0) for r in db.query(
+        "SELECT task_id, duration FROM runs WHERE duration > 0 AND id IN "
+        "(SELECT MAX(id) FROM runs GROUP BY task_id)")}
+    df["执行用时"] = [int(durs.get(i, 0)) for i in df["_id"]] if len(df) \
+        else pd.Series([], dtype=int)
     return df
 
 
@@ -54,8 +73,10 @@ def get_task(task_id):
 
 
 def add_task(num, product, prompt):
-    return db.execute("INSERT INTO tasks(num, product, prompt, updated_at) VALUES(?,?,?,?)",
-                      (str(num), product, prompt, _now()))
+    return db.execute(
+        "INSERT INTO tasks(num, product, prompt, updated_at, prompt_changed_at) "
+        "VALUES(?,?,?,?,?)",
+        (str(num), product, prompt, _now(), _now_precise()))
 
 
 def update_row(task_id, **fields):
@@ -65,11 +86,31 @@ def update_row(task_id, **fields):
         if col:
             sets.append(f"{col}=?")
             args.append(v)
+    # 提示词被修改：记下变更时间，供“迭代执行”判定
+    if COL_PROMPT in fields:
+        sets.append("prompt_changed_at=?")
+        args.append(_now_precise())
     if not sets:
         return
     sets.append("updated_at=?")
     args += [_now(), task_id]
     db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", args)
+
+
+def iter_ready(task_id):
+    """提示词在上次执行之后又改过 → 应视为“迭代执行”，允许重跑"""
+    t = get_task(task_id)
+    if not t:
+        return False
+    changed = t["prompt_changed_at"] or ""
+    if not changed:
+        return False                      # 存量老数据未记录变更时间，沿用旧行为
+    last = db.query("SELECT started_at FROM runs WHERE task_id=? "
+                    "ORDER BY id DESC LIMIT 1", (task_id,))
+    if not last:
+        return True                       # 改过提示词且从未执行过
+    # 时间戳含微秒，可区分同秒内的先后顺序（定长字符串，可直接比较）
+    return changed > (last[0]["started_at"] or "")
 
 
 def bump(task_id, cn_col):
@@ -102,13 +143,24 @@ def scan_new_rows():
 def record_run_start(task_id, num, product, account, job_id):
     db.execute("INSERT INTO runs(task_id,num,product,account,job_id,status,started_at) "
                "VALUES(?,?,?,?,?,?,?)",
-               (task_id, str(num), product, account, job_id, "running", _now()))
+               (task_id, str(num), product, account, job_id, "running", _now_precise()))
 
 
 def record_run_end(job_id, status, output="", error=""):
-    db.execute("UPDATE runs SET status=?, finished_at=?, output=?, error=? "
+    now = _now_precise()
+    # 执行用时（秒）：本次结束时间 - 开始时间
+    dur = 0
+    rows = db.query("SELECT started_at FROM runs WHERE job_id=? AND finished_at IS NULL "
+                    "ORDER BY id DESC LIMIT 1", (job_id,))
+    if rows and rows[0]["started_at"]:
+        try:
+            dur = max(0, int((_parse_ts(now) - _parse_ts(rows[0]["started_at"]
+                                         )).total_seconds()))
+        except ValueError:
+            dur = 0
+    db.execute("UPDATE runs SET status=?, finished_at=?, duration=?, output=?, error=? "
                "WHERE job_id=? AND finished_at IS NULL",
-               (status, _now(), output, error, job_id))
+               (status, now, dur, output, error, job_id))
 
 
 def list_runs(limit=1000):
@@ -166,13 +218,16 @@ def write_import_template(path=None):
 # ---------------- 看板统计 ----------------
 
 _RANGE = ("SELECT COUNT(*) total, SUM(status='completed') ok,"
-          " SUM(status IN ('failed','error')) fail, SUM(status='cancelled') cancel"
+          " SUM(status IN ('failed','error')) fail, SUM(status='cancelled') cancel,"
+          " AVG(CASE WHEN status='completed' THEN duration END) dur"
           " FROM runs WHERE substr(started_at,1,10)")
 
 
 def _sum_row(rows):
     r = rows[0] if rows else {}
-    return {k: int(r.get(k) or 0) for k in ("total", "ok", "fail", "cancel")}
+    out = {k: int(r.get(k) or 0) for k in ("total", "ok", "fail", "cancel")}
+    out["avg_dur"] = round(float(r.get("dur") or 0), 1)   # 成功执行平均用时（秒）
+    return out
 
 
 def range_stats(days=7):
@@ -250,12 +305,17 @@ def export_runs_rows(rows, fmt="excel", path=None):
 
 def _runs_df(rows):
     cols = ["started_at", "num", "product", "account", "status",
-            "finished_at", "output", "error"]
+            "finished_at", "duration", "output", "error"]
     df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    for c in ("started_at", "finished_at"):     # 展示时去掉微秒尾巴
+        if c in df.columns and len(df):
+            df[c] = df[c].fillna("").astype(str).str[:19]
     df = df.rename(columns={"started_at": "开始时间", "num": "编号", "product": "品名",
                             "account": "账号", "status": "状态", "finished_at": "结束时间",
+                            "duration": "用时(秒)",
                             "output": "输出文件", "error": "错误信息"})
-    return df[["开始时间", "编号", "品名", "账号", "状态", "结束时间", "输出文件", "错误信息"]]
+    return df[["开始时间", "编号", "品名", "账号", "状态", "结束时间",
+               "用时(秒)", "输出文件", "错误信息"]]
 
 
 def _stamp():

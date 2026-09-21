@@ -9,7 +9,8 @@ from core.config import POLL_INTERVAL, EXTRACT_SCRIPT_ENABLED, MIN_DURATION_FOR_
 from store import task_store
 from store.task_store import (COL_STATUS, COL_OUTPUT, COL_URL, COL_SUCCESS,
                               COL_CANCEL, COL_SCRIPT_TEXT)
-from core.api_client import query_job, get_outputs, extract_script
+from core.api_client import query_job, get_outputs
+from processors.script_extractor import extract_script_from_prompt
 from core.logger import Ctx, raw_error
 from registry.manager import REG, get_account
 import processors.video_processor as processor
@@ -70,17 +71,19 @@ def poll_worker_for_account(acc_name):
                         task_store.record_run_end(t["job_id"], st,
                                                   output="; ".join(local_paths))
 
-                        # 时长达标才提取口播（duration 取自提交时的任务注册信息；失败静默）
+                        # 时长达标才提取口播（本地正则提取，不走服务端接口；失败静默）
                         try:
                             duration = t.get("duration") or 0
                             if EXTRACT_SCRIPT_ENABLED and \
                                     duration >= MIN_DURATION_FOR_SCRIPT:
-                                script = extract_script(acc.base, t["prompt"])
+                                script = extract_script_from_prompt(t["prompt"] or "")
                                 if script:
                                     task_store.update_row(t["row_idx"],
                                                           **{COL_SCRIPT_TEXT: script})
-                        except Exception:
-                            pass
+                                    ctx.info(f"口播文案已提取："
+                                             f"{len(script.splitlines())} 句")
+                        except Exception as e:
+                            ctx.debug(f"口播提取异常：{type(e).__name__}")
 
                         ctx.info(f"{st} | 下载{len(local_paths)}个 | 记录已回写")
                     except Exception as e:

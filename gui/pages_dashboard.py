@@ -56,9 +56,10 @@ class DashboardPage(QWidget):
         self.k_fail = KpiCard("失败", "✖", "#F54A45")
         self.k_cancel = KpiCard("取消", "⊘", "#8F959E")
         self.k_run = KpiCard("正在运行", "◌", "#FF8D19")
+        self.k_dur = KpiCard("平均用时", "⏱", "#0FB5AE")
         for k in (self.k_total, self.k_ok, self.k_rate, self.k_fail,
-                  self.k_cancel, self.k_run):
-            k.setMinimumWidth(140)
+                  self.k_cancel, self.k_run, self.k_dur):
+            k.setMinimumWidth(125)
             kpis.addWidget(k)
         lay.addLayout(kpis)
 
@@ -106,6 +107,12 @@ class DashboardPage(QWidget):
         self.k_cancel.set_value(cur["cancel"], *self._cmp(cur["cancel"], prev["cancel"], False))
         run = st["running"]
         self.k_run.set_value(run, "云端生成中" if run else "空闲")
+        # 成功执行的平均用时（秒），与上期对比，越短越好
+        avg_c, avg_p = cur.get("avg_dur") or 0, prev.get("avg_dur") or 0
+        dt, up = _delta_text(round(avg_c), round(avg_p), False) if avg_p else ("", None)
+        self.k_dur.set_value(f"{avg_c:.0f}秒" if avg_c else "—",
+                             dt if (avg_p and avg_c) else
+                             ("—" if not avg_c else "均基于本期"), up)
 
         self.trend.title = f"每日执行趋势 · {scope}（成功/失败/取消 堆叠）"
         self.trend.set_data(st["daily"])

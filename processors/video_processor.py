@@ -70,6 +70,11 @@ def process_outputs(outs, base, row_idx, job_id, product, ctx):
         fname = build_filename(num, product, complete_time, name, seq)
         save_path = Path(DOWNLOAD_DIR) / date_str / fname
         save_path.parent.mkdir(parents=True, exist_ok=True)  # 运行目录下自动创建日期文件夹
+        # 强制重跑/抽卡时同一任务可能几乎同时完成多个 job，避免不同轮次撞名互相覆盖
+        while save_path.exists():
+            seq += 1
+            fname = build_filename(num, product, complete_time, name, seq)
+            save_path = Path(DOWNLOAD_DIR) / date_str / fname
 
         if download_with_retry(full_url, save_path, ctx):
             local_paths.append(str(save_path))

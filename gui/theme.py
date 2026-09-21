@@ -22,7 +22,13 @@ QPushButton#GhostBtn:hover { border-color: #3370FF; color: #3370FF; }
 QLineEdit, QPlainTextEdit, QComboBox {
     background: #FFFFFF; border: 1px solid #DEE0E3; border-radius: 8px; padding: 6px 8px; }
 QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border-color: #3370FF; }
-QComboBox::drop-down { border: none; width: 22px; }
+QComboBox { padding-right: 24px; }
+QComboBox::drop-down { border: none; width: 26px; }
+/* 全局样式表会干掉原生下拉箭头，用 border 三角自绘一个，悬停变蓝 */
+QComboBox::down-arrow { width: 0; height: 0; margin-right: 9px;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 7px solid #646A73; }
+QComboBox:hover::down-arrow { border-top-color: #3370FF; }
 
 QTableWidget { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 10px;
     gridline-color: transparent; }

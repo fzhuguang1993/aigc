@@ -1,10 +1,12 @@
 """
 gui/widgets.py —— 视频/图片预览窗口 + 提示词悬停预览浮层（保留换行/限宽/可滚动）
 """
+import html
+import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint, QTimer
-from PySide6.QtGui import QGuiApplication, QPixmap, QPainter, QPen, QColor
+from PySide6.QtCore import Qt, QUrl, QPoint, QTimer, QRect
+from PySide6.QtGui import QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
@@ -115,11 +117,30 @@ class ImagePreviewDialog(QDialog):
         lay.addLayout(bar)
 
 
+# 中文（含中文标点）连续片段：悬停预览时整段高亮，与英文镜头描述区分开
+_CJK_RUN = re.compile(r"([\u4e00-\u9fff\u3000-\u303f\uff01-\uff5e、。！？“”‘’…—·\u2014]+)")
+
+
+def _highlight_cjk_html(text):
+    """转义 HTML 后，把每段中文包成橙底色 span；保留原有换行"""
+    lines = []
+    for line in text.split("\n"):
+        esc = html.escape(line)
+        lines.append(_CJK_RUN.sub(
+            r'<span style="color:#B54708; background-color:#FFF4C4;">\1</span>', esc))
+    return "<br>".join(lines)
+
+
 class HoverPreview(QScrollArea):
-    """悬停预览浮层：限宽自动换行、超长可滚动、保留原文换行排版"""
+    """悬停预览浮层：限宽自动换行、超长可滚动、保留原文换行排版。
+
+    防抖隐藏：鼠标从单元格移向浮层时会短暂离开表格，hide_soon() 延时检查，
+    只要光标在浮层内或 keep_rect（表格区域）内就保持显示。
+    """
 
     WIDTH = 460
     MAX_H = 340
+    HIDE_DELAY = 300        # ms：离开单元格后给移入浮层留的反应时间
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -142,18 +163,49 @@ class HoverPreview(QScrollArea):
         self.setWidget(self.label)
         self.setFixedWidth(self.WIDTH)
         self.setMaximumHeight(self.MAX_H)
+        self._keep_rect = None                             # 全局坐标：视为“未离开”的区域
+        self._hide_timer = QTimer(self)                    # 延时隐藏检查
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(self.HIDE_DELAY)
+        self._hide_timer.timeout.connect(self._check_hide)
 
-    def show_at(self, text, pos):
+    def set_keep_rect(self, rect):
+        self._keep_rect = rect
+
+    def show_at(self, text, pos, rich_text=False):
         if not text or not text.strip():
             self.hide()
             return
-        # PlainText：原文换行 \n 原样保留
-        self.label.setText(text.rstrip())
+        self._hide_timer.stop()
+        if rich_text:
+            # 富文本：中文字高亮，换行用 <br> 还原
+            self.label.setTextFormat(Qt.TextFormat.RichText)
+            self.label.setText(_highlight_cjk_html(text))
+        else:
+            self.label.setTextFormat(Qt.TextFormat.PlainText)
+            self.label.setText(text.rstrip())
         self.label.adjustSize()
         h = min(self.label.sizeHint().height() + 24, self.MAX_H)
         self.setFixedHeight(h)
         self.move(self.clamp_to_screen(pos))
         self.show()
+
+    def hide_soon(self):
+        """不立即隐藏：给鼠标留出移入浮层的时间"""
+        if self.isVisible():
+            self._hide_timer.start()
+
+    def _check_hide(self):
+        pos = QCursor.pos()
+        if self.geometry().contains(pos) or \
+                (self._keep_rect and self._keep_rect.contains(pos)):
+            self._hide_timer.start()       # 还在浮层/表格内，继续观察
+        else:
+            self.hide()
+
+    def hide(self):
+        self._hide_timer.stop()
+        super().hide()
 
     def clamp_to_screen(self, pos):
         """防止浮层超出屏幕右侧/底部"""

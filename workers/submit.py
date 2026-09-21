@@ -17,7 +17,8 @@ from core.config import (MODE, LORA_BY_MODE, ASSET_DIR, MAX_RETRY, DEFAULT_DURAT
 from core.logger import Ctx
 from core.api_client import upload_asset, submit_job, ApiError
 from store import task_store, product_store
-from store.task_store import COL_RUNS, COL_STATUS, COL_ACCOUNT, COL_JOB_ID
+from store.task_store import (COL_RUNS, COL_STATUS, COL_ACCOUNT, COL_JOB_ID,
+                              COL_DURATION)
 from registry.manager import REG, invalidate_load_cache, get_account, pick_account
 from workers.scan import mark_submitted
 
@@ -100,7 +101,8 @@ def _register_success(acc, row_idx, job_id, prompt, product, ctx, duration):
                           **{COL_RUNS: runs,
                              COL_STATUS: "submitted",
                              COL_ACCOUNT: acc.name,
-                             COL_JOB_ID: job_id})
+                             COL_JOB_ID: job_id,
+                             COL_DURATION: int(duration or 0)})   # 任务表留痕本次提交时长
     task_store.record_run_start(row_idx, task.get("num", ""),
                                 product, acc.name, job_id)
 

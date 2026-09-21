@@ -40,6 +40,11 @@ class Registry:
                     return dict(t)
         return None
 
+    def get_all_by_row(self, row_idx):
+        """同一任务可能并发跑多个 job（强制重跑/抽卡），返回列表而非单个"""
+        with self.lock:
+            return [dict(t) for t in self.tasks.values() if t["row_idx"] == row_idx]
+
     def count_active_by_account(self, name):
         with self.lock:
             return sum(1 for t in self.tasks.values()

@@ -48,6 +48,8 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 8 | 提交重试换线 | 其他健康账号（换线 + 指数退避 2/4/8s，封顶 10s） | 无备选账号时原账号退避重试 | `workers/submit.py: _next_account / do_submit` |
 | 9 | 口播文案提取 | 任务时长 ≥ `MIN_DURATION_FOR_SCRIPT` 才提取 | 提取失败静默（不影响主流程） | `workers/poll.py` |
 | 10 | 账号健康标记 | `health` 连续成功 | 连续失败 ≥3 次标记不可用，监控线程自动恢复 | `registry/manager.py: health_monitor_worker` |
+| 11 | 下载文件名防撞 | `next_seq()` 扫描已有文件取最大序号 +1 | 序号仍撞名（强制重跑/抽卡时同任务并发多 job）则线性探测下一个可用序号 | `processors/video_processor.py: process_outputs` |
+| 12 | 已完成任务重跑 | 提示词在上次执行后改过 → 自动识别为「迭代执行」，无需确认 | 没改过 → 弹窗确认是否「强制重跑」，单条时可选抽卡次数（同提示词并发多 job） | `store/task_store.py: iter_ready` + `gui/dialogs.py: ForceRerunDialog` |
 
 ## 5. 并发与资源约定
 

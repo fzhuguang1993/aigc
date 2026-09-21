@@ -15,14 +15,25 @@ from gui.header import page_header
 from gui.widgets import LoadingOverlay
 from gui.tablekit import FieldManagerDialog, apply_field_layout, enable_drag_with_lock
 
-DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间", "输出文件", "错误信息"]
+DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间", "用时", "输出文件", "错误信息"]
 HEADERS = [""] + DATA_HEADERS
 CHECK_COL = 0
 COL_START, COL_NUM, COL_PRODUCT, COL_ACCOUNT, COL_STATUS, COL_END, \
-    COL_OUT, COL_ERR = range(1, 9)
+    COL_DUR, COL_OUT, COL_ERR = range(1, 10)
 LEFT_COLS = (COL_OUT, COL_ERR)          # 长文本列左对齐，其余居中
 _COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
            "cancelled": "#8F959E"}
+
+
+def _fmt_dur(seconds):
+    """执行用时展示：秒级精度，超过 1 分钟折算分秒"""
+    try:
+        d = int(seconds or 0)
+    except (TypeError, ValueError):
+        return ""
+    if d <= 0:
+        return ""
+    return f"{d // 60}分{d % 60}秒" if d >= 60 else f"{d}秒"
 
 
 class RecordsPage(QWidget):
@@ -98,7 +109,7 @@ class RecordsPage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(COL_OUT, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(COL_ERR, QHeaderView.ResizeMode.Stretch)
         for c, w in {COL_START: 120, COL_NUM: 50, COL_PRODUCT: 120, COL_ACCOUNT: 70,
-                     COL_STATUS: 90, COL_END: 120}.items():
+                     COL_STATUS: 90, COL_END: 120, COL_DUR: 70}.items():
             self.table.setColumnWidth(c, w)
         self.table.itemChanged.connect(self._on_item_changed)
         lay.addWidget(self.table, 3)
@@ -184,12 +195,16 @@ class RecordsPage(QWidget):
             self.table.setItem(i, CHECK_COL, ck)
             vals = [(r["started_at"] or "")[5:16], r["num"], r["product"], r["account"],
                     r["status"] or "running", (r["finished_at"] or "")[5:16],
+                    _fmt_dur(r.get("duration")),
                     r["output"] or "", r["error"] or ""]
             for c0, v in enumerate(vals):
                 c = c0 + 1
                 item = QTableWidgetItem(str(v))
                 item.setToolTip(str(v))
                 item.setData(Qt.ItemDataRole.UserRole, r["id"])
+                if c == COL_DUR:
+                    item.setData(Qt.ItemDataRole.DisplayRole,
+                                 int(r.get("duration") or 0))   # 按秒数数值排序
                 item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter
                                       | (Qt.AlignmentFlag.AlignLeft if c in LEFT_COLS
                                          else Qt.AlignmentFlag.AlignCenter))

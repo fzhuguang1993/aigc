@@ -3,7 +3,7 @@ gui/dialogs.py —— 新建 / 编辑任务弹窗、搜索替换弹窗
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                                QPlainTextEdit, QPushButton, QHBoxLayout, QLabel,
-                               QCheckBox, QComboBox, QMessageBox)
+                               QCheckBox, QComboBox, QMessageBox, QSpinBox)
 
 from store import product_store
 
@@ -35,7 +35,8 @@ class TaskDialog(QDialog):
         self.ed_prompt.setPlainText((task or {}).get("prompt", ""))
         self.ed_prompt.setPlaceholderText("描述你想要的视频内容，越具体生成效果越好…\n"
                                           "支持单元格内多行：换行会原样保存并可预览")
-        form.addRow("编 号", self.ed_num)
+        if task:
+            form.addRow("编 号", self.ed_num)      # 仅编辑时可改；新建时编号自增，不展示
         form.addRow("品 名", self.ed_product)
         form.addRow("", self.lbl_ref)
         form.addRow("提示词", self.ed_prompt)
@@ -161,3 +162,67 @@ class FindReplaceDialog(QDialog):
             return None
         return {"find": find, "replace": dlg.ed_replace.text(),
                 "only_selected": dlg.cb_selected.isChecked()}
+
+
+class ForceRerunDialog(QDialog):
+    """已完成、但提示词没改过的任务被要求重跑时的确认弹窗；
+    单条重跑时额外提供「抽卡次数」（AI 随机性，同一条提示词多跑几遍挑效果最好的）"""
+
+    MAX_REPEAT = 20
+
+    def __init__(self, parent=None, task_id=None, count=1, allow_repeat=False):
+        super().__init__(parent)
+        self.setWindowTitle("强制重跑")
+        self.setFixedWidth(420)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+
+        if count == 1:
+            text = (f"任务{task_id} 已经执行成功过，且提示词与上次执行相比没有改动。\n"
+                    "确认要原样重跑一遍看看效果吗？")
+        else:
+            text = (f"勾选的 {count} 个任务都已执行成功过，且提示词都没有改动。\n"
+                    "确认要把它们原样各重跑一遍吗？")
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self.spin_repeat = None
+        if allow_repeat:
+            lay.addSpacing(6)
+            hint = QLabel("也可以让 AI「大力出奇迹」——同一条提示词一次多跑几遍，抽到满意的那条：")
+            hint.setWordWrap(True)
+            hint.setObjectName("PageTip")
+            lay.addWidget(hint)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("执行次数："))
+            self.spin_repeat = QSpinBox()
+            self.spin_repeat.setRange(1, self.MAX_REPEAT)
+            self.spin_repeat.setValue(3)
+            self.spin_repeat.setSuffix(" 次")
+            self.spin_repeat.setToolTip(f"1-{self.MAX_REPEAT} 次，次数越多越容易抽到理想效果，"
+                                        "也会占用更多云端并发额度")
+            row.addWidget(self.spin_repeat)
+            row.addStretch(1)
+            lay.addLayout(row)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        b_cancel = QPushButton("跳过")
+        b_cancel.setObjectName("GhostBtn")
+        b_cancel.clicked.connect(self.reject)
+        b_ok = QPushButton("强制重跑")
+        b_ok.clicked.connect(self.accept)
+        btns.addWidget(b_cancel)
+        btns.addWidget(b_ok)
+        lay.addLayout(btns)
+
+    @staticmethod
+    def ask(parent, task_id=None, count=1, allow_repeat=False):
+        """确认返回 {"repeat": n}；取消返回 None"""
+        dlg = ForceRerunDialog(parent, task_id=task_id, count=count,
+                               allow_repeat=allow_repeat)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        repeat = dlg.spin_repeat.value() if dlg.spin_repeat else 1
+        return {"repeat": repeat}

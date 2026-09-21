@@ -5,8 +5,8 @@ gui/pages_tasks.py —— 任务中心
 """
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt, QDate, QPoint
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QThread, Signal, Qt, QDate, QPoint, QRect
+from PySide6.QtGui import QColor, QCursor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
                                QMenu, QMessageBox, QFileDialog, QAbstractItemView,
@@ -15,8 +15,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 from registry.manager import REG
 from store import task_store, product_store
 from utils.desktop_utils import reveal_in_folder
-from workers.submit import do_submit, SubmitOptions
-from gui.dialogs import TaskDialog, FindReplaceDialog
+from workers.submit import do_submit, cancel_one, SubmitOptions
+from gui.dialogs import TaskDialog, FindReplaceDialog, ForceRerunDialog
 from gui.delegates import ProgressDelegate, ProgressRole
 from gui.widgets import VideoPlayerDialog, HoverPreview
 from gui.header import page_header
@@ -26,13 +26,13 @@ STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45"
                  "cancelled": "#8F959E", "submitted": "#3370FF", "queued": "#3370FF",
                  "starting": "#FF8D19", "cancelling": "#FF8D19"}
 RETRYABLE = {"failed", "error", "cancelled"}
-DATA_HEADERS = ["任务ID", "编号", "品名", "提示词", "状态", "账号",
+DATA_HEADERS = ["任务ID", "编号", "品名", "提示词", "状态", "时长", "执行用时", "账号",
                 "运行", "成功", "口播文案", "更新时间", "输出文件"]
 HEADERS = [""] + DATA_HEADERS          # 第 0 列：勾选框
 CHECK_COL = 0
-COL_PID, COL_NUM, COL_PRODUCT, COL_PROMPT, COL_STATUS, COL_ACCOUNT, \
-    COL_RUNS, COL_OK, COL_SCRIPT, COL_UPDATED, COL_OUT = range(1, 12)
-NUM_COLS = (COL_PID, COL_RUNS, COL_OK)
+COL_PID, COL_NUM, COL_PRODUCT, COL_PROMPT, COL_STATUS, COL_DUR, COL_RUNSEC, \
+    COL_ACCOUNT, COL_RUNS, COL_OK, COL_SCRIPT, COL_UPDATED, COL_OUT = range(1, 14)
+NUM_COLS = (COL_PID, COL_RUNS, COL_OK, COL_DUR, COL_RUNSEC)
 STRETCH_COLS = (COL_PROMPT, COL_OUT)
 PREVIEW_COLS = {COL_PROMPT: "提示词", COL_SCRIPT: "口播文案"}   # 悬停浮层预览列
 BAR_STATUS = ("running", "starting")   # 用图形进度条显示的状态
@@ -74,6 +74,7 @@ class TasksPage(QWidget):
         b_run = QPushButton("▶ 执行选中")
         b_runall = QPushButton("⏩ 执行全部待办")
         b_scan = QPushButton("🔍 扫描新任务")
+        b_cancel = QPushButton("⏹ 取消选中")
         b_del = QPushButton("🗑 删除")
         b_io = QPushButton("📁 导入/导出")
         # 注意：QPushButton.setMenu 配合全局样式表会导致点击无反应，改为手动弹出菜单
@@ -83,9 +84,9 @@ class TasksPage(QWidget):
         b_fields = QPushButton("⚟ 字段管理")
         b_fields.setObjectName("GhostBtn")
         b_fields.setToolTip("控制显示哪些列，拖动表头可直接调整列顺序")
-        for b in (b_del, b_io, b_fields):
+        for b in (b_cancel, b_del, b_io, b_fields):
             b.setObjectName("GhostBtn")
-        for b in (b_new, b_run, b_runall, b_scan, b_del, b_io, b_fields):
+        for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del, b_io, b_fields):
             bar.addWidget(b)
         bar.addStretch(1)
         bar.addWidget(QLabel("时长"))
@@ -154,7 +155,8 @@ class TasksPage(QWidget):
         for c in STRETCH_COLS:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
         widths = {COL_PID: 60, COL_NUM: 50, COL_PRODUCT: 110, COL_STATUS: 130,
-                  COL_ACCOUNT: 70, COL_RUNS: 50, COL_OK: 50, COL_SCRIPT: 90, COL_UPDATED: 95}
+                  COL_DUR: 52, COL_RUNSEC: 80, COL_ACCOUNT: 70, COL_RUNS: 50,
+                  COL_OK: 50, COL_SCRIPT: 90, COL_UPDATED: 95}
         for c, w in widths.items():
             self.table.setColumnWidth(c, w)
         self.table.itemChanged.connect(self._on_item_changed)
@@ -210,6 +212,7 @@ class TasksPage(QWidget):
 
         b_new.clicked.connect(self._new_task)
         b_del.clicked.connect(self._del_selected)
+        b_cancel.clicked.connect(self._cancel_selected)
         b_run.clicked.connect(lambda: self._run(True))
         b_runall.clicked.connect(lambda: self._run(False))
         b_scan.clicked.connect(self._scan_new)
@@ -327,7 +330,9 @@ class TasksPage(QWidget):
         start = (self._page - 1) * size
         page_rows = self._filtered[start:start + size]
 
-        active = {t["row_idx"]: t for t in REG.active()}
+        active_map = {}
+        for t in REG.active():                 # 同一任务可能并发多个 job（强制重跑/抽卡）
+            active_map.setdefault(t["row_idx"], []).append(t)
         header = self.table.horizontalHeader()
         sort_col, sort_order = header.sortIndicatorSection(), header.sortIndicatorOrder()
         if sort_col == CHECK_COL:
@@ -335,20 +340,24 @@ class TasksPage(QWidget):
         self.table.setSortingEnabled(False)
         self._syncing = True
         self.table.setRowCount(0)
+        has_bar = False
         for tid, row in page_rows:
             r = self.table.rowCount()
             self.table.insertRow(r)
             status = str(row["状态"]).strip()
-            at = active.get(tid)
+            ats = active_map.get(tid)
             out_path = str(row["输出"]).split(";")[0].strip()
             for c in range(len(HEADERS)):
-                item = self._make_item(tid, row, r, c, at, status, out_path)
+                item = self._make_item(tid, row, r, c, ats, status, out_path)
                 self.table.setItem(r, c, item)
-            if at and at["status"] in BAR_STATUS:
-                self.table.setRowHeight(r, 30)
+            if ats and any(t["status"] in BAR_STATUS for t in ats):
+                self.table.setRowHeight(r, 34)
+                has_bar = True
         self.table.setSortingEnabled(True)
         self.table.sortItems(sort_col, sort_order)
         self._syncing = False
+        # 有进度条行才开移动画定时器，平时完全静默
+        self.table.itemDelegate().set_anim_enabled(has_bar)
 
         self.lbl_count.setText(f"显示 {len(self._filtered)}/{len(df)} 条")
         self.lbl_page.setText(f"第 {self._page} / {self._page_count()} 页")
@@ -356,7 +365,7 @@ class TasksPage(QWidget):
         self.b_next.setEnabled(self._page < self._page_count())
         self._update_sel_label()
 
-    def _make_item(self, tid, row, r, c, at, status, out_path):
+    def _make_item(self, tid, row, r, c, ats, status, out_path):
         item = QTableWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, tid)     # 行→任务ID，排序后仍可靠
         pct = None
@@ -378,13 +387,43 @@ class TasksPage(QWidget):
         elif c == COL_STATUS:
             show = status or "待执行"
             color_key = status
-            if at:
-                show, color_key = at["status"], at["status"]
-                if at["status"] in BAR_STATUS:
-                    pct = int(at["progress"] or 0)
-                    show = ""                            # 由 delegate 画进度条
+            if ats:
+                if len(ats) == 1:
+                    at0 = ats[0]
+                    show, color_key = at0["status"], at0["status"]
+                    if at0["status"] in BAR_STATUS:
+                        pct = int(at0["progress"] or 0)
+                        show = ""                        # 由 delegate 画进度条
+                else:
+                    n = len(ats)
+                    color_key = "running"
+                    show = f"执行中×{n}"
+                    bars = [int(t["progress"] or 0) for t in ats
+                            if t["status"] in BAR_STATUS]
+                    if bars:
+                        pct = min(bars)                  # 多路并发时以最慢一条代表整体
+                        show = ""
+                    item.setToolTip(f"{n} 个执行正在进行（抽卡/重跑），进度条显示最慢的一条")
             item.setText(show)
             item.setForeground(QColor(STATUS_COLORS.get(color_key, "#8A94A6")))
+        elif c == COL_DUR:
+            try:
+                d = int(row["时长"] or 0)
+            except (TypeError, ValueError):
+                d = 0
+            if d:
+                item.setData(Qt.ItemDataRole.DisplayRole, d)   # 数值排序
+            item.setText(f"{d}秒" if d else "—")
+            item.setToolTip("本任务最后一次提交选的视频时长（执行后自动登记）")
+        elif c == COL_RUNSEC:
+            try:
+                d = int(row["执行用时"] or 0)
+            except (TypeError, ValueError):
+                d = 0
+            if d:
+                item.setData(Qt.ItemDataRole.DisplayRole, d)   # 数值排序
+            item.setText(f"{d // 60}分{d % 60}秒" if d >= 60 else (f"{d}秒" if d else "—"))
+            item.setToolTip("最近一次有用时记录的云端执行耗时")
         elif c == COL_ACCOUNT:
             item.setText(str(row["账号"]))
         elif c == COL_RUNS:
@@ -456,16 +495,18 @@ class TasksPage(QWidget):
 
     # ============ 悬停预览浮层 ============
     def _on_cell_entered(self, r, c):
-        if c not in PREVIEW_COLS:
-            self.hover.hide()
-            return
-        if self.table.item(r, c) is None:
-            self.hover.hide()
+        if c not in PREVIEW_COLS or self.table.item(r, c) is None:
+            self.hover.hide_soon()          # 延时隐藏：给鼠标移入浮层留时间
             return
         text = self._filtered_full_text(r, c)
-        rect = self.table.visualItemRect(self.table.item(r, c))
-        pos = self.table.viewport().mapToGlobal(rect.bottomRight())
-        self.hover.show_at(text, QPoint(pos.x() + 8, pos.y() + 4))
+        if not text.strip():
+            self.hover.hide_soon()
+            return
+        # 跟随鼠标右下方弹出（而不是固定在单元格角上），移过去更顺手
+        pos = QCursor.pos()
+        self.hover.set_keep_rect(QRect(self.table.viewport().mapToGlobal(QPoint(0, 0)),
+                                       self.table.viewport().size()))
+        self.hover.show_at(text, QPoint(pos.x() + 16, pos.y() + 14), rich_text=True)
 
     def _filtered_full_text(self, r, c):
         tid = self._row_tid(r)
@@ -477,7 +518,7 @@ class TasksPage(QWidget):
     def eventFilter(self, obj, e):
         from PySide6.QtCore import QEvent
         if obj is self.table.viewport() and e.type() == QEvent.Type.Leave:
-            self.hover.hide()
+            self.hover.hide_soon()          # 离开表格也延时检查（鼠标可能正在去浮层路上）
         return super().eventFilter(obj, e)
 
     # ============ 双击 / 右键 ============
@@ -516,6 +557,14 @@ class TasksPage(QWidget):
         item_out = self.table.item(r, COL_OUT)
         path = item_out.data(Qt.ItemDataRole.UserRole + 2) if item_out else ""
         menu = QMenu(self)
+        ats = REG.get_all_by_row(self._row_tid(r))
+        if ats:
+            if len(ats) == 1:
+                menu.addAction("⏹ 取消执行（云端）", lambda: self._cancel(ats[0]))
+            else:
+                menu.addAction(f"⏹ 取消全部执行 ×{len(ats)}（云端）",
+                               lambda: self._cancel_many(ats))
+            menu.addSeparator()
         if path:
             menu.addAction("▶ 播放预览", lambda: self._play_video(r))
             menu.addAction("📂 打开存放位置", lambda: self._open_location(r))
@@ -525,6 +574,66 @@ class TasksPage(QWidget):
         menu.addAction("🗑 删除任务",
                        lambda: self._del_tasks({self._row_tid(r)}))
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # ============ 取消云端任务 ============
+    def _cancel(self, at):
+        """向云端发送取消请求；终态由轮询线程回写"""
+        tid = at["row_idx"]
+        if QMessageBox.question(
+                self, "取消任务",
+                f"任务{tid} 正在{at['status']}（{int(at['progress'] or 0)}%），"
+                "确认取消？") != QMessageBox.StandardButton.Yes:
+            return
+        self._do_cancel(at)
+
+    def _cancel_many(self, ats):
+        """同一任务并发多路执行（抽卡/重跑）时，一次确认全部取消"""
+        tid = ats[0]["row_idx"]
+        if QMessageBox.question(
+                self, "取消任务",
+                f"任务{tid} 当前有 {len(ats)} 个执行正在进行（抽卡/重跑），"
+                "确认全部取消？") != QMessageBox.StandardButton.Yes:
+            return
+        ok = fail = 0
+        for at in ats:
+            if cancel_one(at):
+                ok += 1
+            else:
+                fail += 1
+        if fail:
+            QMessageBox.warning(self, "部分取消失败",
+                                f"{ok} 个已发送取消请求，{fail} 个失败，详见日志")
+        else:
+            self.lbl_tip.setText(f"⏹ 任务{tid} 的 {ok} 个执行均已发送取消请求，等待云端确认…")
+        self.refresh()
+
+    def _do_cancel(self, at):
+        tid = at["row_idx"]
+        if cancel_one(at):
+            self.lbl_tip.setText(f"⏹ 任务{tid} 已发送取消请求，等待云端确认…")
+        else:
+            QMessageBox.warning(self, "取消失败",
+                                f"任务{tid} 取消请求发送失败，详见日志")
+        self.refresh()
+
+    def _cancel_selected(self):
+        targets = []
+        for tid in sorted(self._selected_ids):
+            targets.extend(REG.get_all_by_row(tid))
+        if not targets:
+            self.lbl_tip.setText("没有可取消的任务：勾选的任务均未在执行")
+            return
+        by_task = {}
+        for at in targets:
+            by_task.setdefault(at["row_idx"], []).append(at)
+        if len(targets) == 1:
+            self._cancel(targets[0])
+            return
+        for tid, ats in by_task.items():
+            if len(ats) == 1:
+                self._cancel(ats[0])
+            else:
+                self._cancel_many(ats)
 
     def _check_script(self, r):
         """按产品规范卡 + 风控政策检测该任务的口播/提示词合规性"""
@@ -636,6 +745,8 @@ class TasksPage(QWidget):
         else:
             tids = [tid for tid, _ in self._filtered]
         items = []
+        iterated = 0
+        force = []                       # 已完成但提示词没改过，需确认是否强制重跑
         for tid in tids:
             t = task_store.get_task(tid)
             if not t:
@@ -644,14 +755,35 @@ class TasksPage(QWidget):
             if not prompt:
                 continue
             if t["status"] and t["status"] not in RETRYABLE and int(t["runs"] or 0) > 0:
-                continue
+                # 已完成过：若提示词在上次执行后又改过 → 自动识别为“迭代执行”；
+                # 没改过 → 收集到 force，交给用户确认是否强制重跑（而不是静默跳过）
+                if not task_store.iter_ready(tid):
+                    force.append((tid, t["product"], prompt))
+                    continue
+                iterated += 1
             if t["status"] in RETRYABLE:
                 task_store.update_row(tid, **{"状态": ""})
             items.append((tid, t["product"], prompt))
+
+        repeated = 1
+        if force:
+            single = len(force) == 1 and not items
+            d = ForceRerunDialog.ask(self, task_id=force[0][0] if single else None,
+                                     count=len(force), allow_repeat=single)
+            if d is not None:
+                repeated = d["repeat"]
+                for it in force:
+                    items.extend([it] * repeated)
+
         if not items:
-            self.lbl_tip.setText("没有可执行的任务：请确认已填写提示词，且任务尚未成功执行过")
+            self.lbl_tip.setText("没有可执行的任务：请确认已填写提示词；改过提示词的已完成任务会自动按迭代重跑")
             return
-        self.lbl_tip.setText(f"正在提交 {len(items)} 个任务…")
+        self.lbl_tip.setText(f"正在提交 {len(items)} 个任务"
+                             + (f"（含 {iterated} 个提示词迭代）" if iterated else "")
+                             + (f"（任务{force[0][0]} 抽 {repeated} 次卡）"
+                                if repeated > 1 and len(force) == 1
+                                else f"（含 {len(force)} 个强制重跑）" if force else "")
+                             + "…")
         self.worker = SubmitWorker(items, self._current_options())
         self.worker.log_msg.connect(lambda m: self.lbl_tip.setText(m))
         self.worker.all_done.connect(
