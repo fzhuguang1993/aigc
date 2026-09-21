@@ -10,6 +10,10 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # 提到 job 级：step 的 if 里要用它判断“配没配 secret”（配了才验证，
+    # 没配则那一步显示为 skipped，从运行页一眼就能看出包里不带凭证）
+    env:
+      CONFIG_LOCAL_PY: ${{ secrets.CONFIG_LOCAL_PY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,8 +31,6 @@ jobs:
       # 那部分由同事首次启动的向导写 config.json）。
       - name: Restore local config from secrets
         shell: bash
-        env:
-          CONFIG_LOCAL_PY: ${{ secrets.CONFIG_LOCAL_PY }}
         run: |
           if [ -z "$CONFIG_LOCAL_PY" ]; then
             echo "::warning::secret CONFIG_LOCAL_PY 未配置：打出的 exe 不内置提取接口地址"
@@ -54,3 +56,17 @@ jobs:
         with:
           name: aigc-windows-exe
           path: dist/*.exe
+
+      # 只验证“有没有”，绝不把地址/Key 打印到日志里
+      - name: Verify API embedded in exe
+        if: env.CONFIG_LOCAL_PY != ''
+        shell: bash
+        run: |
+          python - <<'PY'
+          from core import config
+          assert config.MATERIAL_API_BASE, "config_local 已写入却没读到接口地址"
+          print(f"OK 接口地址已加载（长度 {len(config.MATERIAL_API_BASE)}）")
+          PY
+          # PyInstaller 的分析清单里有这个模块，才说明真的编译进了 exe
+          grep -qa "core.config_local" build/*/Analysis-00.toc \
+            && echo "OK core.config_local 已打进包"
