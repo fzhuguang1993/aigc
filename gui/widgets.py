@@ -5,7 +5,7 @@ import html
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint, QTimer, QRect
+from PySide6.QtCore import Qt, QUrl, QPoint, QTimer, QRect, Signal
 from PySide6.QtGui import QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -253,6 +253,79 @@ class HoverPreview(QScrollArea):
         x = min(pos.x(), screen.right() - self.width() - 8)
         y = min(pos.y(), screen.bottom() - self.height() - 8)
         return QPoint(max(x, screen.left()), max(y, screen.top()))
+
+
+class Toast(QWidget):
+    """右下角轻量浮层提示：可带一个动作按钮（如「撤销」），自动消失、不抢焦点。
+
+    用于删除可撤销、本批任务完成等“提醒一下就够、不值得弹框打断”的场景。
+    调用方需持有引用防 GC；close 时发 finished 信号便于自行清理引用。"""
+    finished = Signal()
+
+    def __init__(self, text, action_text="", msec=5000, on_action=None,
+                 anchor=None, color="#3370FF", parent=None):
+        super().__init__(parent, Qt.WindowType.Tool
+                         | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._on_action = on_action
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        box = QLabel(text)
+        box.setObjectName("ToastBox")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setStyleSheet(
+            f"QLabel#ToastBox{{background:#FFFFFF;color:#1F2329;"
+            f"border:1px solid {color};border-left:4px solid {color};"
+            f"border-radius:8px;padding:10px 14px;}}")
+        lay.addWidget(box)
+        if action_text:
+            btn = QPushButton(action_text)
+            btn.setObjectName("ToastBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(
+                "QPushButton#ToastBtn{background:#FFFFFF;color:#3370FF;"
+                "border:1px solid #DEE0E3;border-radius:8px;padding:8px 12px;}"
+                "QPushButton#ToastBtn:hover{border-color:#3370FF;}")
+            btn.clicked.connect(self._do_action)
+            lay.addWidget(btn)
+        self.adjustSize()
+        self._place(anchor)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.close)
+        self._timer.start(msec)
+        self.finished.connect(self.deleteLater)
+
+    def _do_action(self):
+        try:
+            if self._on_action:
+                self._on_action()
+        finally:
+            self.close()
+
+    def _place(self, anchor):
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        m = 18
+        if anchor is not None and anchor.isVisible():
+            g = anchor.mapToGlobal(QPoint(0, 0))
+            x = g.x() + anchor.width() - self.width() - m
+            y = g.y() + anchor.height() - self.height() - m
+        else:
+            x = screen.right() - self.width() - m
+            y = screen.bottom() - self.height() - m
+        x = max(screen.left() + 4, min(x, screen.right() - self.width() - 4))
+        y = max(screen.top() + 4, min(y, screen.bottom() - self.height() - 4))
+        self.move(x, y)
+
+    def mousePressEvent(self, e):
+        self.close()          # 点一下即收起
+        super().mousePressEvent(e)
+
+    def closeEvent(self, e):
+        self._timer.stop()
+        self.finished.emit()
+        super().closeEvent(e)
 
 
 class _Spinner(QWidget):

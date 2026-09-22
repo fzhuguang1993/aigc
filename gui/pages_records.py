@@ -45,7 +45,7 @@ class RecordsPage(QWidget):
 
         top = QHBoxLayout()
         top.addWidget(page_header("执行记录",
-                                  "每次提交留痕 · 点表头排序",  # noqa: E501
+                                  "每次提交留痕 · 默认最新在前 · 点表头排序",  # noqa: E501
                                   icon="🕘"), 1)
         b_exp = QPushButton("📤 导出全部记录")
         b_exp.setObjectName("GhostBtn")
@@ -112,6 +112,8 @@ class RecordsPage(QWidget):
                      COL_STATUS: 90, COL_END: 120, COL_DUR: 70}.items():
             self.table.setColumnWidth(c, w)
         self.table.itemChanged.connect(self._on_item_changed)
+        # 默认「最新在前」：按开始时间倒序，与任务中心口径一致（点表头可改列/方向）
+        self.table.horizontalHeader().setSortIndicator(COL_START, Qt.SortOrder.DescendingOrder)
         lay.addWidget(self.table, 3)
 
         lay.addWidget(QLabel("实时日志"))

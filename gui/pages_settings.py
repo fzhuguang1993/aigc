@@ -103,7 +103,7 @@ class SettingsPage(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
 
-        # ---------- 输出目录：默认隐藏，Alt+R（Mac ⌘+R）口令解锁后才出现（不暴露入口） ----------
+        # ---------- 输出目录：默认隐藏，Alt+W（Mac ⌘+W）口令解锁后才出现（不暴露入口） ----------
         self._dirs_unlocked = False
         self.dirs_box = QWidget()
         dbox = QVBoxLayout(self.dirs_box)
@@ -194,7 +194,7 @@ class SettingsPage(QWidget):
         crow.addWidget(self.ed_ai_model)
         lay.addLayout(crow)
 
-        # 维护人入口：Alt+R（Mac ⌘+R）唤出口令框，验证通过才显示「输出目录」；
+        # 维护人入口：Alt+W（Mac ⌘+W）唤出口令框，验证通过才显示「输出目录」；
         # 仅当停在设置页时激活（show/hideEvent 开关），避免别处误触。
         self._sc_dirs = QShortcut(QKeySequence(MAINTAINER_SHORTCUT), self)
         self._sc_dirs.setContext(Qt.ShortcutContext.WindowShortcut)

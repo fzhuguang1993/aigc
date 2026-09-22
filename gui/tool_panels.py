@@ -24,12 +24,12 @@ from utils.desktop_utils import open_path
 
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv"}
 
-# 维护人口令：在素材提取工具窗口按 Alt+R（macOS 为 ⌘+R）唤出密文输入框，
+# 维护人口令：在素材提取工具窗口按 Alt+W（macOS 为 ⌘+W）唤出密文输入框，
 # 输入这串口令才进入接口配置。定位是“不主动暴露给同事”，不是强安全（口令会
 # 存在于源码/exe 里，逆向可得）；真正的强安全靠打包时注入 config_local.py。
 API_MAINTAINER_CODE = "whosyourdaddy"
 # 唤出口令框的快捷键：macOS 用 Command(Qt 里叫 Meta)，其余平台用 Alt
-MAINTAINER_SHORTCUT = "Meta+R" if sys.platform == "darwin" else "Alt+R"
+MAINTAINER_SHORTCUT = "Meta+W" if sys.platform == "darwin" else "Alt+W"
 
 
 # ====================================================================
@@ -842,7 +842,7 @@ class MaterialPanel(BasePanel):
                                         " background:transparent;")
         outer.addWidget(self.lbl_api_host)
 
-        # ---- 接口配置：默认整组隐藏，需 Alt+R（Mac ⌘+R）口令解锁；输入全程密文 ----
+        # ---- 接口配置：默认整组隐藏，需 Alt+W（Mac ⌘+W）口令解锁；输入全程密文 ----
         self._base_unlocked = False
         self.api_cfg_box = QGroupBox("🔧 维护人 · 接口配置")
         form2 = QFormLayout(self.api_cfg_box)
@@ -877,14 +877,14 @@ class MaterialPanel(BasePanel):
         self.make_log_box(outer, height=120)
         self.make_run_row(outer, "▶ 开始提取")
 
-        # 快捷键唤出口令框：Alt+R（macOS ⌘+R），仅本工具窗口激活时生效
+        # 快捷键唤出口令框：Alt+W（macOS ⌘+W），仅本工具窗口激活时生效
         self._sc_maintainer = QShortcut(QKeySequence(MAINTAINER_SHORTCUT), self)
         self._sc_maintainer.setContext(Qt.ShortcutContext.WindowShortcut)
         self._sc_maintainer.activated.connect(self._summon_maintainer)
 
     # ---- 维护人入口：快捷键 → 密文口令框 → 校验通过才展开接口配置 ----
     def _summon_maintainer(self):
-        """按 Alt+R（macOS ⌘+R）：弹密文口令框，输对才进入接口配置"""
+        """按 Alt+W（macOS ⌘+W）：弹密文口令框，输对才进入接口配置"""
         if self._base_unlocked:               # 已展开则直接聚焦，不必重复输口令
             self.ed_api_base.setFocus()
             return

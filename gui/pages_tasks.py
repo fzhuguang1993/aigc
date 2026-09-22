@@ -6,12 +6,12 @@ gui/pages_tasks.py —— 任务中心
 from pathlib import Path
 import time
 
-from PySide6.QtCore import QThread, Signal, Qt, QDate, QPoint
-from PySide6.QtGui import QColor, QCursor
+from PySide6.QtCore import QThread, Signal, Qt, QDate, QPoint, QTimer
+from PySide6.QtGui import QColor, QCursor, QGuiApplication, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
                                QMenu, QMessageBox, QFileDialog, QAbstractItemView,
-                               QLineEdit, QDateEdit, QCheckBox, QInputDialog)
+                               QLineEdit, QDateEdit, QCheckBox, QInputDialog, QFrame)
 
 from registry.manager import REG, BatchBalancer
 from core.config import DEFAULT_STEPS, SUBMIT_PACING, BALANCE_RESCAN_EVERY
@@ -21,7 +21,7 @@ from workers.submit import do_submit, cancel_one, SubmitOptions
 from gui.dialogs import (TaskDialog, FindReplaceDialog, ForceRerunDialog,
                          ScriptBindDialog)
 from gui.delegates import ProgressDelegate, ProgressRole
-from gui.widgets import VideoPlayerDialog, HoverPreview
+from gui.widgets import VideoPlayerDialog, HoverPreview, Toast
 from gui.header import page_header
 from gui.tablekit import FieldManagerDialog, apply_field_layout, enable_drag_with_lock
 
@@ -29,6 +29,11 @@ STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45"
                  "cancelled": "#8F959E", "submitted": "#3370FF", "queued": "#3370FF",
                  "starting": "#FF8D19", "cancelling": "#FF8D19"}
 RETRYABLE = {"failed", "error", "cancelled"}
+# 状态图标（配颜色一起用，色弱/远看也能辨）：前缀到状态文字前
+STATUS_ICONS = {"completed": "✓ ", "succeeded": "✓ ", "failed": "✕ ", "error": "✕ ",
+                "timeout": "✕ ", "cancelled": "⊘ ", "canceled": "⊘ ",
+                "running": "⏳ ", "starting": "⏳ ", "cancelling": "⏳ ",
+                "submitted": "⏩ ", "queued": "⏩ "}
 # 列表字段全量展示（含以前的隐藏技术字段），“字段管理”里逐个可勾可拖：
 # 任务一多，使用者需要自己能控制看哪几列、列序怎么排
 DATA_HEADERS = ["任务ID", "编号", "品名", "备注", "脚本", "提示词", "状态", "时长",
@@ -90,6 +95,45 @@ class SubmitWorker(QThread):
         self.all_done.emit(failed)
 
 
+class _GuideBubble(QWidget):
+    """任务中心首次上手的引导气泡：无边框小卡片，指向下一步操作，可跳过"""
+    advanced = Signal()
+    closed = Signal()
+
+    def __init__(self, parent, text, idx, total):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("GuideCard")
+        card.setStyleSheet("QFrame#GuideCard{background:#FFFFFF;border:1px solid #3370FF;"
+                           "border-radius:10px;}")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(16, 12, 16, 12)
+        cl.setSpacing(8)
+        head = QLabel(f"快速上手 · {idx}/{total}")
+        head.setStyleSheet("color:#3370FF;font-weight:bold;")
+        cl.addWidget(head)
+        body = QLabel(text)
+        body.setWordWrap(True)
+        body.setMinimumWidth(300)
+        body.setMaximumWidth(340)
+        cl.addWidget(body)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b_skip = QPushButton("跳过")
+        b_skip.setObjectName("GhostBtn")
+        b_next = QPushButton("下一步" if idx < total else "开始使用")
+        b_skip.clicked.connect(self.closed.emit)
+        b_next.clicked.connect(self.advanced.emit)
+        row.addWidget(b_skip)
+        row.addWidget(b_next)
+        cl.addLayout(row)
+        lay.addWidget(card)
+
+
 class TasksPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -97,7 +141,7 @@ class TasksPage(QWidget):
         lay.setContentsMargins(24, 12, 24, 12)
         lay.setSpacing(6)
 
-        lay.addWidget(page_header("任务中心", "双击输出列播放 · 单击/空格弹出全文 · 任意键关闭 · 右键更多", icon="📋"))
+        lay.addWidget(page_header("任务中心", "单击输出列播放视频 · 单击/空格弹出全文 · 任意键关闭 · 右键更多", icon="📋"))
 
         # ---------- 工具栏 ----------
         bar = QHBoxLayout()
@@ -119,6 +163,9 @@ class TasksPage(QWidget):
             b.setObjectName("GhostBtn")
         for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del, b_io, b_fields):
             bar.addWidget(b)
+        # 留存几个引导/快捷键目标（首次上手气泡、顶部待办数量都要用）
+        self.b_new, self.b_run, self.b_io = b_new, b_run, b_io
+        self.b_runall, self.b_fields = b_runall, b_fields
         bar.addStretch(1)
         bar.addWidget(QLabel("时长"))
         self.cb_duration = QComboBox()
@@ -136,6 +183,14 @@ class TasksPage(QWidget):
         self.cb_kol = QComboBox()
         self.cb_kol.addItems(["不使用"] + product_store.kol_names())
         bar.addWidget(self.cb_kol)
+        # 常驻“本次默认参数”：避免“改了时长/步数没生效”的经典困惑
+        bar.addSpacing(8)
+        self.lbl_params = QLabel("")
+        self.lbl_params.setObjectName("PageTip")
+        self.lbl_params.setToolTip(
+            "工具栏当前值＝下一次「执行选中/执行全部待办」会用到的参数；\n"
+            "表格里的「时长」列只是上次提交的留痕，改不动也不起作用")
+        bar.addWidget(self.lbl_params)
         lay.addLayout(bar)
         self._restore_exec_params()          # 沿用上次用过的时长/步数/KOL
 
@@ -147,11 +202,12 @@ class TasksPage(QWidget):
         self.ed_search.setFixedWidth(240)
         self.ed_search.returnPressed.connect(lambda: (self._goto_first_page(), self.refresh()))
         fbar.addWidget(self.ed_search)
-        b_replace = QPushButton("🔁 搜索替换/定位")
+        b_replace = QPushButton("🔁 查找/替换")
         b_replace.setObjectName("GhostBtn")
-        b_replace.setToolTip("批量改写提示词；改完自动勾选并置顶那批命中的任务，直接「执行选中」")
+        b_replace.setToolTip("默认只查找：按关键词挑一批任务勾选置顶；点「替换 »」展开后可批量改写提示词")
         b_replace.clicked.connect(self._find_replace)
         fbar.addWidget(b_replace)
+        self.b_replace_btn = b_replace
         fbar.addSpacing(12)
         # 下拉筛选：任务上百条后光靠搜索框拦不住，要能按品名/状态/备注直接分档
         self.cb_f_product = QComboBox()
@@ -182,7 +238,7 @@ class TasksPage(QWidget):
         fbar.addWidget(self.de_end)
         b_clear = QPushButton("✕ 清除筛选")
         b_clear.setObjectName("GhostBtn")
-        b_clear.setToolTip("清空搜索/日期条件，并取消「置顶聚集」（回到完全按编号的顺序）")
+        b_clear.setToolTip("清空搜索/日期条件，并取消「置顶聚集」（回到默认的最新在前）")
         b_clear.clicked.connect(self._clear_filters)
         fbar.addWidget(b_clear)
         fbar.addStretch(1)
@@ -190,6 +246,21 @@ class TasksPage(QWidget):
         self.lbl_count.setObjectName("PageTip")
         fbar.addWidget(self.lbl_count)
         lay.addLayout(fbar)
+
+        # ---------- 快捷筛选标签（A1）：一键设好状态/日期常用组合 ----------
+        chbar = QHBoxLayout()
+        chbar.setSpacing(6)
+        chbar.addWidget(QLabel("快捷筛选："))
+        for label, kind in (("待执行", "todo"), ("进行中", "running"),
+                            ("失败/可重试", "retry"), ("今日更新", "today"),
+                            ("全部放开", "all")):
+            b = QPushButton(label)
+            b.setObjectName("ChipBtn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, k=kind: self._quick_filter(k))
+            chbar.addWidget(b)
+        chbar.addStretch(1)
+        lay.addLayout(chbar)
 
         # ---------- 表格 ----------
         self.table = QTableWidget(0, len(HEADERS))
@@ -226,6 +297,7 @@ class TasksPage(QWidget):
         self.table.viewport().installEventFilter(self)
         self.table.installEventFilter(self)      # 空格键弹全文预览用
         lay.addWidget(self.table)
+        self._build_empty_state()        # 空表时盖在表格上的引导层（导入/新建 或 清除筛选）
 
         # ---------- 分页栏 ----------
         pbar = QHBoxLayout()
@@ -236,6 +308,9 @@ class TasksPage(QWidget):
         b_clearsel.setObjectName("GhostBtn")
         b_clearsel.clicked.connect(self._clear_selection)
         pbar.addWidget(b_clearsel)
+        self.lbl_run = QLabel("")           # E2：进行中/排队总览，有活才显示
+        self.lbl_run.setObjectName("InlineTip")
+        pbar.addWidget(self.lbl_run)
         pbar.addStretch(1)
         self.b_prev = QPushButton("‹ 上一页")
         self.b_next = QPushButton("下一页 ›")
@@ -269,8 +344,14 @@ class TasksPage(QWidget):
         self._page = 1
         self._syncing = False      # 恢复选中时屏蔽 selectionChanged
         self._player = None        # 视频窗口引用，防 GC
+        self._tour_bubble = None   # 首次上手引导气泡引用，防 GC
+        self._tour_started = False # 引导只在首次显示时跑一遍
         self.hover = HoverPreview()  # 全文预览浮层（单击/空格唤起，任意键关闭）
         self._hover_cell = None      # 鼠标最后所在的 (row, col)，空格键弹整列用
+        self._toasts = []            # 右下角浮层引用，防 GC
+        self._failed_ids = set()     # 本次提交失败的任务：标红+置顶，便于改后重跑
+        self._prev_active = 0        # 上次刷新的在途数，用于“跑完”边沿检测
+        self._expect_done = False    # 提交后等待完成通知
 
         b_new.clicked.connect(self._new_task)
         b_del.clicked.connect(self._del_selected)
@@ -280,6 +361,9 @@ class TasksPage(QWidget):
         b_scan.clicked.connect(self._scan_new)
         b_fields.clicked.connect(self._manage_fields)
         self._restore_field_layout()      # 沿用上次列宽/列序/显隐
+        self._setup_shortcuts()           # A4：常用键盘快捷键
+        self._arm_first_hints()           # C2：关键按钮首次悬停多讲一句
+        self._update_params_label()       # E1：初始化“本次默认参数”显示
 
     # ============ 导入/导出菜单 ============
     def _build_io_menu(self):
@@ -471,6 +555,9 @@ class TasksPage(QWidget):
         self._sync_filter_choices()
         self._filtered = [(int(row["_id"]), row)
                           for _, row in df.iterrows() if self._match_filter(row)]
+        # 默认「最新在前」：按更新时间倒序（同秒再按任务ID倒序）。商家日常关心的是
+        # 刚跑过/刚导入的任务，不该从最早编号翻起；点列头排序或清除筛选后会回到这个默认序
+        self._filtered.sort(key=lambda x: (str(x[1]["更新时间"]), x[0]), reverse=True)
         # 刚挑出的那一批置顶聚集（稳定排序，其余保持原序）——否则新导入的
         # 任务排在最后，与已排队的旧任务混在一起根本找不着
         if self._gather_ids:
@@ -480,8 +567,9 @@ class TasksPage(QWidget):
         start = (self._page - 1) * size
         page_rows = self._filtered[start:start + size]
 
+        actives = REG.active()
         active_map = {}
-        for t in REG.active():                 # 同一任务可能并发多个 job（强制重跑/抽卡）
+        for t in actives:                 # 同一任务可能并发多个 job（强制重跑/抽卡）
             active_map.setdefault(t["row_idx"], []).append(t)
         header = self.table.horizontalHeader()
         # 表头排序只在用户真点过列头时生效：否则 setSortingEnabled(True) 会按默认
@@ -516,10 +604,12 @@ class TasksPage(QWidget):
         self.table.itemDelegate().set_anim_enabled(has_bar)
 
         self.lbl_count.setText(f"显示 {len(self._filtered)}/{len(df)} 条")
+        self._update_empty(len(df), len(self._filtered))   # 无任务/无命中时给引导，别让界面一片空白
         self.lbl_page.setText(f"第 {self._page} / {self._page_count()} 页")
         self.b_prev.setEnabled(self._page > 1)
         self.b_next.setEnabled(self._page < self._page_count())
         self._update_sel_label()
+        self._update_run_summary(actives)
 
     def _make_item(self, tid, row, r, c, ats, status, out_path):
         item = QTableWidgetItem()
@@ -576,8 +666,14 @@ class TasksPage(QWidget):
                         pct = min(bars)                  # 多路并发时以最慢一条代表整体
                         show = ""
                     item.setToolTip(f"{n} 个执行正在进行（抽卡/重跑），进度条显示最慢的一条")
+            if show:
+                show = STATUS_ICONS.get(color_key, "") + show
             item.setText(show)
             item.setForeground(QColor(STATUS_COLORS.get(color_key, "#8A94A6")))
+            if tid in self._failed_ids:
+                # 本次提交失败：整格标红置顶，提醒“这条要改提示词重跑”
+                item.setBackground(QColor("#FFECE8"))
+                item.setForeground(QColor("#F54A45"))
         elif c == COL_DUR:
             try:
                 d = int(row["时长"] or 0)
@@ -683,14 +779,265 @@ class TasksPage(QWidget):
     def _update_sel_label(self):
         self.lbl_sel.setText(f"已选 {len(self._selected_ids)} 个")
 
+    # ============ 易用性增强：参数常驻 / 运行总览 / 快捷筛选 / 快捷键 / 首次提示 ============
+    _QUICK_GROUPS = {"todo": ("",),
+                     "running": ("running", "starting", "cancelling"),
+                     "retry": ("failed", "error", "timeout")}
+
+    def _update_params_label(self):
+        """E1：把工具栏当前值常驻显示，改哪个下拉立刻更新"""
+        dur = 2 + self.cb_duration.currentIndex()
+        steps = self.cb_steps.currentText()
+        kol = "不使用KOL" if self.cb_kol.currentIndex() == 0 else self.cb_kol.currentText()
+        self.lbl_params.setText(f"本次默认：{dur}秒 · {steps}步 · {kol}")
+
+    def _update_run_summary(self, actives):
+        # A2：把「执行全部待办」的口径写成实时数量（当前筛选下填了提示词的）
+        todo = sum(1 for _, row in self._filtered if str(row["提示词"]).strip())
+        self.b_runall.setText(f"⏩ 执行全部待办（{todo}）")
+        # E2：有在途任务才显示「进行中 / 排队」总览
+        running = sum(1 for t in actives if t["status"] in BAR_STATUS)
+        queued = len(actives) - running
+        if actives:
+            self.lbl_run.setText(f"⏳ 进行中 {running} · 排队 {queued}")
+            self.lbl_run.show()
+        else:
+            self.lbl_run.hide()
+        # E3：从「有在途」翻到「全清空」且本批在等完成 → 右下角轻提示（不弹框打断）
+        if self._expect_done and self._prev_active > 0 and not actives:
+            self._expect_done = False
+            self._show_toast("✅ 本批任务已全部完成，视频已下载到 outputs/",
+                             color="#00A870", msec=6000)
+        self._prev_active = len(actives)
+
+    def _set_status_group(self, group):
+        idx = self.cb_f_status.findData(group)
+        if idx >= 0:
+            self.cb_f_status.setCurrentIndex(idx)   # currentIndexChanged 会 refresh
+
+    def _quick_filter(self, kind):
+        """A1 快捷标签：一键设好常用组合，先放开其它条件避免“并且”后互相抵消"""
+        if kind == "all":
+            self._clear_filters()
+            return
+        self.ed_search.blockSignals(True); self.ed_search.clear(); self.ed_search.blockSignals(False)
+        for cb in (self.cb_f_product, self.cb_f_remark):
+            cb.blockSignals(True); cb.setCurrentIndex(0); cb.blockSignals(False)
+        self._goto_first_page()
+        if kind == "today":
+            self.cb_f_status.blockSignals(True); self.cb_f_status.setCurrentIndex(0)
+            self.cb_f_status.blockSignals(False)
+            self.de_start.setDate(QDate.currentDate())
+            self.de_end.setDate(QDate.currentDate())
+            self.cb_date.setChecked(True)          # 触发 _toggle_date_filter → 启用日期并 refresh
+            self.refresh()
+            return
+        self.cb_date.blockSignals(True); self.cb_date.setChecked(False); self.cb_date.blockSignals(False)
+        self.de_start.setEnabled(False); self.de_end.setEnabled(False)
+        self._set_status_group(self._QUICK_GROUPS.get(kind))   # 触发 refresh
+        self.refresh()
+
+    def _in_lineedit(self):
+        w = self.window().focusWidget() if self.window() else None
+        return isinstance(w, QLineEdit)
+
+    def _visible_only(self, fn):
+        """快捷键守卫：只有任务中心当前可见时才响应（避免在其它页面误触发）"""
+        return lambda: fn() if self.isVisible() else None
+
+    def _select_all_page(self):
+        if self.table.rowCount() == 0:
+            return
+        self._syncing = True
+        ids = set()
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, CHECK_COL)
+            it.setCheckState(Qt.CheckState.Checked)
+            ids.add(it.data(Qt.ItemDataRole.UserRole))
+        self._syncing = False
+        self._selected_ids |= ids
+        self._update_sel_label()
+
+    def _setup_shortcuts(self):
+        self._shortcuts = []
+        for seq, fn in (
+                ("Ctrl+F", lambda: (self.ed_search.setFocus(), self.ed_search.selectAll())),
+                ("Ctrl+A", lambda: None if self._in_lineedit() else self._select_all_page()),
+                ("Delete", lambda: None if self._in_lineedit() else self._del_selected()),
+                ("F5", self.refresh),
+                ("Ctrl+Return", lambda: self._run(True)),
+        ):
+            s = QShortcut(QKeySequence(seq), self)
+            s.setContext(Qt.ShortcutContext.WindowShortcut)
+            s.activated.connect(self._visible_only(fn))
+            self._shortcuts.append(s)
+
+    def _arm_first_hints(self):
+        """C2：关键按钮首次悬停多讲一句白话解释，看过一次就不再打扰"""
+        self._hint_widgets = {}
+        for w, key, text in (
+            (self.b_runall, "hint_runall",
+             "⏩ 执行全部待办＝跑当前筛选下所有「填了提示词、还没成功跑过」的任务，会先弹确认"),
+            (self.b_replace_btn, "hint_find",
+             "🔁 查找/替换：默认只查找并把命中的一批勾选置顶；点弹窗里的「替换 »」才批量改写"),
+            (self.b_fields, "hint_fields",
+             "⚟ 字段管理：控制显示哪些列；也可直接拖动表头调列序，设置会被记住"),
+        ):
+            if w is not None and not app_state.get(key):
+                w.installEventFilter(self)
+                self._hint_widgets[w] = (key, text)
+
+    def _on_first_hint(self, w):
+        key, text = self._hint_widgets.pop(w, (None, None))
+        if not key:
+            return
+        self.lbl_tip.setText(text)
+        app_state.set_value(key, True)
+        w.removeEventFilter(self)
+
+    def _show_toast(self, text, action_text="", msec=5000, on_action=None, color="#3370FF"):
+        t = Toast(text, action_text=action_text, msec=msec, on_action=on_action,
+                  anchor=self, color=color, parent=self.window())
+        self._toasts.append(t)
+        t.finished.connect(lambda _t=t: self._toasts.remove(_t) if _t in self._toasts else None)
+        t.show()
+
+    def _undo_delete(self, rows):
+        n = task_store.restore_tasks(rows)
+        self.refresh()
+        self.lbl_tip.setText(f"↶ 已撤销，恢复 {n} 个任务")
+
+    # ============ 空状态引导（表格无任务 / 无命中时盖在视口上）============
+    def _build_empty_state(self):
+        self._empty = QWidget(self.table.viewport())
+        self._empty.setObjectName("EmptyState")
+        self._empty.setStyleSheet("QWidget#EmptyState{background:transparent;}")
+        v = QVBoxLayout(self._empty)
+        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.setSpacing(6)
+        self._empty_icon = QLabel("📭")
+        self._empty_icon.setStyleSheet("font-size:46px;")
+        self._empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self._empty_icon)
+        self._empty_title = QLabel("")
+        self._empty_title.setStyleSheet("font-size:16px;font-weight:bold;color:#1F2329;")
+        self._empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self._empty_title)
+        self._empty_sub = QLabel("")
+        self._empty_sub.setObjectName("PageTip")
+        self._empty_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_sub.setWordWrap(True)
+        v.addWidget(self._empty_sub)
+        v.addSpacing(8)
+        btns = QHBoxLayout()
+        btns.setSpacing(10)
+        self._empty_btn_import = QPushButton("📥 导入 Excel 任务")
+        self._empty_btn_import.clicked.connect(self._import_excel)
+        self._empty_btn_new = QPushButton("＋ 新建任务")
+        self._empty_btn_new.setObjectName("GhostBtn")
+        self._empty_btn_new.clicked.connect(self._new_task)
+        self._empty_btn_clear = QPushButton("✕ 清除筛选")
+        self._empty_btn_clear.setObjectName("GhostBtn")
+        self._empty_btn_clear.clicked.connect(self._clear_filters)
+        for b in (self._empty_btn_import, self._empty_btn_new, self._empty_btn_clear):
+            btns.addWidget(b)
+        holder = QHBoxLayout()
+        holder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        holder.addLayout(btns)
+        v.addLayout(holder)
+        self._empty.hide()
+
+    def _update_empty(self, total, matched):
+        if total == 0:
+            self._empty_icon.setText("📭")
+            self._empty_title.setText("还没有任务")
+            self._empty_sub.setText("点下方『导入 Excel 任务』批量建，或『新建任务』手写一条提示词；\n"
+                                    "也可用工具栏『🔍 扫描新任务』拾取外部新增的提示词")
+            self._empty_btn_import.show()
+            self._empty_btn_new.show()
+            self._empty_btn_clear.hide()
+        elif matched == 0:
+            self._empty_icon.setText("🔍")
+            self._empty_title.setText("没有匹配的任务")
+            self._empty_sub.setText("当前搜索 / 筛选条件太严，一条都没筛中；点『清除筛选』回到全部任务")
+            self._empty_btn_import.hide()
+            self._empty_btn_new.hide()
+            self._empty_btn_clear.show()
+        else:
+            self._empty.hide()
+            return
+        vp = self.table.viewport()
+        self._empty.setGeometry(vp.rect())
+        self._empty.raise_()
+        self._empty.show()
+
+    # ============ 首次上手：四步引导（只在第一次进入任务中心时弹，可跳过）============
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._tour_started or app_state.get("tasks_tour_seen"):
+            return
+        self._tour_started = True
+        QTimer.singleShot(400, self._start_tour)
+
+    def _start_tour(self):
+        steps = [
+            (self.b_io, "第 1 步 · 建任务：点这里【导入/导出】批量导入 Excel，"
+                        "或用工具栏最左【＋ 新建任务】手写提示词。"),
+            (self.b_run, "第 2 步 · 开跑：先在表格最左列勾选任务（支持跨页保留），"
+                         "再点【▶ 执行选中】；赶时间可点【⏩ 执行全部待办】。"),
+            (self.table, "第 3 步 · 看进度：『状态』列实时显示进度条，跑完视频自动下载到 "
+                         "outputs/，单击『输出文件』列即可播放，右键有更多操作。"),
+            (self.b_fields, "第 4 步 · 提效率：上方『快捷筛选』一键只看待办/进行中/失败；"
+                            "Ctrl+F 搜索、Ctrl+A 全选本页、Delete 删除、F5 刷新；"
+                            "『字段管理』控制显示哪些列。"),
+        ]
+        self._show_tour_step(steps, 0)
+
+    def _show_tour_step(self, steps, i):
+        if self._tour_bubble is not None:
+            self._tour_bubble.close()
+            self._tour_bubble = None
+        if i >= len(steps):
+            app_state.set_value("tasks_tour_seen", True)
+            return
+        target, text = steps[i]
+        tip = _GuideBubble(self.window(), text, i + 1, len(steps))
+        self._tour_bubble = tip
+        tip.advanced.connect(lambda: self._show_tour_step(steps, i + 1))
+        tip.closed.connect(self._finish_tour)
+        tip.adjustSize()
+        anchor = (target.mapToGlobal(QPoint(60, 60)) if target is self.table
+                  else target.mapToGlobal(QPoint(6, target.height() + 8)))
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        x = max(scr.left() + 8, min(anchor.x(), scr.right() - tip.width() - 8))
+        y = max(scr.top() + 8, min(anchor.y(), scr.bottom() - tip.height() - 8))
+        tip.move(x, y)
+        tip.show()
+        tip.raise_()
+
+    def _finish_tour(self):
+        if self._tour_bubble is not None:
+            self._tour_bubble.close()
+            self._tour_bubble = None
+        app_state.set_value("tasks_tour_seen", True)
+
     # ============ 全文预览浮层：单击或空格弹出，任意键关闭 ============
     def _on_cell_entered(self, r, c):
         # 不再悬停自动弹（会挡鼠标移入浮层的路），只记录光标位置供空格键使用
         self._hover_cell = (r, c)
+        # D3：可操作单元格（看全文/播视频）显示手型光标，提示“这里能点”
+        it = self.table.item(r, c)
+        clickable = (c in PREVIEW_COLS and it is not None and bool(it.text())) \
+            or (c == COL_OUT and it is not None
+                and bool(it.data(Qt.ItemDataRole.UserRole + 2)))
+        self.table.viewport().setCursor(Qt.CursorShape.PointingHandCursor if clickable
+                                          else Qt.CursorShape.ArrowCursor)
 
     def _on_cell_click(self, r, c):
         if c in PREVIEW_COLS:
             self._popup_preview(r, c)
+        elif c == COL_OUT:
+            self._play_video(r)          # A3：单击输出列即播放，不用等双击
 
     def _popup_preview(self, r, c):
         if c not in PREVIEW_COLS or self.table.item(r, c) is None:
@@ -718,6 +1065,13 @@ class TasksPage(QWidget):
                 and e.key() == Qt.Key.Key_Space and self._hover_cell:
             self._popup_preview(*self._hover_cell)
             return True                     # 消费掉，避免表格另行处理空格
+        # C2：关键按钮首次悬停时多讲一句（看过一次就摘掉过滤器，不再弹）
+        if getattr(self, "_hint_widgets", None) and obj in self._hint_widgets \
+                and e.type() == QEvent.Type.Enter:
+            self._on_first_hint(obj)
+        if obj is self.table.viewport() and e.type() == QEvent.Type.Resize \
+                and getattr(self, "_empty", None) is not None and self._empty.isVisible():
+            self._empty.setGeometry(self.table.viewport().rect())   # 空状态引导随表格一起缩放居中
         if obj is self.table.viewport() and e.type() == QEvent.Type.Leave:
             self.hover.hide_soon()          # 钉住模式不受影响（浮层自行判断）
         return super().eventFilter(obj, e)
@@ -725,7 +1079,7 @@ class TasksPage(QWidget):
     # ============ 双击 / 右键 ============
     def _on_cell_double(self, r, c):
         if c == COL_OUT:
-            self._play_video(r)
+            return                     # 单击已播放，双击不再重复、也不进编辑窗
         elif c == COL_REMARK:
             self._edit_remark(r)         # 备注要的是“随手一笔”，不弹整个任务窗
         elif c != CHECK_COL:
@@ -992,6 +1346,7 @@ class TasksPage(QWidget):
             "duration": 2 + self.cb_duration.currentIndex(),
             "steps": int(self.cb_steps.currentText()),
             "kol": None if self.cb_kol.currentIndex() == 0 else self.cb_kol.currentText()})
+        self._update_params_label()
 
     def _current_options(self):
         """从控件读取当前时长/步数/KOL，生成提交选项快照。
@@ -1026,9 +1381,14 @@ class TasksPage(QWidget):
         if QMessageBox.question(self, "确认",
                                 f"删除选中的 {len(tids)} 个任务？（不影响已生成的视频）") \
                 == QMessageBox.StandardButton.Yes:
+            rows = [task_store.get_task(t) for t in tids]      # 删前抓整行，供 5 秒内撤销
+            rows = [r for r in rows if r]
             task_store.delete_tasks(list(tids))
             self._selected_ids -= set(tids)
             self.refresh()
+            self._show_toast(f"🗑 已删除 {len(rows)} 个任务", action_text="↶ 撤销",
+                             on_action=lambda rs=rows: self._undo_delete(rs),
+                             color="#F54A45", msec=6000)
 
     def _find_replace(self):
         sel = list(self._selected_ids)
@@ -1044,23 +1404,39 @@ class TasksPage(QWidget):
             tids = [int(r["_id"]) for _, r in df.iterrows()]
         count = 0
         hit_ids = []                       # 含旧提示词的任务：处理后选中并置顶
+        hits = []                          # [(tid, 旧片段, 新片段)]，供替换前预览
         for tid in tids:
             t = task_store.get_task(tid)
             prompt = t["prompt"] or ""
             if find in prompt:
-                if not locate_only:
-                    task_store.update_row(tid, **{"提示词": prompt.replace(find, repl)})
                 hit_ids.append(tid)
                 count += 1
-        if count:
-            n = self._gather_matches(hit_ids)
-            self.lbl_tip.setText(
-                f"已按「{find}」勾选并置顶 {n} 个任务，可直接「执行选中」（提示词未改动）"
-                if locate_only else
-                f"替换完成：{n} 个任务的提示词已更新，已勾选并置顶集中显示，可直接「执行选中」")
-        else:
+                if not locate_only:
+                    sample = prompt.replace(find, repl)
+                    hits.append((tid, prompt[:36], sample[:36]))
+        if not count:
             self.lbl_tip.setText(f"未找到包含「{find}」的提示词")
             self.refresh()
+            return
+        # B2：改写前先给一眼“会动哪些、改成什么样”，避免一失手把上百条提示词改错
+        if not locate_only:
+            preview = "\n".join(f"  任务{tid}：{old} → {new}" for tid, old, new in hits[:6])
+            more = f"\n  …共 {count} 个任务" if count > 6 else ""
+            if QMessageBox.question(
+                    self, "确认替换",
+                    f"将把 {count} 个任务的提示词中的「{find}」全部替换为「{repl}」：\n"
+                    f"{preview}{more}\n\n替换后可用「查找/定位」重新核对，确认执行？") \
+                    != QMessageBox.StandardButton.Yes:
+                self.lbl_tip.setText("已取消替换（未改动任何提示词）")
+                return
+            for tid, _o, _n in hits:
+                t = task_store.get_task(tid)
+                task_store.update_row(tid, **{"提示词": (t["prompt"] or "").replace(find, repl)})
+        n = self._gather_matches(hit_ids)
+        self.lbl_tip.setText(
+            f"已按「{find}」勾选并置顶 {n} 个任务，可直接「执行选中」（提示词未改动）"
+            if locate_only else
+            f"替换完成：{n} 个任务的提示词已更新，已勾选并置顶集中显示，可直接「执行选中」")
 
     def _run(self, selected_only):
         if self.worker and self.worker.isRunning():
@@ -1118,6 +1494,8 @@ class TasksPage(QWidget):
                                 else f"；含 {len(force)} 个强制重跑" if force else "")
                              + "…")
         self.worker = SubmitWorker(items, options)
+        self._failed_ids = set()      # B3：新一批提交，清空上次的失败标红
+        self._expect_done = True       # E3：本批在等完成，跑完后轻提醒
         # 每条进度都带上本批参数：否则一行「✓ 任务6 已提交」就把上面那句
         # 「本次：10秒 / 20 步」冲掉，使用者无从判断这次到底用的什么参数
         snap = f"（本次：{options.duration}秒 / {options.steps} 步）"
@@ -1129,7 +1507,12 @@ class TasksPage(QWidget):
     def _on_submit_done(self, failed):
         """提交结果必留痕：失败只写一行灰色小字会被看成“改了没生效”
         （云端拒绝参数时就是这样：一行提示转瞬即逝，表格里的旧视频、旧时长还在）"""
-        self.refresh()
+        # B3：本次提交失败的任务标红并置顶，改好提示词直接重跑，不用翻找
+        self._failed_ids = {tid for tid, _ in failed}
+        if failed:
+            self._gather_matches([tid for tid, _ in failed])   # 内部会 refresh
+        else:
+            self.refresh()
         if not failed:
             self.lbl_tip.setText("提交完成，云端生成中…进度条将实时更新，完成后自动下载到 outputs/")
             return

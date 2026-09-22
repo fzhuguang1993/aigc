@@ -1,5 +1,5 @@
 """
-gui/dialogs.py —— 新建 / 编辑任务弹窗、搜索替换弹窗、批量绑定脚本弹窗
+gui/dialogs.py —— 新建 / 编辑任务弹窗、查找/替换弹窗、批量绑定脚本弹窗
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
@@ -172,12 +172,15 @@ class ScriptBindDialog(QDialog):
 
 
 class FindReplaceDialog(QDialog):
-    """提示词搜索替换 / 定位勾选弹窗"""
+    """提示词查找 / 替换弹窗：默认只“查找”（像 Excel），点「替换 »」才展开替换行。"""
 
     def __init__(self, parent=None, selected_count=0):
         super().__init__(parent)
-        self.setWindowTitle("搜索替换 / 定位提示词")
-        self.setFixedWidth(460)
+        self.setWindowTitle("查找 / 替换提示词")
+        self.setMinimumWidth(460)
+        self.setMaximumWidth(460)
+        self._selected_count = selected_count
+        self._mode = "find"          # find=只查找(定位勾选)  replace=替换
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 20, 24, 20)
 
@@ -186,34 +189,65 @@ class FindReplaceDialog(QDialog):
         self.ed_find.setPlaceholderText("例如：男明星")
         lay.addWidget(self.ed_find)
 
-        lay.addWidget(QLabel("替换为："))
+        # 替换行：默认收起，点「替换 »」才展开（不展开就是纯搜索）
+        self.lbl_replace = QLabel("替换为：")
+        lay.addWidget(self.lbl_replace)
         self.ed_replace = QLineEdit()
         self.ed_replace.setPlaceholderText("例如：女明星（留空则删除该词）")
         lay.addWidget(self.ed_replace)
 
-        self.cb_selected = QCheckBox(f"仅替换选中的 {selected_count} 个任务（不勾则全部）")
+        self.cb_selected = QCheckBox("")
         self.cb_selected.setChecked(selected_count > 0)
         lay.addWidget(self.cb_selected)
 
-        self.cb_locate = QCheckBox("只定位勾选，不修改提示词（按关键词找出一批任务直接批量执行）")
-        lay.addWidget(self.cb_locate)
-
-        tip = QLabel("替换后这批命中的任务会自动勾选并排到列表最前面（每页条数不够时自动提升），"
-                     "直接点「执行选中」就只重跑它们。")
-        tip.setWordWrap(True)
-        tip.setObjectName("PageTip")
-        lay.addWidget(tip)
+        self.tip = QLabel("")
+        self.tip.setWordWrap(True)
+        self.tip.setObjectName("PageTip")
+        lay.addWidget(self.tip)
 
         btns = QHBoxLayout()
+        self.b_toggle = QPushButton("替换 »")
+        self.b_toggle.setObjectName("GhostBtn")
+        self.b_toggle.setToolTip("展开替换：填入替换词后「全部替换」；收起则只做查找定位")
+        self.b_toggle.clicked.connect(self._toggle_mode)
+        btns.addWidget(self.b_toggle)
         btns.addStretch(1)
         b_cancel = QPushButton("取消")
         b_cancel.setObjectName("GhostBtn")
         b_cancel.clicked.connect(self.reject)
-        b_ok = QPushButton("全部替换")
-        b_ok.clicked.connect(self.accept)
+        self.b_ok = QPushButton("查找全部")
+        self.b_ok.clicked.connect(self.accept)
         btns.addWidget(b_cancel)
-        btns.addWidget(b_ok)
+        btns.addWidget(self.b_ok)
         lay.addLayout(btns)
+
+        self._apply_mode()
+
+    def _toggle_mode(self):
+        self._mode = "replace" if self._mode == "find" else "find"
+        self._apply_mode()
+
+    def _apply_mode(self):
+        replacing = self._mode == "replace"
+        verb = "替换" if replacing else "查找"
+        self.lbl_replace.setVisible(replacing)
+        self.ed_replace.setVisible(replacing)
+        n = self._selected_count
+        if n:
+            self.cb_selected.setText(f"仅在选中的 {n} 个任务中{verb}（不勾则全部）")
+            self.cb_selected.setVisible(True)
+        else:
+            self.cb_selected.setText(f"在全部任务中{verb}")
+            self.cb_selected.setVisible(False)
+        self.b_toggle.setText("« 查找" if replacing else "替换 »")
+        self.b_ok.setText("全部替换" if replacing else "查找全部")
+        self.tip.setText(
+            "替换后这批命中的任务会自动勾选并排到列表最前面（每页条数不够时自动提升），"
+            "直接点「执行选中」就只重跑它们。" if replacing else
+            "「查找全部」不改提示词：按关键词找出的任务会自动勾选并置顶，可直接「执行选中」。")
+        if not replacing:
+            self.ed_replace.clear()        # 收起时不残留替换词，避免下次误替换
+        self.adjustSize()
 
     @staticmethod
     def ask(parent, selected_count=0):
@@ -223,9 +257,10 @@ class FindReplaceDialog(QDialog):
         find = dlg.ed_find.text()
         if not find:
             return None
-        return {"find": find, "replace": dlg.ed_replace.text(),
+        replacing = dlg._mode == "replace"
+        return {"find": find, "replace": dlg.ed_replace.text() if replacing else "",
                 "only_selected": dlg.cb_selected.isChecked(),
-                "locate_only": dlg.cb_locate.isChecked()}
+                "locate_only": not replacing}
 
 
 class ForceRerunDialog(QDialog):

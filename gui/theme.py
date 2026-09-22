@@ -66,6 +66,10 @@ QPushButton:hover { background: #5A8BFF; }
 QPushButton:pressed { background: #2457D9; }
 QPushButton#GhostBtn { background: #FFFFFF; color: #37445A; border: 1px solid #DEE0E3; }
 QPushButton#GhostBtn:hover { border-color: #3370FF; color: #3370FF; }
+/* 快捷筛选标签：淡蓝胶囊，区别于普通按钮，一眼看出是“一键筛选” */
+QPushButton#ChipBtn { background: #F2F6FF; color: #3370FF; border: 1px solid #D6E4FF;
+    border-radius: 12px; padding: 3px 12px; font-size: 12px; }
+QPushButton#ChipBtn:hover { background: #E1ECFF; border-color: #3370FF; }
 
 QLineEdit, QPlainTextEdit {
     background: #FFFFFF; border: 1px solid #DEE0E3; border-radius: 8px; padding: 6px 8px; }

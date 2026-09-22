@@ -148,6 +148,27 @@ def delete_tasks(ids):
         db.execute("DELETE FROM tasks WHERE id=?", (i,))
 
 
+# 撤销删除时按原主键回插的完整列（与 tasks 表字段一致）
+_RESTORE_COLS = ["id", "num", "product", "prompt", "status", "account", "job_id",
+                 "output", "url", "runs", "success", "cancels", "script_text",
+                 "updated_at", "duration", "prompt_changed_at", "script",
+                 "storyboard", "remark"]
+
+
+def restore_tasks(rows):
+    """把删除前抓取的整行按原 id 回插（INSERT OR REPLACE）：主键不变，
+    关联的 runs 记录也不会错位。rows 为 get_task() 返回的字典列表。"""
+    for r in rows:
+        if not r or r.get("id") is None:
+            continue
+        cols = [c for c in _RESTORE_COLS if c in r]
+        db.execute(
+            "INSERT OR REPLACE INTO tasks(%s) VALUES(%s)"
+            % (",".join(cols), ",".join("?" * len(cols))),
+            [r[c] for c in cols])
+    return len(rows)
+
+
 def task_count():
     rows = db.query("SELECT COUNT(*) AS c FROM tasks")
     return rows[0]["c"] if rows else 0
