@@ -186,12 +186,16 @@ def _register_success(acc, row_idx, job_id, prompt, product, ctx, duration):
                                 product, acc.name, job_id)
 
 
-def do_submit(row_idx, product, prompt, options=None, *, _sleep=time.sleep):
+def do_submit(row_idx, product, prompt, options=None, *, balancer=None, _sleep=time.sleep):
     """
     提交单个任务：选线（带在途闸门）→ 组装 → 提交；失败则退避重试并换线。
 
     返回 (job_id, err_msg, account_name)；成功时 err_msg 为 None，
     失败时 err_msg 是一句能直接给人看的原因（不再只回 "all retries failed"）。
+
+    balancer：批量提交时传入 BatchBalancer，走「快照+投影」注水选线并**绕开在途
+    闸门**（排队模型下往忙线提交只是排队，不该阻塞等空位）；不传则为单条手动提交，
+    保持原有 pick_and_wait 闸门行为不变。
     _sleep 仅供测试注入，业务代码勿传。
     """
     options = options or SubmitOptions()
@@ -201,18 +205,26 @@ def do_submit(row_idx, product, prompt, options=None, *, _sleep=time.sleep):
     except Exception:
         pass
 
-    # 选线 + 在途闸门：挑一条真有空位的线，全满则等到有人空出来
-    # （旧实现只锁住提交动作那几百毫秒，一条线能被无限灌）
-    acc, waited, got_slot = pick_and_wait(_log=raw_info)
-    ctx = Ctx(row=row_idx, account=acc.name)
-    if not got_slot:
-        ctx.warning(f"{acc.name} 等空位超过 {waited}s 仍全满，按现状提交")
-    elif waited:
-        ctx.info(f"等 {waited}s 后拿到 {acc.name} 空位")
-    else:
+    # 选线：批量模式走注水分配器（绕闸门），单条手动提交走在途闸门
+    if balancer is not None:
+        acc = balancer.pick()
+        ctx = Ctx(row=row_idx, account=acc.name)
         load, src = measure_load(acc)
-        ctx.debug(f"选线 {acc.name}｜在途 {load}/{acc.concurrency}｜"
+        ctx.debug(f"批量选线 {acc.name}｜投影在途 {load}｜"
                   f"{'云端全量' if src == 'cloud' else '仅本机视角⚠'}")
+    else:
+        # 选线 + 在途闸门：挑一条真有空位的线，全满则等到有人空出来
+        # （旧实现只锁住提交动作那几百毫秒，一条线能被无限灌）
+        acc, waited, got_slot = pick_and_wait(_log=raw_info)
+        ctx = Ctx(row=row_idx, account=acc.name)
+        if not got_slot:
+            ctx.warning(f"{acc.name} 等空位超过 {waited}s 仍全满，按现状提交")
+        elif waited:
+            ctx.info(f"等 {waited}s 后拿到 {acc.name} 空位")
+        else:
+            load, src = measure_load(acc)
+            ctx.debug(f"选线 {acc.name}｜在途 {load}/{acc.concurrency}｜"
+                      f"{'云端全量' if src == 'cloud' else '仅本机视角⚠'}")
 
     ctx.debug(f"等待 {acc.name} 信号量（并发={acc.concurrency}）")
     held = acc  # 当前实际持有信号量的账号（修复：旧实现换账号后释放错了信号量）

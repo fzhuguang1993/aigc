@@ -16,7 +16,7 @@ import threading
 
 from core.config import (ACCOUNTS as CONFIG_ACCOUNTS, LOAD_CACHE_TTL, JOBS_LIMIT,
                          LOAD_TIE_BAND, SUBMIT_GATE, GATE_WAIT_TIMEOUT,
-                         GATE_POLL_INTERVAL)
+                         GATE_POLL_INTERVAL, BALANCE_RESCAN_EVERY)
 from core.api_client import list_jobs
 from core.logger import raw_info, raw_warning
 
@@ -149,6 +149,17 @@ def get_account_load(acc):
     return measure_load(acc)[0]
 
 
+def cloud_load(acc):
+    """该线云端队列数（含所有人：同事 + 已反映的本机）；不可达返回 None。
+    与 measure_load 的 max(cloud, local) 不同——这里要的是“全局裸读数”，供
+    BatchBalancer 扣除本机已投数后得到“非本机基线”。"""
+    try:
+        items = list_jobs(acc.base, limit=JOBS_LIMIT)
+        return sum(1 for j in items if is_active(j.get("status")))
+    except Exception:
+        return None
+
+
 def load_source(name):
     """给 UI 用：这条线的负载读数是全局量（cloud）还是降级值（local）"""
     with _cache_lock:
@@ -223,6 +234,81 @@ def pick_and_wait(timeout=None, _sleep=time.sleep, _log=None):
         _sleep(GATE_POLL_INTERVAL)
         # 等过一轮必须重查：不然 TTL 里的旧读数会把空位晚一轮发现
         invalidate_load_cache()
+
+
+def plan_allocation(load, n):
+    """对静态快照做注水式分配：把 n 条任务逐条投给「当前总队列最短」的线，
+    返回每条线应分到的条数（与 load 同序）。只增不减——本就过载的线自动出局。
+    与 BatchBalancer 的逐步 argmin 等价，供离线规划与单元直测。
+
+    例：plan_allocation([10, 25, 15, 5], 20) -> [7, 0, 2, 11]
+        （分配后总队列 [17, 25, 17, 16]，可控制的三条被拉平，过载线不分）
+    """
+    adds = [0] * len(load)
+    eff = list(load)
+    for _ in range(max(0, n)):
+        if not eff:
+            break
+        i = min(range(len(eff)), key=lambda k: eff[k])   # 并列取靠前索引，保证确定性
+        eff[i] += 1
+        adds[i] += 1
+    return adds
+
+
+class BatchBalancer:
+    """批量提交的注水式选线器（排队模型专用）。
+
+    为什么要它：measure_load 取 max(cloud, local)，当某线 cloud 很大（同事排的队）
+    而本机刚投几条时，max 会把本机增量遮罩掉、读数纹丝不动 → 逐条 argmin 会反复
+    砸同一条最空的线。破解：把“非本机基线”与“本机已投数”分开维护——
+        有效负载 = base(非本机) + ours(本机本批累计)，base 只随云端上调、不被 max 抹掉。
+
+    与在途闸门相反：这里不阻塞等空位——排队模型下往忙线提交只是排队，不该等。
+    每推 rescan_every 条重扫一次，仅用于并入同事新增的全局量（上调 base）。
+    """
+
+    def __init__(self, total, rescan_every=None):
+        self.total = total
+        self.rescan_every = (BALANCE_RESCAN_EVERY if rescan_every is None
+                             else rescan_every)
+        self.base = {}         # name -> 非本机负载估计（同事+已反映），重扫时只升不降
+        self.ours = {}         # name -> 本机本批累计投了几条（精确，永不重置）
+        self._since_rescan = 0
+        self._rescan()
+
+    def _lines(self):
+        healthy = [a for a in ACCOUNTS if a.healthy]
+        if healthy:
+            return healthy
+        fallback = sorted(ACCOUNTS, key=lambda a: a.fail_count)[:1]
+        return fallback or ACCOUNTS
+
+    def _rescan(self):
+        """重扫全局：base = max(旧 base, 云端裸读数 - 本机已投)。
+        只上调不下调：/jobs 反映延迟内云端可能还没含本机刚投的，下调会误丢同事基线。"""
+        invalidate_load_cache()
+        for a in ACCOUNTS:
+            c = cloud_load(a)
+            if c is None:                 # 降级：看不见全局，保留既有 base 估计
+                continue
+            est = max(0, c - self.ours.get(a.name, 0))
+            self.base[a.name] = max(self.base.get(a.name, est), est)
+        self._since_rescan = 0
+
+    def _effective(self, acc):
+        return self.base.get(acc.name, 0) + self.ours.get(acc.name, 0)
+
+    def pick(self):
+        """选一条「基线+本机累计」最小的线（并列按 LOAD_TIE_BAND 随机），本机计数 +1。"""
+        if self.rescan_every and self._since_rescan >= self.rescan_every:
+            self._rescan()
+        lines = self._lines()
+        best = min(self._effective(a) for a in lines)
+        pool = [a for a in lines if self._effective(a) <= best + LOAD_TIE_BAND]
+        acc = random.choice(pool)
+        self.ours[acc.name] = self.ours.get(acc.name, 0) + 1
+        self._since_rescan += 1
+        return acc
 
 
 def health_monitor_worker():

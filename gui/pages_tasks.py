@@ -4,7 +4,6 @@ gui/pages_tasks.py —— 任务中心
 搜索/替换/日期筛选 · 扫描新任务 · 导入导出（含模板）
 """
 from pathlib import Path
-import random
 import time
 
 from PySide6.QtCore import QThread, Signal, Qt, QDate, QPoint
@@ -14,8 +13,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QMenu, QMessageBox, QFileDialog, QAbstractItemView,
                                QLineEdit, QDateEdit, QCheckBox, QInputDialog)
 
-from registry.manager import REG
-from core.config import DEFAULT_STEPS, SUBMIT_JITTER
+from registry.manager import REG, BatchBalancer
+from core.config import DEFAULT_STEPS, SUBMIT_PACING, BALANCE_RESCAN_EVERY
 from store import task_store, product_store, app_state
 from utils.desktop_utils import reveal_in_folder
 from workers.submit import do_submit, cancel_one, SubmitOptions
@@ -73,12 +72,16 @@ class SubmitWorker(QThread):
 
     def run(self):
         failed = []
+        # 多条一起提交才启用注水分配器：按全局快照+本批投影均衡选线、绕开在途闸门；
+        # 单条仍走原有闸门逻辑（balancer=None）
+        balancer = (BatchBalancer(len(self.items), rescan_every=BALANCE_RESCAN_EVERY)
+                    if len(self.items) > 1 else None)
         for i, (tid, product, prompt) in enumerate(self.items):
             if i:
-                # 两条之间错开随机间隔：三台配置相同的电脑同时点「执行」时，
-                # 撞同一毫秒就会一起选中同一条线路
-                time.sleep(random.uniform(*SUBMIT_JITTER))
-            jid, err, acc = do_submit(tid, product, prompt, self.options)
+                # 批量推送小间隔：排队模型下不再靠大抖动错峰，仅防连发
+                time.sleep(SUBMIT_PACING)
+            jid, err, acc = do_submit(tid, product, prompt, self.options,
+                                      balancer=balancer)
             if jid:
                 self.log_msg.emit(f"✓ 任务{tid} 已提交 [{acc}]")
             else:

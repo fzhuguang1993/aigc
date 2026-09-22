@@ -187,18 +187,26 @@ GATE_POLL_INTERVAL = 5
 # 批量提交时两条任务之间的随机间隔（秒）：把多台电脑的同时选线错开
 SUBMIT_JITTER = (0.4, 1.2)
 
+# 注水式批量分配：每往各线推 BALANCE_RESCAN_EVERY 条就重扫一次全局快照，
+# 把同事新增、以及已被 /jobs 反映出来的本机任务并入（0=整批只在开头扫一次）。
+BALANCE_RESCAN_EVERY = 6
+# 批量推送时两条之间的固定小间隔（秒）：排队模型下不再靠大抖动错峰，仅防手抖连发。
+SUBMIT_PACING = 0.2
+
 
 # 以上调度参数允许 config.json 同名（小写）覆盖：内测同事改 exe 旁边的
 # config.json 就能调，不必改代码重新打包。
 def _override_from_config_json():
     global SUBMIT_GATE, GATE_WAIT_TIMEOUT, GATE_POLL_INTERVAL
     global LOAD_TIE_BAND, LOAD_CACHE_TTL, JOBS_LIMIT
+    global BALANCE_RESCAN_EVERY, SUBMIT_PACING
     data = _json_data()
     if not data:
         return
     _vars = {"SUBMIT_GATE": "submit_gate", "GATE_WAIT_TIMEOUT": "gate_wait_timeout",
              "GATE_POLL_INTERVAL": "gate_poll_interval", "LOAD_TIE_BAND": "load_tie_band",
-             "LOAD_CACHE_TTL": "load_cache_ttl", "JOBS_LIMIT": "jobs_limit"}
+             "LOAD_CACHE_TTL": "load_cache_ttl", "JOBS_LIMIT": "jobs_limit",
+             "BALANCE_RESCAN_EVERY": "balance_rescan_every", "SUBMIT_PACING": "submit_pacing"}
     g = globals()
     for name, key in _vars.items():
         if key in data:

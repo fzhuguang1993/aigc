@@ -7,10 +7,12 @@ import re
 import time
 
 from core.config import (COL_PRODUCT, COL_PROMPT, DEFAULT_DURATION,
-                         LAST_PRODUCT, LAST_KOL, KOL_OPTIONS)
+                         LAST_PRODUCT, LAST_KOL, KOL_OPTIONS,
+                         SUBMIT_PACING, BALANCE_RESCAN_EVERY)
 from store import db, task_store
 from store.task_store import COL_ID, COL_STATUS, COL_RUNS
-from registry.manager import REG, ACCOUNTS, get_account, get_account_load
+from registry.manager import (REG, ACCOUNTS, get_account, get_account_load,
+                              BatchBalancer)
 from workers.submit import do_submit, cancel_one, SubmitOptions
 from workers.scan import print_new_rows, SCAN
 from core.logger import raw_warning, raw_info
@@ -177,8 +179,12 @@ def parse_row_numbers(args_str):
 
 
 def _submit_by_ids(id_list):
-    """按任务ID列表提交，返回 (成功数, 失败数, 跳过数)"""
+    """按任务ID列表提交，返回 (成功数, 失败数, 跳过数)。
+    多条时走注水式批量分配（绕开在途闸门、按全局快照均衡）；单条保持闸门旧行为。"""
     success = fail = skip = 0
+    balancer = (BatchBalancer(len(id_list), rescan_every=BALANCE_RESCAN_EVERY)
+                if len(id_list) > 1 else None)
+    submitted = 0
     for tid in id_list:
         task = task_store.get_task(tid)
         if not task:
@@ -190,8 +196,12 @@ def _submit_by_ids(id_list):
             print(f"[跳过] 任务 {tid} 提示词为空")
             skip += 1
             continue
+        if balancer and submitted:
+            time.sleep(SUBMIT_PACING)   # 批量推送小间隔，仅防连发
+        submitted += 1
         product = str(task.get(COL_PRODUCT) or task["product"] or "").strip()
-        jid, err, acc_name = do_submit(tid, product, prompt, _current_options())
+        jid, err, acc_name = do_submit(tid, product, prompt, _current_options(),
+                                       balancer=balancer)
         if jid:
             print(f"  ✓ 任务 {tid} 提交成功 [{acc_name}]")
             success += 1
