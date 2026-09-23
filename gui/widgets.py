@@ -11,8 +11,9 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
                                QPushButton, QLabel, QWidget, QMessageBox,
-                               QComboBox, QSizeGrip)
+                               QComboBox, QSizeGrip, QSizePolicy)
 
+from store import app_state
 from utils.desktop_utils import open_path, reveal_in_folder
 
 
@@ -28,6 +29,12 @@ def _fmt_rate(r):
 
 # 倍速预设：审片时 1.5x/2x 快速过片、逐帧对口型时 0.5x
 RATES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+
+# 快退/快进步长：一条成品就 5~15 秒，写死 5 秒既不好对口型也不好跳读，
+# 所以改成「1~5 秒」下拉 + 加减号，选过的步长记进 ui_state（下次还在）
+STEP_SECONDS = (1, 2, 3, 4, 5)
+STEP_DEFAULT = 5                        # 没记过时的默认（与旧版写死的 5 秒一致）
+STEP_KEY = "player_step_sec"
 
 # 深色播放器外壳。选择器全部挂在 #PlayerShell 下：应用级样式表里已经有
 # QPushButton{...}，不拿 id 提高优先级的话按钮会被全局浅色样式盖掉。
@@ -49,16 +56,69 @@ _SHELL_QSS = """
     border-radius:6px; padding:3px 6px; }
 #PlayerShell QComboBox QAbstractItemView { background:#252A33; color:#DCE1EA;
     selection-background-color:#3370FF; border:1px solid #3A4150; }
-#PlayerShell QSlider::groove:horizontal { height:4px; background:#31363F; border-radius:2px; }
-#PlayerShell QSlider::sub-page:horizontal { background:#3370FF; border-radius:2px; }
-#PlayerShell QSlider::handle:horizontal { width:12px; margin:-4px 0; border-radius:6px;
-    background:#EAF0FA; }
+#PlayerShell QSlider::groove:horizontal { height:6px; background:#31363F; border-radius:3px; }
+#PlayerShell QSlider::sub-page:horizontal { background:#3370FF; border-radius:3px; }
+#PlayerShell QSlider::handle:horizontal { width:16px; height:16px; margin:-5px 0;
+    border-radius:8px; background:#EAF0FA; }
+#PlayerShell QSlider::handle:horizontal:pressed { background:#FFFFFF; }
 #PlayerShell QSizeGrip { background:transparent; }
 """
 
 
+class _SeekSlider(QSlider):
+    """进度条：除了拖着走，点哪儿就跳到哪儿
+
+    默认 QSlider 点凹槽只是按 singleStep 挪一格（毫秒级的时长等于没反应），
+    手柄又只有几像素宽，使用者就判定了「进度条拖不动」。
+    这里自己把鼠标位置换算成进度，按下/拖动/抬起都直接定位。"""
+
+    seeked = Signal(int)
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setFixedHeight(20)             # 抬高命中区，好点中手柄
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+    def _value_at(self, x):
+        half = 8                            # 手柄半径（与上面 QSS 的 16px 对应）
+        span = max(self.width() - 2 * half, 1)
+        r = min(max((x - half) / span, 0.0), 1.0)
+        return int(self.minimum() + r * (self.maximum() - self.minimum()))
+
+    def _jump(self, x):
+        if self.maximum() <= self.minimum():
+            return                          # 时长还没回来：不拦着报错就行
+        v = self._value_at(int(x))
+        self.setValue(v)                    # setValue 不发 sliderMoved，自己补一个
+        self.seeked.emit(v)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(True)
+            self._jump(e.position().x())
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self.isSliderDown():
+            self._jump(e.position().x())
+            e.accept()
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self.isSliderDown():
+            self._jump(e.position().x())
+            self.setSliderDown(False)
+            e.accept()
+        else:
+            super().mouseReleaseEvent(e)
+
+
 class VideoPlayerDialog(QDialog):
-    """无边框播放器：播放/暂停、进度、倍速、全屏、横竖屏自适应、审片标记
+    """无边框播放器：播放/暂停、进度（可拖可点）、步长快进退、倍速、全屏、
+    横竖屏自适应、审片标记
 
     无边框就得自己把窗口的事管完：顶部一条可拖动的标题栏（定位/全屏/最小化/关闭），
     右下角 QSizeGrip 拉大，Esc 关、双击画面全屏、单击画面播放/暂停。
@@ -71,16 +131,16 @@ class VideoPlayerDialog(QDialog):
 
     marked = Signal(str, str)
 
-    MIN_W, MIN_H = 360, 220
-    FILL_W, FILL_H = 0.72, 0.72          # 自适应时占屏幕可用区的比例
-    BAR_H = 96                          # 标题条 + 控制条大致占高
+    MIN_W, MIN_H = 360, 220             # 画面区最小尺寸（也是没报出视频尺寸时的兜底）
+    FILL_W, FILL_H = 0.88, 0.94         # 自适应时画面可占屏幕可用区的比例
+    REFIT_EPS = 0.015                   # 宽高比变化超过这个值才重摆（不跟用户抢尺寸）
 
     def __init__(self, parent, file_path, allow_mark=False):
         super().__init__(parent)
         self._path = str(file_path or "")
         self._allow_mark = bool(allow_mark)
         self._drag_pos = None            # 无边框拖动：按下时的坐标偏移
-        self._fitted = None              # 已按哪个视频尺寸自适应过（不跟用户抢尺寸）
+        self._fitted = None              # 已按哪个宽高比摆过（None=还没摆）
         self._swapping = False           # 换文件途中屏蔽报错
         self._fullscreen = False
         self._last_size = None           # 视频真实宽高（退出全屏时重摆一次）
@@ -102,6 +162,10 @@ class VideoPlayerDialog(QDialog):
         bar = QHBoxLayout()
         bar.setSpacing(6)
         self.lbl_name = QLabel(objectName="FileName")
+        # 文件名动辄二三十字，不降到「可压缩」的话它会拿自己的最小宽度
+        # 顶住整个窗口，竖屏成品就被带成两侧一大块黑边（完整名在 tooltip 里）
+        self.lbl_name.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                    QSizePolicy.Policy.Preferred)
         bar.addWidget(self.lbl_name, 1)
         self.btn_reveal = QPushButton("📂 定位")
         self.btn_reveal.setToolTip("打开成品所在文件夹并选中这个文件（G）")
@@ -134,24 +198,47 @@ class VideoPlayerDialog(QDialog):
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video)
 
-        # ---------- 控制条 ----------
+        # ---------- 控制条（拆两行）----------
+        # 为什么拆：竖屏成品要的是窄窗口，一行摆下 9 个控件的话
+        # 布局算出来的最小宽度会把窗口顶宽，多出来的那截就成了画面两侧的黑边。
         ctrl = QHBoxLayout()
         ctrl.setSpacing(6)
         self.btn_play = QPushButton("▶")
         self.btn_play.setToolTip("播放 / 暂停（空格）")
         self.btn_play.setFixedWidth(40)
         self.btn_play.clicked.connect(self._toggle_play)
-        b_back = QPushButton("-5s")
-        b_back.setToolTip("后退 5 秒（←）")
-        b_back.clicked.connect(lambda: self._seek_rel(-5000))
-        b_fwd = QPushButton("+5s")
-        b_fwd.setToolTip("前进 5 秒（→）")
-        b_fwd.clicked.connect(lambda: self._seek_rel(5000))
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        b_back = QPushButton("－")        # 全角减号：比半角"-"好认也好点
+        b_back.setObjectName("StepBack")
+        b_back.setFixedWidth(34)
+        b_back.setToolTip("按步长后退（←）")
+        b_back.clicked.connect(lambda: self._step_seek(-1))
+        self.cb_step = QComboBox()
+        for s in STEP_SECONDS:
+            self.cb_step.addItem(f"{s}秒", s)
+        self._restore_step()
+        self.cb_step.setToolTip("快退 / 快进的步长（1~5 秒）\n选过的下次开播放器还在")
+        self.cb_step.currentIndexChanged.connect(self._step_changed)
+        b_fwd = QPushButton("＋")
+        b_fwd.setObjectName("StepFwd")
+        b_fwd.setFixedWidth(34)
+        b_fwd.setToolTip("按步长前进（→）")
+        b_fwd.clicked.connect(lambda: self._step_seek(1))
+        self.slider = _SeekSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
-        self.slider.sliderMoved.connect(self.player.setPosition)
+        self.slider.setMinimumWidth(70)
+        self.slider.sliderMoved.connect(self._seek_to)
+        self.slider.seeked.connect(self._seek_to)
         self.lbl_time = QLabel("00:00 / 00:00")
-        self.lbl_time.setToolTip("当前位置 / 总时长")
+        self.lbl_time.setToolTip("当前位置 / 总时长（进度条上点一下就能跳到那儿）")
+        for w in (self.btn_play, b_back, self.cb_step, b_fwd,
+                  self.slider, self.lbl_time):
+            ctrl.addWidget(w)
+        lay.addLayout(ctrl)
+        self.btn_back, self.btn_fwd = b_back, b_fwd
+
+        # ---------- 第二行：倍速 / 音量 / 循环 +（只给成品的）审片按钮 ----------
+        mark_bar = QHBoxLayout()
+        mark_bar.setSpacing(6)
         self.cb_rate = QComboBox()
         self.cb_rate.addItems([f"{_fmt_rate(r)}x" for r in RATES])
         self.cb_rate.setCurrentIndex(list(RATES).index(1.0))
@@ -165,20 +252,15 @@ class VideoPlayerDialog(QDialog):
         self.vol = QSlider(Qt.Orientation.Horizontal)
         self.vol.setRange(0, 100)
         self.vol.setValue(100)
-        self.vol.setFixedWidth(72)
+        self.vol.setFixedWidth(64)
         self.vol.setToolTip("音量（↑ / ↓）")
         self.vol.valueChanged.connect(self._set_volume)
-        self.btn_loop = QPushButton("🔁 循环")
+        self.btn_loop = QPushButton("🔁")
         self.btn_loop.setCheckable(True)
         self.btn_loop.setToolTip("循环播放：同一条反复看（L）")
-        for w in (self.btn_play, b_back, b_fwd, self.slider, self.lbl_time,
-                  self.cb_rate, self.btn_mute, self.vol, self.btn_loop):
-            ctrl.addWidget(w)
-        lay.addLayout(ctrl)
-
-        # ---------- 审片区（只给成品视频） ----------
-        mark_bar = QHBoxLayout()
-        mark_bar.setSpacing(6)
+        for w in (self.cb_rate, self.btn_mute, self.vol, self.btn_loop):
+            mark_bar.addWidget(w)
+        mark_bar.addStretch(1)
         self.lbl_mark = QLabel("审片：")
         self.btn_ok = QPushButton("👍 可用")
         self.btn_ok.setObjectName("MarkOk")
@@ -195,7 +277,6 @@ class VideoPlayerDialog(QDialog):
         mark_bar.addWidget(self.lbl_mark)
         mark_bar.addWidget(self.btn_ok)
         mark_bar.addWidget(self.btn_bad)
-        mark_bar.addStretch(1)
         for w in (self.lbl_mark, self.btn_ok, self.btn_bad):
             w.setVisible(self._allow_mark)
         lay.addLayout(mark_bar)
@@ -209,12 +290,12 @@ class VideoPlayerDialog(QDialog):
 
         self.player.playbackStateChanged.connect(self._on_state)
         self.player.positionChanged.connect(self._on_pos)
-        self.player.durationChanged.connect(self.slider.setMaximum)
+        self.player.durationChanged.connect(self._on_duration)
         self.player.errorOccurred.connect(self._on_err)
         self.player.mediaStatusChanged.connect(self._on_status)
         self.player.playbackRateChanged.connect(self._on_rate)
-        # 真实宽高比元数据靠谱：不依赖容器写没写 Resolution
-        self.video.videoSink().videoSizeChanged.connect(self._fit_to_video)
+        # 真实宽高比靠视频尺寸变化重排窗口（不依赖容器写没写 Resolution）
+        self.video.videoSink().videoSizeChanged.connect(self._on_video_size)
 
         self._load(self._path, autoplay=True)
         self._sync_mark_buttons()
@@ -253,7 +334,36 @@ class VideoPlayerDialog(QDialog):
             self.player.play()
 
     def _seek_rel(self, ms):
-        self.player.setPosition(max(0, self.player.position() + ms))
+        self.player.setPosition(max(0, self.player.position() + int(ms)))
+
+    def _step_sec(self):
+        return int(self.cb_step.currentData() or STEP_DEFAULT)
+
+    def _step_seek(self, direction):
+        """±按钮与键盘 ←/→ 都走这里：步长由那个下拉说了算"""
+        self._seek_rel(direction * self._step_sec() * 1000)
+
+    def _restore_step(self):
+        """步长接着上次的用（没记过才用默认）
+
+        必须赶在接 currentIndexChanged 之前调，否则开一次窗口就写一次盘。"""
+        want = app_state.get(STEP_KEY)
+        for i in range(self.cb_step.count()):
+            if self.cb_step.itemData(i) == want:
+                self.cb_step.setCurrentIndex(i)
+                return
+        self.cb_step.setCurrentIndex(list(STEP_SECONDS).index(STEP_DEFAULT))
+
+    def _step_changed(self, idx):
+        sec = int(self.cb_step.itemData(idx) or STEP_DEFAULT)
+        self.btn_back.setToolTip(f"后退 {sec} 秒（←）")
+        self.btn_fwd.setToolTip(f"前进 {sec} 秒（→）")
+        app_state.set_value(STEP_KEY, sec)
+
+    def _seek_to(self, ms):
+        """进度条定位：拖动、点哪儿跳哪儿都走这一条"""
+        self.player.setPosition(max(0, int(ms)))
+        self._show_pos(ms)          # 先本地回显，不等 positionChanged 绕一圈
 
     def _rate_changed(self, idx):
         try:
@@ -288,10 +398,21 @@ class VideoPlayerDialog(QDialog):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.btn_play.setText("❚❚" if playing else "▶")
 
+    def _on_duration(self, ms):
+        """时长回来才把进度条撑开
+
+        范围还是 0~0 时滑块是拖不动的，而个别文件的时长比首帧晚到，
+        不能只在创建时搭一次。"""
+        self.slider.setRange(0, max(int(ms), 0))
+        self._show_pos(self.player.position())
+
     def _on_pos(self, pos):
         if not self.slider.isSliderDown():
             self.slider.setValue(pos)
-        self.lbl_time.setText(f"{_fmt_ms(pos)} / {_fmt_ms(self.player.duration())}")
+        self._show_pos(pos)
+
+    def _show_pos(self, ms):
+        self.lbl_time.setText(f"{_fmt_ms(ms)} / {_fmt_ms(self.player.duration())}")
 
     def _on_status(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self.btn_loop.isChecked():
@@ -329,26 +450,98 @@ class VideoPlayerDialog(QDialog):
     def _toggle_fullscreen(self):
         self._set_fullscreen(not self._fullscreen)
 
-    def _fit_to_video(self, size):
-        """按视频真实宽高比重排窗口：竖屏视频不再两侧各一大块黑
+    def _avail(self):
+        return (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
 
-        只在本条视频第一次报出尺寸时动手（_fitted 记下那个尺寸），
-        否则用户拖大拖小会被后续的尺寸回调顶回去。"""
-        w, h = int(size.width()), int(size.height())
-        if w <= 0 or h <= 0:
-            return
-        self._last_size = (w, h)
-        if self._fitted == (w, h) or self._fullscreen:
-            return
-        self._fitted = (w, h)
-        avail = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
-        max_w = max(int(avail.width() * self.FILL_W), self.MIN_W)
-        max_h = max(int(avail.height() * self.FILL_H), self.MIN_H)
-        scale = min(max_w / w, max_h / h)
-        self.resize(max(int(w * scale), self.MIN_W),
-                    max(int(h * scale) + self.BAR_H, self.MIN_H))
+    def _place(self, w, h):
+        """摆窗 + 居中（居中按可用区算，别被菜单栏/Dock 顶到屏幕外）"""
+        avail = self._avail()
+        self.resize(min(w, avail.width()), min(h, avail.height()))
         self.move(avail.x() + (avail.width() - self.width()) // 2,
                   avail.y() + (avail.height() - self.height()) // 2)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._fitted is None and not self._fullscreen:
+            # 后端还没报出视频尺寸（容器没写 Resolution 或报得比首帧晚）：
+            # 先按半屏给一个够大的窗，不要把播放器开成一个巴掌大的方块，
+            # 等视频尺寸到了再按真实比例重摆一次。
+            avail = self._avail()
+            self._place(int(avail.width() * 0.5), int(avail.height() * 0.5))
+
+    def _on_video_size(self, *_):
+        """视频尺寸变化的通知：尺寸要自己从 sink 上取
+
+        PySide6 6.11 里这条信号到 Python 槽是不带参数的（签名就是
+        videoSizeChanged()），当初写成接一个 QSize，槽每次都被 0 参数调用、
+        报个 TypeError 被 Qt 吃掉——横竖屏自适应等于完全没做。
+        所以这里签 (self, *_)：带不带尺寸都能接。"""
+        self._fit_to_video(self.video.videoSink().videoSize())
+
+    def _fit_to_video(self, size):
+        """按视频真实宽高比重排窗口：横屏视频给横窗、竖屏视频给窄高窗
+
+        判据是「比例变没变」而不是「只摆第一次」：后端可能先报一个占位尺寸、
+        准确尺寸随后才到，只摆一次会停在错的比例上；而比例没变时不重摆，
+        用户拖大拖小不会被后续回调顶回去。
+        这里只能粗算（外壳占多少算不准），真正的贴比例交给 _reconcile。"""
+        w, h = int(size.width()), int(size.height())
+        if w <= 0 or h <= 0 or self._fullscreen:
+            return
+        self._last_size = (w, h)
+        cur = w / h
+        if self._fitted is not None and abs(cur - self._fitted) < self.REFIT_EPS:
+            return
+        self._fitted = cur
+        avail = self._avail()
+        scale = min(avail.width() * self.FILL_W / w, avail.height() * self.FILL_H / h)
+        self._place(max(int(w * scale), self.MIN_W + 60),
+                    max(int(h * scale), self.MIN_H + 60))
+        # 上面的尺寸是「整窗」而不是「画面」，布局会把画面区压成另一个比例；
+        # 等一轮事件让布局落地后再按实测尺寸补差（_reconcile 里会继续约正）。
+        QTimer.singleShot(0, self._reconcile)
+
+    def _reconcile(self):
+        """把窗口修到「画面区尺寸 == 视频宽高比」
+
+        黑边的唯一来源就是画布比例与视频比例不等，而外壳占多少没法凭空算准
+        （控件摆几行、字体大一号都会变），所以先摆一次再拿实测的画面尺寸补差：
+        先调高（高的余量最便宜），顶到屏幕上下限了再反过来调宽。"""
+        if self._fullscreen or not self._last_size or not self.isVisible():
+            return
+        vw, vh = self.video.width(), self.video.height()
+        if vw <= 0 or vh <= 0:
+            return
+        w, h = self._last_size
+        avail = self._avail()
+        want_h = vw * h / w                       # 画面宽 vw 时该有多高
+        old_h = self.height()
+        new_h = min(max(int(old_h + want_h - vh), self.minimumSizeHint().height()),
+                    avail.height())
+        if new_h != old_h:
+            self.resize(self.width(), new_h)
+        # 高度真被改过就要等一轮布局把新的画面高报回来；没改（已顶到上下限）
+        # 直接走宽度那一步，否则 self.height() 已是新值，比对永远相等
+        if abs(new_h - old_h) <= 2:
+            self._reconcile_width()
+        else:
+            QTimer.singleShot(0, self._reconcile_width)
+
+    def _reconcile_width(self):
+        """高度顶到屏幕上限补不开时，反过来把宽度收到贴视频比例"""
+        if self._fullscreen or not self._last_size or not self.isVisible():
+            return
+        vw, vh = self.video.width(), self.video.height()
+        if vw <= 0 or vh <= 0:
+            return
+        w, h = self._last_size
+        avail = self._avail()
+        want_w = vh * w / h                       # 画面高 vh 时该有多宽
+        if abs(want_w - vw) <= 2:
+            return
+        new_w = min(max(int(self.width() + want_w - vw), self.minimumSizeHint().width()),
+                    avail.width())
+        self.resize(new_w, self.height())
 
     def _video_clicked(self, e):
         """单击画面＝播放/暂停，双击＝全屏（双击时两下点击会把播放状态又拨回来）"""
@@ -383,9 +576,9 @@ class VideoPlayerDialog(QDialog):
         elif k in (Qt.Key.Key_Space, Qt.Key.Key_K):
             self._toggle_play()
         elif k == Qt.Key.Key_Left:
-            self._seek_rel(-5000)
+            self._step_seek(-1)
         elif k == Qt.Key.Key_Right:
-            self._seek_rel(5000)
+            self._step_seek(1)
         elif k == Qt.Key.Key_Up:
             self.vol.setValue(min(100, self.vol.value() + 5))
         elif k == Qt.Key.Key_Down:
