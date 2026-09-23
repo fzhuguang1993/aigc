@@ -43,7 +43,7 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 1 | 运行时目录（DB/日志/输出/ui_state 落地处） | 环境变量 `AIGC_HOME` | 打包版＝**exe 所在目录**，开发版＝**仓库根**（`_runtime_dir()`）。⚠ 绝不能用 `Path.cwd()`：cwd 是「从哪个目录启动」而不是「软件在哪」，换目录启动会另建一份空 `data/aigc.db`，看板从零开始（内测现场就是被这个误判成「统计不持久化」）。（口径单实在 `core/paths.py`，因为首次运行向导要赶在 config 加载前算出目录，不能 `from core.config import`） | `core/paths.py: RUNTIME_DIR` → `core/config.py` |
 | 2 | 用户配置 | 配置家 `config.json`（首运向导/首配弹窗生成） | **exe 内置线路**（维护机 `core/config_local.py` 的 `ACCOUNTS`，打包时编进去）→ 首次只问姓名；两者都没有才回退出“自己粘地址”。⚠ `config.json` 里 **没 `accounts` 键也算这种回退**（开发机首配只存姓名，改 `config_local.py` 要能立刻生效） | `core/config.py: _load_local_config/defaults_accounts` |
 | 2b | 账号 base 后缀 | 已是 `…/api/v1` 原样使用 | 缺失时加载端自动补齐（手写 config.json 漏后缀会 POST 打根路径返 405） | `core/config.py: _normalize_account_base` |
-| 3 | 文件命名姓名 | `config.json` 的 `user_name` | Excel「命名规则」sheet | `utils/excel_utils.py: load_name_rule` |
+| 3 | 文件命名姓名 | `config.json` 的 `user_name` | Excel「命名规则」sheet → 两者都没则写 `未知姓名`（不能让文件名缺一段） | `core/naming.py: _FIELDS["name"]` + `utils/excel_utils.py: load_name_rule`（在 `processors/video_processor.py: process_outputs` 里串起来） |
 | 4 | 参考图 | 产品中心该品名登记图片 | 无（为空则不带参考图提交） | `workers/submit.py: build_payload` |
 | 5 | KOL 形象图 | 产品中心登记 | `material/KOL` 目录 → 都找不到则忽略并告警 | `workers/submit.py: build_payload` + `store/product_store.py: kol_image` |
 | 6 | 账号负载统计 | 云端 `list_jobs` 实时数（取 `max(云端, 本机在途)`，防提交到入队几秒延迟期内被自己灌穿） | 接口不可达时降级为 `REG.count_active_by_account`，**首次降级必告警**，UI 标「⚠仅本机」 | `registry/manager.py: measure_load` |
@@ -51,7 +51,7 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 8 | 提交重试换线 | 其他健康账号中**负载最低的**（`pick_account(exclude=当前)`，换线 + 指数退避 2/4/8s，封顶 10s） | 无备选账号时原账号退避重试 | `workers/submit.py: _next_account / do_submit` |
 | 9 | 口播文案/分镜数自动识别 | 提交链路（执行时）字段为空且能从提示词识别 → 自动补齐（不限时长；口播已有/分镜已识别则不覆盖） | 识别不出留空，规范检测退而用提示词；失败静默不影响提交 | `workers/submit.py: do_submit` + `processors/script_extractor.py: ensure_script_fields` |
 | 10 | 账号健康标记 | **启动立即真实探活一轮**（`check_all_accounts` 先检后睡），一轮内 `HEALTH_ATTEMPTS=2` 次全败才计一次失败 | 连续失败 ≥`HEALTH_FAIL_THRESHOLD(3)` 轮才标不可用（防网络闪断误杀），监控线程自动恢复并清零；`healthy` 默认 True 只是“未测先当可用”，展示层靠 `first_check_done()` 先显示「检测中/⚪ 待检测」而不是绿灯；侧栏灯可点击手动重测 | `registry/manager.py: check_all_accounts/health_monitor_worker` + `gui/main_window.py: _recheck_health` |
-| 11 | 下载文件名防撞 | `next_seq()` 扫描已有文件取最大序号 +1 | 序号仍撞名（强制重跑/抽卡时同任务并发多 job）则线性探测下一个可用序号 | `processors/video_processor.py: process_outputs` |
+| 11 | 下载文件名防撞 | 规则里排了「序号」→ `next_seq()` 扫同日同前缀取最大序号 +1，占着就继续 +1 | 规则里**没**「序号」时续不了号，就在尾巴挂 `(2)(3)`（绝不能默默覆盖：强制重跑/抽卡会同一秒出多条） | `core/naming.py: resolve_save_path/next_seq` |
 | 12 | 已完成任务重跑 | **先查还有没有执行在跑**（`inflight_execs`，见第 36 行）：在跑的不归“强制重跑”那档；没在跑的若提示词在上次执行后改过 → 自动识别为「迭代执行」，无需确认 | 没改过 → 弹窗确认是否「强制重跑」，单条时可选抽卡次数（同提示词并发多 job） | `store/task_store.py: iter_ready` + `gui/dialogs.py: ForceRerunDialog` + `gui/pages_tasks.py: _run` |
 | 13 | 任务编辑重置执行态 | 提示词变了 → 重置状态/运行次数（否则永远进不了待办） | 只改品名/脚本 → 不动执行态，不影响迭代/重跑判定 | `gui/pages_tasks.py: _edit_current` |
 | 14 | 生成步数（1-50） | GUI 工具栏「步数」下拉取值，随 SubmitOptions 快照透传 payload.**inference_steps**（写成 `steps` 会被云端整单拒绝） | 跨入口越界值自动限幅到 1-50，缺省 `DEFAULT_STEPS=8`；批量取消多任务只弹一次确认 | `workers/submit.py: SubmitOptions/build_payload` + `gui/pages_tasks.py: _cancel_selected` |
@@ -78,6 +78,9 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 35 | 一次用浏览器打开多条线路 | 设置页底部「🌐 打开选中」：按表格顺序去重后逐条开标签，超过 `OPEN_MAX=8` 条先确认；没选中任何行时**只问一句**「要打开全部 N 条吗」，答否就一个都不开 | 空地址行先滤掉再交给 `_browser_url`（否则拼出光杆 `http://`），全空则提示「还没填接口地址」；`openUrl` 返回 False 的行汇总成「部分没打开」告警而不是静默失败。逐行点行末按钮在 5 条以上就太累 | `gui/pages_settings.py: _open_selected/dedupe_browser_urls/_selected_rows` |
 | 36 | 重跑时该任务还有执行在跑 | 「▶ 执行选中」先过 `inflight_execs(tids)`（只看 `REG` 且 `is_active`）：有在跑的执行 → 同一个弹窗多给一个默认项「⏹ 取消并重跑」（另有「🔁 直接重跑」与「跳过」），取消排在提交**之前**且在后台线程里做 | 旧实现根本不查：再提交一份 → 新旧两份同时占并发、各下一个成品（**同事反馈现场**），还给正在跑的任务念“已经执行成功过”这种错文案（单条时更给出抽卡，1 份变 4 份）。不能拿数据库的 `status=running` 当“还在跑”：重启后 `REG` 空了而库里那句是上一辈子留下的（轮询只管本次会话的 job），拿它发取消等于对着早就跑完的 job 发消息。「跳过」必须连在跑的那几条一起退出本批，否则“跳过”了还会多一个成品。命令行 `run` 不拦不弹确认，但提一句「还有 N 个没跑完，这次会再提交一份」 | `gui/pages_tasks.py: inflight_execs/decide_rerun/cancel_inflight/SubmitWorker` + `gui/dialogs.py: ForceRerunDialog` + `console/app.py: _submit_by_ids` |
 | 37 | 「这条视频生成用了多久」怎么算 | `gen_sec` 用**云端回报的三个时间戳**算（`submitted_at`→`started_at`→`completed_at`）：任务中心分「生成用时」+「排队」两列，看板「平均生成时长」只平均 `gen_sec` | 旧口径把提交→完成整个当生成用时：批量提交时同一条线串行跑，**越靠后的视频数字越大**（实测 928 秒里 629 秒在排队、真生成只 297 秒），看板的平均也就不是“一条视频要多久”。宁可没数也不猜：拿不到时间戳时 `gen_sec=0`，执行记录显示「—」，任务中心回退显示总用时并标「早期记录没拆出排队」；不拿本地轮询时刻估（差一个 POLL_INTERVAL，而单条生成本身才 5 分钟量级）。老数据跑 `backfill_run_gen_sec.py` 按 job_id 回云端补（幂等，不覆盖已有拆分）。展示与排序：三个时长列共用 `gui.formatting.secs`（写三份就会出现“10分30秒”排在“4分58秒”前面）与 `tablekit.SecsItem`（重载 `<` ：显示折分秒、排序比秒数） | `store/task_store.py: split_from_cloud/record_run_end/update_run_split/list_tasks_df/_RANGE` + `workers/poll.py` + `gui/pages_tasks.py: _dur_tip` + `gui/tablekit.py: SecsItem` + `backfill_run_gen_sec.py` |
+| 38 | 输出文件怎么命名 | `config.json` 的 `filename: {tokens, sep}`（「⚙ 设置 → 🏷 命名规则」拖排组合），字段清单与渲染只在 **`core/naming.py` 一处** | 没这段/这段被手改坏（字段名不认识、JSON 语法错）一律回到内置默认 `num_product_date_seq_name` + `_`，与历史输出逐字节一致；一个字段都不认也算坏规则，不然会拼出**空文件名**让下载落到非法路径。⚠ 本模块**自己解析 `CONFIG_JSON`**，不走 `core.config._json_data()` 的启动期缓存，所以能**保存即生效**（设置页其它项仍是重启生效）；`set_rules()` 只改内存（测试/预览），落盘只有 `save_rules()` | `core/naming.py` + `gui/dialogs_naming.py` + `processors/video_processor.py: process_outputs` |
+| 39 | 审片「可用/不可用」记在哪 | **文件名 + `file_marks` 表都记**（主键是成品**当前路径**，不是任务 ID：一个任务抽卡多条要逐条判定）：改名后 `move_file_mark` 跟键 + `replace_output_path` 同步 `tasks.output`/`runs.output`（`; ` 拼接的多产物逐段比对） | 库里查不到时再看文件名（同事在资源管理器里自己改的名也认）。⚠ 路径键必须 `Path.resolve()` 归一（macOS 临时目录 `/var`→`/private/var` 是符号链接，不归一同一份文件会记两条）；在播放器里点标记要先 `stop()` + 清 source 放句柄再改名（Windows 上打开中的文件改不了名），改名带 3 次 0.25s 重试。「🧹 清理不可用」**只移文件进回收站 + 清标记，不删 tasks/runs**（那次执行确实发生过，成功率与平均生成时长不该因事后删片而变） | `store/db.py: file_marks` + `store/task_store.py` + `processors/output_mark.py` |
+| 40 | 原生系统能力（定位/回收站/剪贴板） | 直接调系统：Windows `shell32.SHFileOperationW(FOF_ALLOWUNDO)` / `CF_HDROP` / `explorer /select,`，macOS `osascript` 让 Finder 做，Linux `gio trash`/`trash-put` + `xclip` | **不引第三方依赖**；回收站逐条删才能准确报哪几条失败，一条都移不进（没那命令）就当失败，**绝不降级成真删**；剪贴板走 `CF_HDROP` 必须显式声明 64 位 `restype/argtypes`（否则句柄被截断，粘出去是空的）；`explorer /select` 的路径要**连同开关合成一个参数**传（分两个参数时路径带空格/中文会只打开目录不选中文件） | `utils/desktop_utils.py: reveal_in_folder/move_to_trash/copy_paths_to_clipboard` |
 
 ### 4.1 三个文本字段的分工（勿混淆）
 
@@ -102,7 +105,13 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 
 - 回归测试放 `tests/`（pytest），批量手测脚本与对照仿真留在 `test/`（不计入回归）。
   选线分布类问题用 `python test/load_balance_sim.py` 复现（改前/改后/接口降级三组对比）。
-- `tests/conftest.py` 通过 `AIGC_HOME` 把 SQLite/日志/输出隔离到临时目录；
-  涉及网络的依赖一律 monkeypatch `workers.submit` / `core.api_client` 命名空间。
+- **临时脚本/测试必须同时隔离两个目录**：`AIGC_HOME`（SQLite/日志/输出）与
+  `AIGC_CONFIG_DIR`（`config.json`：姓名、**线路凭证**、命名规则）。只设前者时，
+  任何走到 `config.save_*` / `naming.save_rules` 的代码都会写进使用者真实的配置家
+  （Windows `%APPDATA%\AIGC视频助手`，macOS `~/Library/Application Support/…`），
+  把里面的线路覆盖掉；`tests/conftest.py` 两个都设，一次性临时冒烟脚本也必须两个都设。
+- 涉及网络的依赖一律 monkeypatch `workers.submit` / `core.api_client` 命名空间；
+  要验写盘行为的，monkeypatch `naming.CONFIG_JSON`（或 `config.CONFIG_JSON`）到 `tmp_path`，
+  不靠环境变量外的兜底。
 - 改动提交/轮询/账号选择主链路后，必须跑 `python -m pytest -q` 全绿再提交。
 - 新增主链路行为时同步补断言，不写"只打印不 assert"的回归用例。

@@ -1,18 +1,19 @@
 """
-gui/widgets.py —— 视频/图片预览窗口 + 提示词悬停预览浮层（保留换行/限宽/可滚动）
+gui/widgets.py —— 无边框视频播放器 + 图片预览 + 提示词悬停预览浮层 + Toast
 """
 import html
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint, QTimer, QRect, Signal
+from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
-                               QPushButton, QLabel, QWidget, QMessageBox, QStyle)
+                               QPushButton, QLabel, QWidget, QMessageBox,
+                               QComboBox, QSizeGrip)
 
-from utils.desktop_utils import open_path
+from utils.desktop_utils import open_path, reveal_in_folder
 
 
 def _fmt_ms(ms):
@@ -20,64 +21,441 @@ def _fmt_ms(ms):
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
+def _fmt_rate(r):
+    """0.5 → 0.5；1.0 → 1（倍速列表里不想看到“1.0x”这种写法）"""
+    return f"{float(r):g}"
+
+
+# 倍速预设：审片时 1.5x/2x 快速过片、逐帧对口型时 0.5x
+RATES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+
+# 深色播放器外壳。选择器全部挂在 #PlayerShell 下：应用级样式表里已经有
+# QPushButton{...}，不拿 id 提高优先级的话按钮会被全局浅色样式盖掉。
+# 也不用 WA_TranslucentBackground 做真圆角：透明窗口叠硬解视频在 Windows 上
+# 会把画面区域变成一块黑，宁可角上直角。
+_SHELL_QSS = """
+#PlayerShell { background:#15171C; border:1px solid #2A2E37; border-radius:10px; }
+#PlayerShell QLabel { color:#C9CFDA; background:transparent; font-size:12px; }
+#PlayerShell QLabel#FileName { color:#F2F5FA; font-size:12px; font-weight:600; }
+#PlayerShell QLabel#StatusTip { color:#8A93A3; font-size:11px; }
+#PlayerShell QPushButton, #PlayerShell QToolButton {
+    background:#252A33; color:#DCE1EA; border:0; border-radius:6px; padding:4px 9px; }
+#PlayerShell QPushButton:hover, #PlayerShell QToolButton:hover { background:#323A47; }
+#PlayerShell QPushButton:checked { background:#3370FF; color:#FFFFFF; }
+#PlayerShell QPushButton#MarkOk:checked { background:#12A150; color:#FFFFFF; }
+#PlayerShell QPushButton#MarkBad:checked { background:#D94A43; color:#FFFFFF; }
+#PlayerShell QPushButton#CloseBtn:hover { background:#D94A43; color:#FFFFFF; }
+#PlayerShell QComboBox { background:#252A33; color:#DCE1EA; border:0;
+    border-radius:6px; padding:3px 6px; }
+#PlayerShell QComboBox QAbstractItemView { background:#252A33; color:#DCE1EA;
+    selection-background-color:#3370FF; border:1px solid #3A4150; }
+#PlayerShell QSlider::groove:horizontal { height:4px; background:#31363F; border-radius:2px; }
+#PlayerShell QSlider::sub-page:horizontal { background:#3370FF; border-radius:2px; }
+#PlayerShell QSlider::handle:horizontal { width:12px; margin:-4px 0; border-radius:6px;
+    background:#EAF0FA; }
+#PlayerShell QSizeGrip { background:transparent; }
+"""
+
+
 class VideoPlayerDialog(QDialog):
-    """双击输出文件单元格弹出：播放该视频（含 播放/暂停/进度条/时间）"""
+    """无边框播放器：播放/暂停、进度、倍速、全屏、横竖屏自适应、审片标记
 
-    def __init__(self, parent, file_path):
+    无边框就得自己把窗口的事管完：顶部一条可拖动的标题栏（定位/全屏/最小化/关闭），
+    右下角 QSizeGrip 拉大，Esc 关、双击画面全屏、单击画面播放/暂停。
+
+    allow_mark：只有【成品视频】才给标记按钮。素材库里预览的是同事传上来的
+    原材，误点一下就把素材改名了，所以默认不给。
+
+    marked(new_path, mark)：标记完成（含改名）后发出来，父页面据此刷新列表。
+    """
+
+    marked = Signal(str, str)
+
+    MIN_W, MIN_H = 360, 220
+    FILL_W, FILL_H = 0.72, 0.72          # 自适应时占屏幕可用区的比例
+    BAR_H = 96                          # 标题条 + 控制条大致占高
+
+    def __init__(self, parent, file_path, allow_mark=False):
         super().__init__(parent)
-        self.setWindowTitle(f"预览 - {Path(file_path).name}")
-        self.resize(860, 520)
+        self._path = str(file_path or "")
+        self._allow_mark = bool(allow_mark)
+        self._drag_pos = None            # 无边框拖动：按下时的坐标偏移
+        self._fitted = None              # 已按哪个视频尺寸自适应过（不跟用户抢尺寸）
+        self._swapping = False           # 换文件途中屏蔽报错
+        self._fullscreen = False
+        self._last_size = None           # 视频真实宽高（退出全屏时重摆一次）
 
-        lay = QVBoxLayout(self)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet(_SHELL_QSS)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSizeGripEnabled(True)
+
+        shell = QWidget(objectName="PlayerShell")
+        out = QVBoxLayout(self)
+        out.setContentsMargins(0, 0, 0, 0)
+        out.addWidget(shell)
+        lay = QVBoxLayout(shell)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+
+        # ---------- 顶部：拖动区 + 窗口按钮 ----------
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.lbl_name = QLabel(objectName="FileName")
+        bar.addWidget(self.lbl_name, 1)
+        self.btn_reveal = QPushButton("📂 定位")
+        self.btn_reveal.setToolTip("打开成品所在文件夹并选中这个文件（G）")
+        self.btn_reveal.clicked.connect(self._reveal)
+        self.btn_full = QPushButton("⛶ 全屏")
+        self.btn_full.setCheckable(True)
+        self.btn_full.setToolTip("全屏 / 退出全屏（F 或双击画面）")
+        self.btn_full.toggled.connect(self._set_fullscreen)
+        b_min = QPushButton("―")
+        b_min.setToolTip("最小化")
+        b_min.clicked.connect(self.showMinimized)
+        b_close = QPushButton("✕")
+        b_close.setObjectName("CloseBtn")
+        b_close.setToolTip("关闭（Esc）")
+        b_close.clicked.connect(self.close)
+        for b in (self.btn_reveal, self.btn_full, b_min, b_close):
+            bar.addWidget(b)
+        lay.addLayout(bar)
+
+        # ---------- 画面 ----------
         self.video = QVideoWidget()
-        self.video.setMinimumSize(640, 360)
+        self.video.setMinimumSize(self.MIN_W, self.MIN_H)
+        self.video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        self.video.mousePressEvent = self._video_clicked
         lay.addWidget(self.video, 1)
 
-        ctrl = QHBoxLayout()
-        self.btn_play = QPushButton()
-        self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        self.btn_play.setFixedWidth(40)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(0, 0)
-        self.lbl_time = QLabel("00:00 / 00:00")
-        ctrl.addWidget(self.btn_play)
-        ctrl.addWidget(self.slider, 1)
-        ctrl.addWidget(self.lbl_time)
-        lay.addLayout(ctrl)
-
+        # ---------- 媒体（先建好，控制条要接它的信号） ----------
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video)
 
-        self.btn_play.clicked.connect(self.player.play)
-        self.player.playbackStateChanged.connect(self._on_state)
+        # ---------- 控制条 ----------
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(6)
+        self.btn_play = QPushButton("▶")
+        self.btn_play.setToolTip("播放 / 暂停（空格）")
+        self.btn_play.setFixedWidth(40)
+        self.btn_play.clicked.connect(self._toggle_play)
+        b_back = QPushButton("-5s")
+        b_back.setToolTip("后退 5 秒（←）")
+        b_back.clicked.connect(lambda: self._seek_rel(-5000))
+        b_fwd = QPushButton("+5s")
+        b_fwd.setToolTip("前进 5 秒（→）")
+        b_fwd.clicked.connect(lambda: self._seek_rel(5000))
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 0)
         self.slider.sliderMoved.connect(self.player.setPosition)
+        self.lbl_time = QLabel("00:00 / 00:00")
+        self.lbl_time.setToolTip("当前位置 / 总时长")
+        self.cb_rate = QComboBox()
+        self.cb_rate.addItems([f"{_fmt_rate(r)}x" for r in RATES])
+        self.cb_rate.setCurrentIndex(list(RATES).index(1.0))
+        self.cb_rate.setToolTip("播放倍速（, 减速 / . 加速 / 斜杠回到 1x）\n"
+                                "审片用 2x 过片、看口型用 0.5x")
+        self.cb_rate.currentIndexChanged.connect(self._rate_changed)
+        self.btn_mute = QPushButton("🔊")
+        self.btn_mute.setCheckable(True)
+        self.btn_mute.setToolTip("静音 / 取消静音（M）")
+        self.btn_mute.toggled.connect(self._set_muted)
+        self.vol = QSlider(Qt.Orientation.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(100)
+        self.vol.setFixedWidth(72)
+        self.vol.setToolTip("音量（↑ / ↓）")
+        self.vol.valueChanged.connect(self._set_volume)
+        self.btn_loop = QPushButton("🔁 循环")
+        self.btn_loop.setCheckable(True)
+        self.btn_loop.setToolTip("循环播放：同一条反复看（L）")
+        for w in (self.btn_play, b_back, b_fwd, self.slider, self.lbl_time,
+                  self.cb_rate, self.btn_mute, self.vol, self.btn_loop):
+            ctrl.addWidget(w)
+        lay.addLayout(ctrl)
+
+        # ---------- 审片区（只给成品视频） ----------
+        mark_bar = QHBoxLayout()
+        mark_bar.setSpacing(6)
+        self.lbl_mark = QLabel("审片：")
+        self.btn_ok = QPushButton("👍 可用")
+        self.btn_ok.setObjectName("MarkOk")
+        self.btn_ok.setCheckable(True)
+        self.btn_ok.setToolTip("标为可用：文件名上的「_不可用」记号会被去掉\n"
+                               "（再点一次＝取消标记）")
+        self.btn_bad = QPushButton("👎 不可用")
+        self.btn_bad.setObjectName("MarkBad")
+        self.btn_bad.setCheckable(True)
+        self.btn_bad.setToolTip("标为不可用：文件名改成「…_不可用.mp4」，\n"
+                                "回头用任务中心的「🧹 清理不可用」一次清掉（再点一次＝取消）")
+        self.btn_ok.clicked.connect(lambda: self._on_mark("ok"))
+        self.btn_bad.clicked.connect(lambda: self._on_mark("bad"))
+        mark_bar.addWidget(self.lbl_mark)
+        mark_bar.addWidget(self.btn_ok)
+        mark_bar.addWidget(self.btn_bad)
+        mark_bar.addStretch(1)
+        for w in (self.lbl_mark, self.btn_ok, self.btn_bad):
+            w.setVisible(self._allow_mark)
+        lay.addLayout(mark_bar)
+
+        self.lbl_tip = QLabel(objectName="StatusTip")
+        self.lbl_tip.setVisible(False)
+        self.lbl_tip.setWordWrap(True)
+        lay.addWidget(self.lbl_tip)
+
+        self._grip = QSizeGrip(shell)          # 无边框时手动挂一个拖动块
+
+        self.player.playbackStateChanged.connect(self._on_state)
         self.player.positionChanged.connect(self._on_pos)
         self.player.durationChanged.connect(self.slider.setMaximum)
         self.player.errorOccurred.connect(self._on_err)
+        self.player.mediaStatusChanged.connect(self._on_status)
+        self.player.playbackRateChanged.connect(self._on_rate)
+        # 真实宽高比元数据靠谱：不依赖容器写没写 Resolution
+        self.video.videoSink().videoSizeChanged.connect(self._fit_to_video)
 
-        if not Path(file_path).exists():
-            QMessageBox.warning(self, "文件不存在", f"找不到视频文件：\n{file_path}")
-        self.player.setSource(QUrl.fromLocalFile(str(file_path)))
-        self.player.play()
+        self._load(self._path, autoplay=True)
+        self._sync_mark_buttons()
+
+    # ---------------- 加载与换文件 ----------------
+
+    def _load(self, path, autoplay=False):
+        self._path = str(path)
+        name = Path(self._path).name
+        self.setWindowTitle(name)
+        self.lbl_name.setText(name)
+        self.lbl_name.setToolTip(self._path)
+        if not Path(self._path).exists():
+            self._say(f"文件不存在或已被移动：{self._path}", True)
+            return
+        self._swapping = True
+        self.player.setSource(QUrl.fromLocalFile(self._path))
+        self._swapping = False
+        if autoplay:
+            self.player.play()
+
+    def _reload_after_rename(self, new_path, resume_ms, was_playing):
+        """改名后重新指到新的路径，尽量接回原来的观看进度"""
+        self._load(new_path, autoplay=False)
+        if was_playing:
+            self.player.play()
+        if resume_ms:
+            self.player.setPosition(resume_ms)
+
+    # ---------------- 播放控制 ----------------
+
+    def _toggle_play(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _seek_rel(self, ms):
+        self.player.setPosition(max(0, self.player.position() + ms))
+
+    def _rate_changed(self, idx):
+        try:
+            self.player.setPlaybackRate(float(RATES[idx]))
+        except (IndexError, ValueError):
+            pass
+
+    def _step_rate(self, delta):
+        self.cb_rate.setCurrentIndex(min(max(self.cb_rate.currentIndex() + delta, 0),
+                                         len(RATES) - 1))
+
+    def _on_rate(self, rate):
+        """把后端实际生效的倍速回写到下拉框
+
+        解码器不支持时 setPlaybackRate 会静默失败，不回调回来就看不出来。"""
+        for i, r in enumerate(RATES):
+            if _fmt_rate(r) == _fmt_rate(rate):
+                if self.cb_rate.currentIndex() != i:
+                    self.cb_rate.setCurrentIndex(i)
+                return
+
+    def _set_volume(self, v):
+        self.audio.setVolume(max(0.0, min(1.0, v / 100.0)))
+        if v and self.btn_mute.isChecked():
+            self.btn_mute.setChecked(False)
+
+    def _set_muted(self, on):
+        self.audio.setMuted(on)
+        self.btn_mute.setText("🔇" if on else "🔊")
 
     def _on_state(self, state):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        icon = QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay
-        self.btn_play.setIcon(self.style().standardIcon(icon))
+        self.btn_play.setText("❚❚" if playing else "▶")
 
     def _on_pos(self, pos):
-        self.slider.setValue(pos)
+        if not self.slider.isSliderDown():
+            self.slider.setValue(pos)
         self.lbl_time.setText(f"{_fmt_ms(pos)} / {_fmt_ms(self.player.duration())}")
 
+    def _on_status(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.btn_loop.isChecked():
+            self.player.setPosition(0)
+            self.player.play()
+
     def _on_err(self, err, text):
-        if text:
-            QMessageBox.warning(self, "无法播放", f"{text}\n（文件可能已删除或编码不支持）")
+        # 注意枚举名是 QMediaPlayer.Error（不是 ErrorType），写错会让这条
+        # 槽在真正出错时抛 AttributeError，用户反而看不到任何失败提示
+        if self._swapping or err == QMediaPlayer.Error.NoError:
+            return
+        self._say(f"无法播放：{text or '文件可能已删除或编码不支持'}", True)
+
+    def _say(self, msg, warn=False):
+        self.lbl_tip.setText(msg)
+        self.lbl_tip.setStyleSheet(f"color:{'#F5A623' if warn else '#8A93A3'};")
+        self.lbl_tip.setVisible(bool(msg))
+
+    # ---------------- 窗口：全屏 / 横竖屏自适应 / 无边框拖动 ----------------
+
+    def _set_fullscreen(self, on):
+        self._fullscreen = bool(on)
+        if on:
+            self.showFullScreen()
+        else:
+            self.showNormal()
+            if self._last_size:
+                # 退出全屏：重新按视频比例摆一次（_fitted 清空才能再触发）
+                self._fitted = None
+                self._fit_to_video(QSize(*self._last_size))
+        self.btn_full.blockSignals(True)
+        self.btn_full.setChecked(on)
+        self.btn_full.blockSignals(False)
+
+    def _toggle_fullscreen(self):
+        self._set_fullscreen(not self._fullscreen)
+
+    def _fit_to_video(self, size):
+        """按视频真实宽高比重排窗口：竖屏视频不再两侧各一大块黑
+
+        只在本条视频第一次报出尺寸时动手（_fitted 记下那个尺寸），
+        否则用户拖大拖小会被后续的尺寸回调顶回去。"""
+        w, h = int(size.width()), int(size.height())
+        if w <= 0 or h <= 0:
+            return
+        self._last_size = (w, h)
+        if self._fitted == (w, h) or self._fullscreen:
+            return
+        self._fitted = (w, h)
+        avail = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        max_w = max(int(avail.width() * self.FILL_W), self.MIN_W)
+        max_h = max(int(avail.height() * self.FILL_H), self.MIN_H)
+        scale = min(max_w / w, max_h / h)
+        self.resize(max(int(w * scale), self.MIN_W),
+                    max(int(h * scale) + self.BAR_H, self.MIN_H))
+        self.move(avail.x() + (avail.width() - self.width()) // 2,
+                  avail.y() + (avail.height() - self.height()) // 2)
+
+    def _video_clicked(self, e):
+        """单击画面＝播放/暂停，双击＝全屏（双击时两下点击会把播放状态又拨回来）"""
+        if e.detail() == 2:
+            self._toggle_fullscreen()
+        else:
+            self._toggle_play()
+        e.accept()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        # 全屏时不拖；按在按钮/滑块上时事件被子控件吃掉，不会走到这里
+        if self._drag_pos is not None and not self._fullscreen \
+                and e.buttons() & Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k == Qt.Key.Key_Escape:
+            if self._fullscreen:
+                self._set_fullscreen(False)
+            else:
+                self.close()
+        elif k in (Qt.Key.Key_Space, Qt.Key.Key_K):
+            self._toggle_play()
+        elif k == Qt.Key.Key_Left:
+            self._seek_rel(-5000)
+        elif k == Qt.Key.Key_Right:
+            self._seek_rel(5000)
+        elif k == Qt.Key.Key_Up:
+            self.vol.setValue(min(100, self.vol.value() + 5))
+        elif k == Qt.Key.Key_Down:
+            self.vol.setValue(max(0, self.vol.value() - 5))
+        elif k in (Qt.Key.Key_F, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._toggle_fullscreen()
+        elif k == Qt.Key.Key_M:
+            self.btn_mute.click()
+        elif k == Qt.Key.Key_L:
+            self.btn_loop.click()
+        elif k in (Qt.Key.Key_Comma, Qt.Key.Key_BracketLeft):
+            self._step_rate(-1)
+        elif k in (Qt.Key.Key_Period, Qt.Key.Key_BracketRight):
+            self._step_rate(1)
+        elif k == Qt.Key.Key_Slash:
+            self.cb_rate.setCurrentIndex(list(RATES).index(1.0))
+        elif k == Qt.Key.Key_G:
+            self._reveal()
+        else:
+            super().keyPressEvent(e)
 
     def closeEvent(self, e):
         self.player.stop()
         super().closeEvent(e)
+
+    # ---------------- 审片标记 ----------------
+
+    def _reveal(self):
+        if Path(self._path).exists():
+            reveal_in_folder(self._path)
+        else:
+            self._say("文件不存在或已被移动", True)
+
+    def _current_mark(self):
+        if not self._allow_mark:
+            return ""
+        from processors import output_mark
+        return output_mark.mark_of(self._path)
+
+    def _sync_mark_buttons(self):
+        mark = self._current_mark()
+        self.btn_ok.setChecked(mark == "ok")
+        self.btn_bad.setChecked(mark == "bad")
+
+    def _on_mark(self, want):
+        """点当前已选中的那个按钮＝取消标记
+
+        改名前必须先松手：Windows 上改不了「正被打开」的文件，而媒体后端
+        此刻就是拿着它的那个。"""
+        if not self._allow_mark:
+            return
+        from processors import output_mark
+        mark = self._current_mark()
+        target = "" if mark == want else want
+        resume = self.player.position()
+        was_playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        self._swapping = True
+        self.player.stop()
+        self.player.setSource(QUrl())        # 把文件句柄放掉
+        self._swapping = False
+        ok, new_path, msg = output_mark.set_mark(self._path, target)
+        if not ok:
+            self._say(msg, True)
+            self._load(self._path, autoplay=was_playing)
+            self._sync_mark_buttons()
+            return
+        self._reload_after_rename(new_path, resume, was_playing)
+        self._say(msg)
+        self._sync_mark_buttons()
+        self.marked.emit(new_path, target)
 
 
 class ImagePreviewDialog(QDialog):

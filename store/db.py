@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS risk_rules(
   active INTEGER DEFAULT 1,
   updated_at TEXT DEFAULT ''
 );
+-- 审片标记：以「成品文件当前路径」为键（一个任务可能抽卡多条，
+-- 每条要能单独标可用/不可用，挂在 tasks/runs 上都会串位）。
+-- 重命名时跟着改键（见 processors/output_mark.py）。
+CREATE TABLE IF NOT EXISTS file_marks(
+  path TEXT PRIMARY KEY,
+  mark TEXT DEFAULT '',               -- bad=不可用 ok=可用 ''=没标
+  marked_at TEXT DEFAULT ''
+);
 """
 
 # 老库升级：列不存在时 ALTER 补上（重复执行安全）

@@ -22,7 +22,7 @@ def _finalize_completed(acc, t):
         outs = get_outputs(acc.base, t["job_id"])
         local_paths, full_urls = processor.process_outputs(
             outs, acc.base, t["row_idx"], t["job_id"],
-            t["product"], ctx)
+            t["product"], ctx, account=acc.name)
 
         task_store.update_row(t["row_idx"], **{
             COL_STATUS: "completed",

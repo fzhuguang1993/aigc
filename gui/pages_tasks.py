@@ -1,7 +1,7 @@
 """
 gui/pages_tasks.py —— 任务中心
-分页表格 · 图形进度条 · 视频双击预览 · 右键打开位置 · 悬停预览浮层 ·
-搜索/替换/日期筛选 · 扫描新任务 · 导入导出（含模板）
+分页表格 · 图形进度条 · 无边框视频预览（倍速/全屏/审片标记）·
+快捷定位/复制成品 · 搜索/替换/日期筛选 · 扫描新任务 · 导入导出（含模板）
 """
 from pathlib import Path
 import time
@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 from registry.manager import REG, ACCOUNTS, BatchBalancer, is_active
 from core.config import DEFAULT_STEPS, SUBMIT_PACING, BALANCE_RESCAN_EVERY
 from store import task_store, product_store, app_state
-from utils.desktop_utils import reveal_in_folder
+from utils.desktop_utils import reveal_in_folder, copy_paths_to_clipboard
+from processors import output_mark
 from workers.submit import (do_submit, cancel_one, SubmitOptions,
                             format_batch_distribution)
 from gui.dialogs import (TaskDialog, FindReplaceDialog, ForceRerunDialog,
@@ -234,7 +235,8 @@ class TasksPage(QWidget):
         lay.setContentsMargins(24, 12, 24, 12)
         lay.setSpacing(6)
 
-        lay.addWidget(page_header("任务中心", "单击输出列播放视频 · 单击/空格弹出全文 · 任意键关闭 · 右键更多", icon="📋"))
+        lay.addWidget(page_header("任务中心", "单击输出列播放视频 · 单击/空格弹出全文 · 任意键关闭 · "
+                                  "右键定位/复制/标可用不可用", icon="📋"))
 
         # ---------- 工具栏 ----------
         bar = QHBoxLayout()
@@ -244,6 +246,11 @@ class TasksPage(QWidget):
         b_scan = QPushButton("🔍 扫描新任务")
         b_cancel = QPushButton("⏹ 取消选中")
         b_del = QPushButton("🗑 删除")
+        b_clean = QPushButton("🧹 清理不可用")
+        b_clean.setToolTip(
+            "把所有标了「👎 不可用」的成品一次移到回收站（能搜回来）。\n"
+            "只删视频文件与它们的标记，不删任务、也不删执行记录：\n"
+            "那次执行确实发生过，成功率与平均生成时长不该因为事后删片而变")
         b_io = QPushButton("📁 导入/导出")
         # 注意：QPushButton.setMenu 配合全局样式表会导致点击无反应，改为手动弹出菜单
         self._io_menu = self._build_io_menu()
@@ -252,10 +259,12 @@ class TasksPage(QWidget):
         b_fields = QPushButton("⚟ 字段管理")
         b_fields.setObjectName("GhostBtn")
         b_fields.setToolTip("控制显示哪些列，拖动表头可直接调整列顺序")
-        for b in (b_cancel, b_del, b_io, b_fields):
+        for b in (b_cancel, b_del, b_clean, b_io, b_fields):
             b.setObjectName("GhostBtn")
-        for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del, b_io, b_fields):
+        for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del, b_clean, b_io,
+                  b_fields):
             bar.addWidget(b)
+        b_clean.clicked.connect(self._cleanup_bad)
         # 留存几个引导/快捷键目标（首次上手气泡、顶部待办数量都要用）
         self.b_new, self.b_run, self.b_io = b_new, b_run, b_io
         self.b_runall, self.b_fields = b_runall, b_fields
@@ -825,6 +834,19 @@ class TasksPage(QWidget):
             item.setText(Path(out_path).name if out_path else "")
             item.setData(Qt.ItemDataRole.UserRole + 2, out_path)   # 完整路径
             item.setToolTip(out_path)
+            # 标记要在列表里看得见：不能要求使用者自己去认文件名后缀
+            # 加个图标 + 底色，一眼就知道哪些已经在待清理名单里
+            audit = str(row.get("审核") or "")
+            if audit == "不可用":
+                item.setText("⛔ " + item.text())
+                item.setBackground(QColor("#FFF1F0"))
+                item.setForeground(QColor("#D94A43"))
+                item.setToolTip(out_path + "\n审片：已标不可用（右键可取消标记，"
+                                          "或点工具栏「🧹 清理不可用」）")
+            elif audit == "可用":
+                item.setText("✅ " + item.text())
+                item.setForeground(QColor("#00A870"))
+                item.setToolTip(out_path + "\n审片：已标可用（文件名上不另外加记号）")
         if pct is not None:
             item.setData(ProgressRole, pct)
         if c in LEFT_COLS:
@@ -1251,34 +1273,99 @@ class TasksPage(QWidget):
             task_store.update_row(tid, **{"备注": text.strip()})
         self.refresh()
 
-    def _play_video(self, r):
+    def _cell_path(self, r):
+        """这一行正在展示/播放的那个成品文件（多产物只取第一个）"""
         item = self.table.item(r, COL_OUT)
-        path = item.data(Qt.ItemDataRole.UserRole + 2) if item else ""
+        return item.data(Qt.ItemDataRole.UserRole + 2) if item else ""
+
+    def _play_video(self, r):
+        path = self._cell_path(r)
         if not path:
             QMessageBox.information(self, "提示", "该任务还没有输出视频")
             return
         if not Path(path).exists():
             QMessageBox.warning(self, "文件不存在", f"找不到视频文件：\n{path}")
             return
-        self._player = VideoPlayerDialog(self, path)
+        # allow_mark：成品才给审片按钮（素材库预览不给，不误改素材名）
+        self._player = VideoPlayerDialog(self, path, allow_mark=True)
+        # 标不可用会改名，路径变了不刷新就还会指着老名字
+        self._player.marked.connect(lambda *_: self.refresh())
         self._player.show()
 
     def _open_location(self, r):
-        item = self.table.item(r, COL_OUT)
-        path = item.data(Qt.ItemDataRole.UserRole + 2) if item else ""
+        path = self._cell_path(r)
         if path and Path(path).exists():
             reveal_in_folder(path)
         else:
             QMessageBox.information(self, "提示", "输出文件不存在或已被移动")
 
+    def _copy_video(self, r):
+        """把成品文件本身放进系统剪贴板（粘到微信/钉钉就是发附件）"""
+        path = self._cell_path(r)
+        if not path:
+            QMessageBox.information(self, "提示", "该任务还没有输出视频")
+            return
+        ok, msg = copy_paths_to_clipboard([path])
+        if ok:
+            self.lbl_tip.setText(msg)
+        else:
+            QMessageBox.warning(self, "复制失败", msg)
+
+    def _mark(self, r, mark):
+        """在列表上直接改标记（不用先打开播放器）
+
+        正在播放器里看这条时去改名，Windows 上会因为文件被占用而失败，
+        改名重试三次都不行就把原因原话告诉使用者。"""
+        path = self._cell_path(r)
+        if not path:
+            QMessageBox.information(self, "提示", "该任务还没有输出视频")
+            return
+        ok, new_path, msg = output_mark.set_mark(path, mark)
+        if not ok:
+            QMessageBox.warning(self, "标记失败", msg)
+            return
+        self.lbl_tip.setText(msg)
+        self.refresh()
+
+    def _cleanup_bad(self):
+        """一键清理：把所有「不可用」的成品移到回收站（不真删）"""
+        items = output_mark.collect_bad()
+        alive = [i for i in items if i["exists"]]
+        gone = len(items) - len(alive)
+        if not items:
+            QMessageBox.information(
+                self, "没有待清理的成品",
+                "播放视频时点「👎 不可用」就会进待清理名单")
+            return
+        mb = sum(i["size"] for i in alive) / 1024 / 1024
+        names = "\n".join("  · " + Path(i["path"]).name for i in alive[:8])
+        if len(alive) > 8:
+            names += f"\n  …… 另外 {len(alive) - 8} 个"
+        text = (f"共 {len(alive)} 个「不可用」成品，合计 {mb:.0f} MB：\n{names}"
+                if alive else "没有现存的文件（都已经被手工删过了）")
+        if gone:
+            text += f"\n\n另有 {gone} 条标记的文件已经不在了，顺手清掉标记"
+        text += "\n\n会移到【回收站】，误清了还能从回收站找回来；\n"
+        text += "任务与执行记录不会被删。确定清理？"
+        if QMessageBox.question(self, "清理不可用成品", text) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        st = output_mark.cleanup()
+        msg = f"已移到回收站 {len(st['trashed'])} 个"
+        if st["missing"]:
+            msg += f"，顺便清掉 {len(st['missing'])} 条空标记"
+        if st["failed"]:
+            msg += f"；{len(st['failed'])} 个失败：{st['failed'][0][1]}"
+        self.lbl_tip.setText(msg)
+        self.refresh()
+
     def _on_context_menu(self, pos):
-        """表格右键菜单：播放/打开位置/编辑/删除"""
+        """表格右键菜单：播放/定位/复制/标记 · 编辑/备注/检测/删除"""
         idx = self.table.indexAt(pos)
         if not idx.isValid():
             return
         r = idx.row()
-        item_out = self.table.item(r, COL_OUT)
-        path = item_out.data(Qt.ItemDataRole.UserRole + 2) if item_out else ""
+        path = self._cell_path(r)
         menu = QMenu(self)
         ats = REG.get_all_by_row(self._row_tid(r))
         if ats:
@@ -1290,7 +1377,23 @@ class TasksPage(QWidget):
             menu.addSeparator()
         if path:
             menu.addAction("▶ 播放预览", lambda: self._play_video(r))
-            menu.addAction("📂 打开存放位置", lambda: self._open_location(r))
+            menu.addAction("📍 快捷定位（打开目录并选中）",
+                           lambda: self._open_location(r))
+            menu.addAction("📋 复制视频文件（可直接粘贴发送）",
+                           lambda: self._copy_video(r))
+            menu.addSeparator()
+            mark = output_mark.mark_of(path)
+            if mark == task_store.MARK_BAD:
+                menu.addAction("↩ 取消「不可用」标记（文件名改回去）",
+                               lambda: self._mark(r, ""))
+            elif mark == task_store.MARK_OK:
+                menu.addAction("👎 标记不可用（改名 + 待清理）",
+                               lambda: self._mark(r, task_store.MARK_BAD))
+                menu.addAction("↩ 取消「可用」标记", lambda: self._mark(r, ""))
+            else:
+                menu.addAction("👎 标记不可用（改名 + 待清理）",
+                               lambda: self._mark(r, task_store.MARK_BAD))
+                menu.addAction("👍 标记可用", lambda: self._mark(r, task_store.MARK_OK))
             menu.addSeparator()
         menu.addAction("✎ 编辑任务", lambda: self._edit_current(r))
         n_sel = len(self._selected_ids)

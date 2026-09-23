@@ -30,14 +30,19 @@ def _init_db():
 
 @pytest.fixture(autouse=True)
 def _clean_state():
-    """每个用例前后清空任务/运行记录与运行时注册表，用例互不干扰"""
+    """每个用例前后清空任务/运行记录/审片标记与运行时注册表，用例互不干扰"""
     from store import db
     from registry.manager import REG
+    from core import naming
 
     def _reset():
         db.execute("DELETE FROM tasks")
         db.execute("DELETE FROM runs")
+        db.execute("DELETE FROM file_marks")
         REG.tasks.clear()
+        # 命名规则是模块级缓存：一个用例 set_rules 过就会泄给下一个，
+        # 表现为“同一个文件名单独跑能过、整批跑不过”。每轮压回内置默认。
+        naming.set_rules(list(naming.DEFAULT_TOKENS), naming.DEFAULT_SEP)
 
     _reset()
     yield

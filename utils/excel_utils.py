@@ -1,18 +1,17 @@
 """
-excel_utils.py —— Excel 读写（带全局锁）+ 命名规则 + 扫描
+excel_utils.py —— Excel 读写（带全局锁）+ 新任务扫描
+
+文件命名不在这里：已整体搬到 core/naming.py（以前两处各写一份，
+改规则要同步两个文件，现在只有一处）。
 """
-import re
 import threading
 import pandas as pd
-from pathlib import Path
-from datetime import datetime
 
 from core.config import (
     EXCEL_PATH, SHEET_TASK, SHEET_NAME_RULE,
     COL_ID, COL_PRODUCT, COL_PROMPT, COL_SCRIPT, COL_STATUS, COL_ACCOUNT,
     COL_JOB_ID, COL_OUTPUT, COL_URL, COL_RUNS, COL_SUCCESS, COL_CANCEL,
-    COL_SCRIPT_TEXT, COL_NAME, ASSET_DIR, DOWNLOAD_DIR, DEFAULT_PRODUCT,
-    USER_NAME
+    COL_SCRIPT_TEXT, COL_NAME, ASSET_DIR, USER_NAME
 )
 from core.logger import raw_info, raw_warning, raw_error
 
@@ -124,27 +123,3 @@ def scan_new_rows():
                 "提示词": row.get(COL_PROMPT, ""),
             }))
     return out
-
-
-def sanitize(s):
-    return re.sub(r'[\\/:*?"<>|]', "_", str(s).strip())
-
-
-def next_seq(prefix):
-    base = Path(DOWNLOAD_DIR)
-    if not base.exists():
-        return 1
-    max_seq = 0
-    pat = re.compile(re.escape(prefix) + r"(\d+)_")
-    for p in base.rglob(f"{prefix}*"):
-        m = pat.match(p.name)
-        if m:
-            max_seq = max(max_seq, int(m.group(1)))
-    return max_seq + 1
-
-
-def build_filename(num, product, complete_time, name, seq):
-    product = sanitize(product) or DEFAULT_PRODUCT
-    name = sanitize(name) or "未知姓名"
-    date_str = complete_time.strftime("%m%d")
-    return f"{int(num):03d}_{product}_{date_str}_{seq:02d}_{name}.mp4"

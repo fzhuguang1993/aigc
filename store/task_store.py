@@ -29,7 +29,7 @@ _CN2DB = {"编号": "num", "品名": "product", "提示词": "prompt",
 # 全字段导出（与导入模板列对齐，方便导出→修改→再导入闭环）
 EXPORT_COLUMNS = ["编号", "品名", "提示词", "脚本", "备注", "口播文案", "分镜数",
                   "状态", "时长", "生成用时", "排队用时", "账号", "job_id",
-                  "输出", "URL", "运行次数", "成功次数", "取消次数", "更新时间"]
+                  "输出", "审核", "URL", "运行次数", "成功次数", "取消次数", "更新时间"]
 
 EXPORT_DIR = Path(EXPORT_DIR_STR)   # 模板/导出目录：可在设置里改，默认运行目录 exports/
 
@@ -112,6 +112,16 @@ def list_tasks_df():
     # 不标出来就会拿着含排队的数当生成耗时比
     df["用时含排队"] = [(not t[2]) and t[0] > 0 for t in triples] if len(df) \
         else pd.Series([], dtype=bool)
+    # 派生列：审片标记。看的是「输出文件」里第一个成品——跟任务中心
+    # 那一格显示/播放的是同一个文件，抽卡多条时只标得了当前展示的这条
+    marks = marks_by_path()
+
+    def _mark_of(out):
+        first = _mark_key(str(out or "").split(";")[0])
+        return MARK_LABEL.get(marks.get(first, ""), "")
+
+    df["审核"] = [_mark_of(o) for o in df["输出"]] if len(df) \
+        else pd.Series([], dtype=str)
     return df
 
 
@@ -306,6 +316,102 @@ def attach_run_result(job_id, output=None, error=None):
 
 def list_runs(limit=1000):
     return db.query("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))
+
+
+# ---------------- 审片标记（可用 / 不可用） ----------------
+
+MARK_BAD = "bad"
+MARK_OK = "ok"
+MARK_LABEL = {MARK_BAD: "不可用", MARK_OK: "可用"}
+# 标记落在成品文件的【当前路径】上：一个任务可能抽卡出好几条，每条要能
+# 单独判，挂在 tasks/runs 上都会串位。重命名时跟着改键。
+BAD_SUFFIX = "不可用"          # 文件名上的记号：不动库的人也能一眼认出
+
+
+def _mark_key(path):
+    """标记以绝对路径为键：同一个文件用相对/绝对两种写法不该记两条"""
+    s = str(path or "").strip()
+    if not s:
+        return ""
+    try:
+        return str(Path(s).resolve())
+    except OSError:                     # 路径不存在/含非法字符：退化成原值
+        return s
+
+
+def marks_by_path():
+    """{绝对路径: 标记}，给列表派生用（一次查完，不逐行回库）"""
+    return {r["path"]: r["mark"]
+            for r in db.query("SELECT path, mark FROM file_marks")}
+
+
+def get_file_mark(path):
+    rows = db.query("SELECT mark FROM file_marks WHERE path=?", (_mark_key(path),))
+    return rows[0]["mark"] if rows else ""
+
+
+def set_file_mark(path, mark):
+    """标一条成品；mark 传空＝取消标记（整行删掉，库里的空记号没人读）"""
+    key = _mark_key(path)
+    if not key:
+        return False
+    if not mark:
+        db.execute("DELETE FROM file_marks WHERE path=?", (key,))
+        return True
+    db.execute("INSERT OR REPLACE INTO file_marks(path, mark, marked_at) VALUES(?,?,?)",
+               (key, mark, _now()))
+    return True
+
+
+def move_file_mark(old, new):
+    """文件被重命名：标记跟着走
+
+    不跟的话刚标完就变孤儿——列表上看不到了，“一键清理”也找不到它。"""
+    o, n = _mark_key(old), _mark_key(new)
+    if not o or o == n:
+        return
+    rows = db.query("SELECT mark, marked_at FROM file_marks WHERE path=?", (o,))
+    db.execute("DELETE FROM file_marks WHERE path=?", (o,))
+    for r in rows:
+        db.execute("INSERT OR REPLACE INTO file_marks(path, mark, marked_at) VALUES(?,?,?)",
+                   (n, r["mark"], r["marked_at"]))
+
+
+def list_file_marks(mark=None):
+    if mark:
+        return db.query("SELECT path, mark, marked_at FROM file_marks WHERE mark=?"
+                        " ORDER BY marked_at DESC", (mark,))
+    return db.query("SELECT path, mark, marked_at FROM file_marks ORDER BY marked_at DESC")
+
+
+def _split_outputs(s):
+    """tasks.output / runs.output 存的是「; 」拼接的多产物路径"""
+    return [p.strip() for p in str(s or "").split(";") if p.strip()]
+
+
+def _is_same_file(a, b):
+    """同一个文件的两种写法（相对/绝对、斜杠方向）也算同一个"""
+    x, y = _mark_key(a), _mark_key(b)
+    return bool(x) and x == y
+
+
+def replace_output_path(old, new):
+    """文件重命名后同步【任务表与执行记录】里的路径，不然双击就报「文件不存在」
+
+    逐段比对而不是整串字符串替换：一个路径是另一个的前缀时（_01 与 _012）
+    整串替换会把不相干的那条也改坏。返回改了多少行。"""
+    hits = 0
+    for table in ("tasks", "runs"):
+        for r in db.query(f"SELECT id, output FROM {table}"
+                          f" WHERE output IS NOT NULL AND output != ''"):
+            segs = _split_outputs(r["output"])
+            if not any(_is_same_file(s, old) for s in segs):
+                continue
+            segs = [new if _is_same_file(s, old) else s for s in segs]
+            db.execute(f"UPDATE {table} SET output=? WHERE id=?",
+                       ("; ".join(segs), r["id"]))
+            hits += 1
+    return hits
 
 
 # ---------------- 导入 / 导出 ----------------

@@ -1,15 +1,19 @@
 """
-video_processor.py —— 下载 + 重命名（保存到运行目录下的 outputs/）
+video_processor.py —— 下载 + 按命名规则重命名（保存到运行目录下的 outputs/）
+
+文件名怎么拼不在这里：字段清单与排列规则统一由 core/naming.py 管
+（设置页「🏷 命名规则」可改，改完立即生效）。本模块只负责凑齐一个文件
+的上下文（编号/品名/线路/备注…）交给命名模块，再把字节落盘。
 """
 import time
-import re
 from pathlib import Path
 from datetime import datetime
 
-from core.config import DOWNLOAD_DIR, DEFAULT_PRODUCT, USER_NAME
-from utils.excel_utils import sanitize, build_filename
+from core.config import DOWNLOAD_DIR, USER_NAME
+from core import naming
 from core.api_client import download_to
 from store import task_store
+from utils.excel_utils import load_name_rule
 
 
 def build_full_url(base, rel_url):
@@ -38,11 +42,13 @@ def download_with_retry(url, save_path, ctx):
     return False
 
 
-def process_outputs(outs, base, row_idx, job_id, product, ctx):
-    """处理视频输出，汇总日志（row_idx 现为数据库任务ID）"""
-    name = USER_NAME
+def process_outputs(outs, base, row_idx, job_id, product, ctx, account=""):
+    """处理视频输出，汇总日志（row_idx 现为数据库任务ID）
+
+    account 只用来填命名规则里的「线路」字段，没传就不影响其它段。"""
+    # 姓名：设置里填的优先，没填回退 Excel「命名规则」sheet（历史口径）
+    name = USER_NAME or load_name_rule()
     complete_time = datetime.now()
-    date_str = complete_time.strftime("%m%d")
 
     task = task_store.get_task(row_idx) or {}
     try:
@@ -54,8 +60,7 @@ def process_outputs(outs, base, row_idx, job_id, product, ctx):
 
     items = outs.get("outputs", []) if isinstance(outs, dict) else []
     local_paths, full_urls = [], []
-    success_count = 0
-    
+
     for item in items:
         rel = item.get("url", "")
         if not rel:
@@ -63,35 +68,18 @@ def process_outputs(outs, base, row_idx, job_id, product, ctx):
         full_url = build_full_url(base, rel)
         full_urls.append(full_url)
 
-        prod = sanitize(product) or DEFAULT_PRODUCT
-        prefix = f"{num:03d}_{prod}_{date_str}_"
-        seq = next_seq(prefix)
-
-        fname = build_filename(num, product, complete_time, name, seq)
-        save_path = Path(DOWNLOAD_DIR) / date_str / fname
-        save_path.parent.mkdir(parents=True, exist_ok=True)  # 运行目录下自动创建日期文件夹
-        # 强制重跑/抽卡时同一任务可能几乎同时完成多个 job，避免不同轮次撞名互相覆盖
-        while save_path.exists():
-            seq += 1
-            fname = build_filename(num, product, complete_time, name, seq)
-            save_path = Path(DOWNLOAD_DIR) / date_str / fname
+        # 按天一个子目录（历史行为，与命名规则无关）
+        save_dir = Path(DOWNLOAD_DIR) / naming.subdirname(complete_time)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        # 强制重跑/抽卡时同一任务可能几乎同时完成多个 job，
+        # 靠命名模块保证不撞名（有「序号」就续序号，没有就挂 (2) 尾巴）
+        save_path = naming.resolve_save_path(save_dir, {
+            "num": num, "product": product, "name": name, "when": complete_time,
+            "account": account, "remark": task.get("remark") or "",
+            "task_id": row_idx, "job_id": job_id})
 
         if download_with_retry(full_url, save_path, ctx):
             local_paths.append(str(save_path))
-            success_count += 1
-    
+
     # 汇总输出日志（由调用方 poll.py 统一显示）
     return local_paths, full_urls
-
-
-def next_seq(prefix):
-    base = Path(DOWNLOAD_DIR)
-    if not base.exists():
-        return 1
-    max_seq = 0
-    pat = re.compile(re.escape(prefix) + r"(\d+)_")
-    for p in base.rglob(f"{prefix}*"):
-        m = pat.match(p.name)
-        if m:
-            max_seq = max(max_seq, int(m.group(1)))
-    return max_seq + 1

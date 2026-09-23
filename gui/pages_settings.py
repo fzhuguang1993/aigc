@@ -1,5 +1,6 @@
 """
-gui/pages_settings.py —— 设置（编辑 config.json，保存后需重启软件生效）
+gui/pages_settings.py —— 设置（编辑 config.json，保存后需重启软件生效；
+例外：「🏷 命名规则」在自己的对话框里就写盘并立即生效）
 """
 import json
 import os
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineE
 
 from core.config import (CONFIG_JSON, USER_NAME, ACCOUNTS, SCRIPT_CHECK,
                          DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR)
+from core import naming
 from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header
@@ -131,7 +133,7 @@ class SettingsPage(QWidget):
         lay.setContentsMargins(24, 12, 24, 12)
         lay.setSpacing(8)
 
-        head = page_header("设置", "修改保存后重启生效", icon="⚙️")
+        head = page_header("设置", "修改保存后重启生效（命名规则除外：保存即生效）", icon="⚙️")
         head.setToolTip(f"配置文件：{CONFIG_JSON}")
         lay.addWidget(head)
 
@@ -142,6 +144,20 @@ class SettingsPage(QWidget):
         row.addWidget(self.name_edit)
         row.addStretch(1)
         lay.addLayout(row)
+
+        # ---------- 成品命名规则（唯一「保存即生效」的一项，不进下面的「保存设置」） ----------
+        nrow = QHBoxLayout()
+        nrow.addWidget(QLabel("成品命名："))
+        self.lbl_naming = QLabel()
+        self.lbl_naming.setObjectName("InlineTip")
+        self.lbl_naming.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        b_naming = QPushButton("🏷 自定义规则…")
+        b_naming.setObjectName("GhostBtn")
+        b_naming.clicked.connect(self._edit_naming)
+        nrow.addWidget(self.lbl_naming, 1)
+        nrow.addWidget(b_naming)
+        lay.addLayout(nrow)
+        self._refresh_naming()
 
         # ---------- 输出目录：默认隐藏，Alt+W（Mac ⌘+W）口令解锁后才出现（不暴露入口） ----------
         self._dirs_unlocked = False
@@ -264,6 +280,19 @@ class SettingsPage(QWidget):
 
     def refresh(self):
         pass  # 不自动覆盖用户正在编辑的内容
+
+    # ---------- 命名规则 ----------
+    def _refresh_naming(self):
+        """把当前生效的规则写成一句话：下载成品时就按它拼文件名"""
+        self.lbl_naming.setText(f"{naming.describe()}　→　例如 {naming.preview()}")
+        self.lbl_naming.setToolTip(
+            "下载成品时的文件命名规则，点右侧「🏷 自定义规则…」可重新排列组合。\n"
+            "这一项保存后立即生效（不用重启），且只影响之后新下载的视频。")
+
+    def _edit_naming(self):
+        from gui.dialogs_naming import NamingRuleDialog   # 只在打开时导入，减启动开销
+        if NamingRuleDialog(self).exec():
+            self._refresh_naming()
 
     # ---------- 维护人入口：口令解锁隐藏的「输出目录」 ----------
     def _summon_dirs(self):
