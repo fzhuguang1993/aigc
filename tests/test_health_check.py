@@ -8,7 +8,8 @@ tests/test_health_check.py —— 「线路绿灯必须来自真实检测」回�
 约定（改之前先读完）：
 - 默认 True 只为「刚开机也能提交」，展示层必须先问 `first_check_done()`；
 - 一次网络抖动不许降灯：一轮内重试一次，两轮累计到阈值才判故障（防误杀）；
-- 检测恢复后必须重新亮绿灯并清零 fail_count（否则线路再也回不来）。
+- 检测恢复后必须重新亮绿灯并清零 fail_count（否则线路再也回不来）；
+- 探活拿到任何 HTTP 响应（含 404）就是「服务活着」，不许当线路故障。
 
 所有 HTTP 通过 monkeypatch 注入，无网络、无真实服务。
 """
@@ -17,6 +18,7 @@ import inspect
 import pytest
 
 import registry.manager as mgr
+from core.api_client import ApiError
 
 
 class FakeAcc:
@@ -26,6 +28,7 @@ class FakeAcc:
         self.concurrency = 1
         self.healthy = True          # 与 AccountState 同构：默认「未测即当可用」
         self.fail_count = 0
+        self.probe_state = None
 
 
 @pytest.fixture()
@@ -137,3 +140,46 @@ def test_submission_still_works_before_first_check(lines, monkeypatch):
     monkeypatch.setattr(mgr, "list_jobs", lambda base, limit=100: [])
     assert mgr.first_check_done() is False
     assert mgr.pick_account() in lines.values()
+
+
+# ====================================================================
+# 4. 探活归类：服务有话回就不算线路故障
+# ====================================================================
+@pytest.mark.parametrize("code, expect", [
+    (None, "down"),        # 连不上（拒连/超时/DNS）：真故障
+    (502, "down"),         # 网关报错：后端已经挂了，提交上去也是白提
+    (500, "down"),
+    (404, "alive"),        # 云端没实现 GET /health（实测回 HTML「页面未找到」）
+    (405, "alive"),
+    (401, "alive"),        # 要鉴权：机器是活的
+])
+def test_classify_probe_by_status_code(code, expect):
+    assert mgr.classify_probe(ApiError("boom", code)) == expect
+
+
+def test_probe_404_does_not_turn_the_line_red(lines, monkeypatch):
+    """旧实现把所有异常一律计失败：云端没实现 /health 时，30 秒×3 轮
+    就能把全部线路标红，接着选线退化成“只留一条”（同事反馈的现场）"""
+    def fake_health(base):
+        if base.startswith("http://acc2."):
+            raise ApiError("HTTP 404: <!doctype html>\n页面未找到", 404)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(mgr, "health", fake_health)
+    for _ in range(5):                      # 远超阈值（3）轮
+        mgr.check_all_accounts()
+    assert lines["acc2"].healthy is True     # 不降灯，仍可被选中去提交
+    assert lines["acc2"].fail_count == 0
+    assert lines["acc2"].probe_state == "alive"   # 但不谎称“测过了”
+    assert lines["acc1"].probe_state == "ok"
+
+
+def test_probe_5xx_still_flips_the_line_red(lines, monkeypatch):
+    def fake_health(base):
+        raise ApiError("HTTP 502: bad gateway", 502)
+
+    monkeypatch.setattr(mgr, "health", fake_health)
+    for _ in range(3):
+        mgr.check_all_accounts()
+    assert lines["acc1"].healthy is False
+    assert lines["acc1"].probe_state == "down"

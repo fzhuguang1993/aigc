@@ -27,6 +27,9 @@ COL_NAME, COL_BASE, COL_CONC, COL_OPEN = range(4)
 # 现按使用者体感再抬 25%。
 ROW_H = 45
 
+# 「🌐 打开选中」超过这个数量就先问一句：再多会把浏览器卡住、也看不过来
+OPEN_MAX = 8
+
 
 def _browser_url(base):
     """线路地址是给程序打的（带 /api/v1），浏览器要开的是根地址
@@ -39,6 +42,22 @@ def _browser_url(base):
     if "://" not in url:
         url = "http://" + url
     return url
+
+
+def dedupe_browser_urls(bases):
+    """一组接口地址 -> 要去浏览器里打开的链接（先去掉空行，同一地址只留一个）
+
+    保留输入顺序：“选中几行开几个标签”得跟人看到的顺序对得上，
+    否则同时看七个 Gradio 页面时分不清谁是谁。空地址要先拦下再交给
+    `_browser_url`（它给空串会拼出个“http://”，不拦就会真去开一个废标签）。"""
+    urls = []
+    for base in bases:
+        if not str(base or "").strip():
+            continue
+        url = _browser_url(base)
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _same_path(a, b):
@@ -152,8 +171,8 @@ class SettingsPage(QWidget):
         lay.addWidget(self.dirs_box)
 
         lay.addWidget(QLabel("API 服务地址（一个地址 = 一个账号，双击单元格可编辑；"
-                             "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」"
-                             "用浏览器看这条线路）："))
+                             "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」看"
+                             "单条线路，要一次对比几条就用下方「🌐 打开选中」）："))
         self.acc_table = QTableWidget(0, 4)
         self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数", "打开"])
         self.acc_table.horizontalHeader().setSectionResizeMode(COL_BASE,
@@ -179,6 +198,13 @@ class SettingsPage(QWidget):
         b_del.setObjectName("GhostBtn")
         b_del.setToolTip("可先用鼠标拖动多选几行；删除只弹一次确认，一次删掉全部选中行")
         b_del.clicked.connect(self._del_rows)
+        b_open_sel = QPushButton("🌐 打开选中")
+        b_open_sel.setObjectName("GhostBtn")
+        b_open_sel.setToolTip(
+            "一次用浏览器打开选中这几条线路（没选中则问一句后开全部），\n"
+            "方便横向对比哪台机器最忙；地址相同的只开一个标签\n"
+            f"超过 {OPEN_MAX} 个标签时会先问一句，免得把浏览器卡住")
+        b_open_sel.clicked.connect(self._open_selected)
         b_check = QPushButton("🔌 测试连通性")
         b_check.setObjectName("GhostBtn")
         b_check.clicked.connect(self._check)
@@ -197,6 +223,7 @@ class SettingsPage(QWidget):
         b_save.clicked.connect(self._save)
         bar.addWidget(b_add)
         bar.addWidget(b_del)
+        bar.addWidget(b_open_sel)
         bar.addWidget(b_check)
         bar.addWidget(b_copy)
         bar.addWidget(b_paste)
@@ -295,6 +322,21 @@ class SettingsPage(QWidget):
         self.acc_table.setCellWidget(r, COL_OPEN, btn)
         return btn
 
+    def _selected_rows(self):
+        """选中行号（升序去重）：整行拖选与逐格点选都算
+
+        `selectedRows()` 要求整行（全部列）都选中才计数，而末列是按钮（只有 widget
+        没有 item）——选区没铺满列时它就返回空，表现为“点了按钮没反应”。
+        批删与批量打开共用这个口径，不各写一遍。"""
+        sel = self.acc_table.selectionModel()
+        return sorted({idx.row() for idx in sel.selectedRows()}
+                      | {idx.row() for idx in sel.selectedIndexes()})
+
+    def _row_base(self, r):
+        """某行当前填的接口地址（没填返回空串；行越界也不抛）"""
+        item = self.acc_table.item(r, COL_BASE)
+        return item.text().strip() if (r >= 0 and item) else ""
+
     def _open_api(self, btn):
         """按按钮所在行取当前地址开浏览器（地址改过就开改后的，不是创建时那一份）"""
         r = -1
@@ -302,8 +344,7 @@ class SettingsPage(QWidget):
             if self.acc_table.cellWidget(i, COL_OPEN) is btn:
                 r = i
                 break
-        item = self.acc_table.item(r, COL_BASE) if r >= 0 else None
-        base = item.text().strip() if item else ""
+        base = self._row_base(r)
         if not base:
             QMessageBox.information(self, "提示", "这一行还没填接口地址")
             return
@@ -311,14 +352,43 @@ class SettingsPage(QWidget):
         if not QDesktopServices.openUrl(QUrl(url)):
             QMessageBox.warning(self, "打不开", f"系统没能打开浏览器：\n{url}")
 
+    def _open_selected(self):
+        """「🌐 打开选中」：一次把选中几条线路全开成浏览器标签
+
+        行内按钮只能一条条点，线路多了对比“谁最忙”要点七下；没选中时
+        不静默也不猜：问一句“要开全部 N 条吗”，免得误以为坏了。"""
+        rows = self._selected_rows()
+        if not rows:
+            total = self.acc_table.rowCount()
+            if not total:
+                QMessageBox.information(self, "提示", "线路表是空的，先添加接口地址")
+                return
+            if QMessageBox.question(
+                    self, "打开全部线路",
+                    f"没有选中行，要打开表里全部 {total} 条线路吗？\n"
+                    "（会在浏览器里一次弹多个标签页）") \
+                    != QMessageBox.StandardButton.Yes:
+                return
+            rows = list(range(total))
+        urls = dedupe_browser_urls(self._row_base(r) for r in rows)
+        if not urls:
+            QMessageBox.information(self, "提示", "这些行都还没填接口地址")
+            return
+        if len(urls) > OPEN_MAX and QMessageBox.question(
+                self, "一次开太多标签",
+                f"要一次打开 {len(urls)} 个页面（上限 {OPEN_MAX} 个），\n"
+                "浏览器可能明显卡顿。确定继续？") != QMessageBox.StandardButton.Yes:
+            return
+        fails = [u for u in urls if not QDesktopServices.openUrl(QUrl(u))]
+        if fails:
+            QMessageBox.warning(
+                self, "部分没打开",
+                f"已打开 {len(urls) - len(fails)} 个，这几个系统没能打开：\n"
+                + "\n".join(fails[:5]))
+
     def _del_rows(self):
         """批量删除：选中几删几，一次确认全删（旧实现无确认且只能删当前一行）"""
-        sel = self.acc_table.selectionModel()
-        # selectedRows() 要求整行（全部列）都选中才计数，而末列是按钮（只有 widget
-        # 没有 item）——一旦选区没铺满列就会返回空，表现为“点了删除没反应”。
-        # 取两个口径的并集：整行选中与逐格选中都能删干净。
-        rows = sorted({idx.row() for idx in sel.selectedRows()}
-                      | {idx.row() for idx in sel.selectedIndexes()})
+        rows = self._selected_rows()
         if not rows:
             QMessageBox.information(self, "提示", "先用鼠标点选/拖选要删的线路行")
             return

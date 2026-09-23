@@ -12,6 +12,14 @@ registry.py —— 任务注册 + 账号状态 + 负载均衡
 3. `AccountState.healthy` 默认 True 只表示「还没测过，先当可用」（否则刚开机的
    几十秒里一条线都不能提交），**不等于检测通过**：展示层必须先问
    `first_check_done()`，没测过就写「检测中/待检测」，不能画绿灯。
+4. 探活拿到任何 HTTP 响应（含 404/405）就说明**机器活着**，只算「探活路径没实现」
+   （`probe_state == "alive"`），不许计线路故障：真正把线路判死的是连接层异常
+   （拒绝/超时/DNS）与 5xx。旧实现把 404 当故障，实测会 30 秒×3 轮后把**全部**
+   线路标红。
+5. 全线路都不健康时的候选池是「fail_count 最小的那一档」**全部**，不是一条：
+   旧实现取 `[:1]`（并列恒为配置第一条）→ 整批任务全灌同一条线，正是同事反馈的
+   「多选强制重跑只跑一个线路」。探活失败往往是探测路径/瞬时网络问题，服务本身
+   可能完全正常，宁可在几条线之间摊平，也不要死磕一条。
 """
 import random
 import time
@@ -97,6 +105,10 @@ class AccountState:
         self.sem = threading.Semaphore(cfg["concurrency"])
         self.healthy = True
         self.fail_count = 0
+        # 最近一轮探活的归类：None=没测过 / "ok"=探活接口正常应答
+        # / "alive"=服务有话回但路径不对（404/405/401…，可调度但不给绿灯）
+        # / "down"=连接层不通或 5xx
+        self.probe_state = None
 
 ACCOUNTS = [AccountState(c) for c in CONFIG_ACCOUNTS]
 
@@ -189,12 +201,34 @@ def invalidate_load_cache(name=None):
 
 
 def ranked_accounts():
-    """健康线路按负载升序：[(acc, load, src)]，全不健康时退回失败次数最少的"""
+    """可调度线路按负载升序：[(acc, load, src)]"""
+    return sorted(((a, *measure_load(a)) for a in schedulable_accounts()), key=lambda x: x[1])
+
+
+# “全线路探活失败”每轮只告一次，不然逐条提交都刷一行
+_ALL_DOWN_NOTIFIED = False
+
+
+def schedulable_accounts():
+    """选线候选：健康线路优先；全被判不可用时，拿 fail_count 最小的那一**档**。
+
+    不能退回到「只留一条」：一条就是一根独木桥，整批（多选强制重跑/抽卡）全灌它
+    身上、其余线路全程空转——就是同事反馈的现场。而且探活失败证明不了服务坏了
+    （常见是代理拦截、路径未实现、瞬时抽风），fail_count 相同就等于了解程度相同，
+    那就平摊到这一档的多条线，而不是死赌一条。同时告警一次，不默默发生。
+    """
+    global _ALL_DOWN_NOTIFIED
     healthy = [a for a in ACCOUNTS if a.healthy]
-    if not healthy:
-        raw_warning("所有账号不可用，选择 fail_count 最小的")
-        healthy = sorted(ACCOUNTS, key=lambda a: a.fail_count)[:1]
-    return sorted(((a, *measure_load(a)) for a in healthy), key=lambda x: x[1])
+    if healthy:
+        _ALL_DOWN_NOTIFIED = False
+        return healthy
+    least = min(a.fail_count for a in ACCOUNTS)
+    pool = [a for a in ACCOUNTS if a.fail_count == least] or list(ACCOUNTS)
+    if not _ALL_DOWN_NOTIFIED:
+        _ALL_DOWN_NOTIFIED = True
+        raw_warning("所有线路探活均未通过，本批在 " + " ".join(a.name for a in pool)
+                    + " 之间平摊（不会只灌一条）；若这些地址确实失效，请到「📡 线路负载」核对")
+    return pool
 
 
 def pick_account(exclude=None):
@@ -290,11 +324,8 @@ class BatchBalancer:
         self._rescan()
 
     def _lines(self):
-        healthy = [a for a in ACCOUNTS if a.healthy]
-        if healthy:
-            return healthy
-        fallback = sorted(ACCOUNTS, key=lambda a: a.fail_count)[:1]
-        return fallback or ACCOUNTS
+        # 全不健康时取 schedulable_accounts 的那一档，不能只留一条（同 ranked_accounts）
+        return schedulable_accounts()
 
     def _rescan(self):
         """重扫全局：base = max(旧 base, 云端裸读数 - 本机已投)。
@@ -328,25 +359,45 @@ class BatchBalancer:
 HEALTH_ATTEMPTS = 2
 
 
+def classify_probe(err):
+    """探活异常归类："alive" = 服务有话回（不算故障）；"down" = 真的不通
+
+    关键区分是 `ApiError.status_code` 有没有值：有值 = TCP 通了、HTTP 服务给了个
+    状态码，哪怕是 404/405/401 也证明这台机器活着在应答，只是探测路径不对/需鉴权；
+    没值 = 连不上（拒绝/超时/DNS/代理劫持），这才是该降灯的故障。
+    5xx 归 down：服务进程在但后端已挂（典型是网关 502），提交上去也是白提。
+
+    旧实现把所有异常一律计失败：云端没实现 GET /health 时（实测返回 HTML 404
+    「页面未找到」），30 秒×3 轮就能把公用的全部线路标红，接着选线退化成“只留一条”。
+    """
+    code = getattr(err, "status_code", None)
+    return "alive" if (code and code < 500) else "down"
+
+
 def check_all_accounts():
-    """逐条线路真实探活一次，更新 healthy/fail_count。
+    """逐条线路真实探活一次，更新 healthy/fail_count/probe_state。
 
     启动时必须立即跑一遍：旧实现先睡 30 秒才首检，AccountState 默认
     healthy=True，刚开软件的绿灯全是「缓存的默认值」而非检测结果。"""
     for acc in ACCOUNTS:
-        fails = 0
-        for _ in range(HEALTH_ATTEMPTS):        # 瞬时抖动重试一次，两次全败才计失败
+        verdict = "down"
+        for i in range(HEALTH_ATTEMPTS):        # 瞬时抖动重试一次，两轮全败才计失败
             try:
                 health(acc.base)
-                fails = 0
+                verdict = "ok"
                 break
-            except Exception:
-                fails += 1
-                if fails < HEALTH_ATTEMPTS:
+            except Exception as e:
+                verdict = classify_probe(e)
+                if verdict == "alive":          # 服务在应答：不是抖动，不必再试
+                    break
+                if i < HEALTH_ATTEMPTS - 1:
                     time.sleep(0.5)
-        if not fails:
+        acc.probe_state = verdict
+        if verdict != "down":
+            # ok（探活接口正常）与 alive（有响应但路径不对）都当可调度：
+            # 后者不记失败也不谎称“正常”，由展示层画黄灯区分
             if not acc.healthy:
-                raw_info(f"{acc.name} 恢复健康")
+                raw_info(f"{acc.name} 恢复可用")
             acc.healthy = True
             acc.fail_count = 0
         else:

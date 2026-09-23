@@ -73,7 +73,10 @@ class MainWindow(QMainWindow):
         self.lbl_health.setWordWrap(True)
         # 灯不是只读装饰：点一下立刻逐条真实探活（后台线程，不卡界面）
         self.lbl_health.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_health.setToolTip("点击重新检测全部线路（后台线程，几秒后刷新）")
+        self.lbl_health.setToolTip(
+            "点击重新检测全部线路（后台线程，几秒后刷新）\n"
+            "🟢 探活接口已应答　🟡 服务在线但探活路径未实现（照样能提交）\n"
+            "🔴 连不上/5xx（选线跳过它）　⚪ 还没测过")
         self.lbl_health.mousePressEvent = lambda e: self._recheck_health()
         self._checking = False
         slay.addWidget(self.lbl_health)
@@ -135,7 +138,10 @@ class MainWindow(QMainWindow):
             # 首轮探活还没回来：此刻的 healthy 只是默认值，不能当结果画成绿灯
             dots = "检测中…" if ACCOUNTS else "无线路"
         else:
-            dots = "  ".join("🟢" if a.healthy else "🔴" for a in ACCOUNTS)
+            # 🟢 探活接口正常应答；🟡 服务有话回但探活路径未实现（能提交，但不谎称
+            # “已测正常”）；🔴 连不上/5xx —— 三档共用 gui.header.line_light
+            from gui.header import line_light
+            dots = "  ".join(line_light(a, True)[0] for a in ACCOUNTS)
         self.lbl_health.setText(f"服务：{dots}\n当前用户：{USER_NAME or '未配置'}")
 
     def _recheck_health(self):

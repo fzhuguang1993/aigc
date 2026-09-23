@@ -1,10 +1,11 @@
 """
 tests/test_registry_load.py —— 负载均衡回归测试
 
-钉住三个线上事故场景：
+钉住四个线上事故场景：
 1. 云端排队态（pending/waiting/…）被旧口径漏计 → 所有线路负载恒为 0；
 2. 负载全等时 min() 平局恒取配置第一条 → 三台同配置的电脑一起把一条线灌到 20+；
-3. concurrency=1 只锁住「提交动作」那几百毫秒 → 从没真正限制过一条线的在途任务。
+3. concurrency=1 只锁住「提交动作」那几百毫秒 → 从没真正限制过一条线的在途任务；
+4. 探活失败到阈值后全部线路标红，候选池塌缩成一条 → 整批只跑一条线（同事反馈）。
 
 所有 HTTP 通过 monkeypatch 注入，无网络、无真实服务。
 """
@@ -27,16 +28,19 @@ class FakeAcc:
         self.concurrency = concurrency
         self.healthy = healthy
         self.fail_count = 0
+        self.probe_state = None
 
 
 @pytest.fixture(autouse=True)
 def _clean_load_cache():
-    """负载缓存与降级标记跨用例残留会让断言变得看运气"""
+    """负载缓存、降级标记、全红告警位跨用例残留会让断言变得看运气"""
     mgr.invalidate_load_cache()
     mgr._load_errors.clear()
+    mgr._ALL_DOWN_NOTIFIED = False
     yield
     mgr.invalidate_load_cache()
     mgr._load_errors.clear()
+    mgr._ALL_DOWN_NOTIFIED = False
 
 
 @pytest.fixture()
@@ -212,3 +216,47 @@ def test_first_task_never_waits(lines, monkeypatch):
     monkeypatch.setattr(mgr, "list_jobs", lambda base, limit=100: [])
     _acc, waited, got = pick_and_wait(_sleep=lambda s: None)
     assert got and waited == 0
+
+
+# ====================================================================
+# 5. 全线路探活失败：候选是「最少那一档」，不是一条
+# ====================================================================
+def _all_red(lines, fail_count=5):
+    for a in lines.values():
+        a.healthy = False
+        a.fail_count = fail_count
+
+
+def test_all_lines_red_still_spreads(lines, monkeypatch):
+    """旧实现 `sorted(ACCOUNTS, key=fail_count)[:1]` 只留一条：整批（多选强制
+    重跑/抽卡）全灌 acc1、其余线全程空转——就是同事反馈的“只跑一个线路”"""
+    monkeypatch.setattr(mgr, "list_jobs", lambda base, limit=100: [])
+    _all_red(lines)
+    hits = dict.fromkeys(lines, 0)
+    for _ in range(300):
+        hits[pick_account().name] += 1
+    assert sum(1 for v in hits.values() if v) >= 2, hits
+
+
+def test_all_red_pool_is_the_least_failed_group(lines):
+    _all_red(lines, fail_count=4)
+    assert len(mgr.schedulable_accounts()) == len(lines)   # 同档全部留下平摊
+    lines["acc3"].fail_count = 1        # 只有一条最先恢复：先信它
+    assert [a.name for a in mgr.schedulable_accounts()] == ["acc3"]
+
+
+def test_all_red_warned_once_per_episode(lines, monkeypatch):
+    """全红要告知（不然只看到任务全上一根线），但逐条提交不能刷屏"""
+    warned = []
+    monkeypatch.setattr(mgr, "raw_warning", warned.append)
+    monkeypatch.setattr(mgr, "list_jobs", lambda base, limit=100: [])
+    _all_red(lines)
+    for _ in range(3):
+        mgr.pick_account()
+    assert len(warned) == 1 and "只灌一条" in warned[0]
+
+    lines["acc1"].healthy = True          # 有线路回来了 → 告警位复位
+    mgr.pick_account()
+    _all_red(lines)
+    mgr.pick_account()
+    assert len(warned) == 2               # 下次再全红还要说一次

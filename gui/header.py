@@ -12,6 +12,25 @@ FS_TEXT = "#1F2329"
 FS_SUB = "#646A73"
 FS_WEAK = "#8F959E"
 
+# 线路状态灯三档，不是“绿/红”两档：探活接口未实现时（服务有话回但路径不对，
+# 典型是 GET {base}/health 返回 HTML 404）画红灯会把人吓去删线路，画绿灯又是
+# 谎称“测过了”。语义与 registry.manager.classify_probe 一一对应。
+LIGHT_PENDING = ("⚪", "⚪ 待检测", FS_WEAK)      # 首轮探活还没回来
+LIGHT_OK = ("🟢", "🟢 正常", "#1FA45C")          # 探活接口正常应答
+LIGHT_ALIVE = ("🟡", "🟡 在线（探活路径未实现）", "#F5A623")
+LIGHT_DOWN = ("🔴", "🔴 故障", "#E5484D")        # 连不上 / 5xx
+
+
+def line_light(acc, checked=True):
+    """一条线路的展示三件套：(小灯, 状态文字, 颜色)"""
+    if not checked:
+        return LIGHT_PENDING
+    if not acc.healthy:
+        return LIGHT_DOWN
+    if getattr(acc, "probe_state", None) == "alive":
+        return LIGHT_ALIVE
+    return LIGHT_OK
+
 
 class _AccentBar(QWidget):
     """标题左侧的飞书蓝渐变竖条"""

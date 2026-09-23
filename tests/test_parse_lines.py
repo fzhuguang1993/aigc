@@ -6,7 +6,7 @@ tests/test_parse_lines.py —— 线路配置纯函数回归（粘贴导入解�
 """
 import json
 
-from gui.pages_settings import _browser_url, parse_lines
+from gui.pages_settings import _browser_url, dedupe_browser_urls, parse_lines
 
 
 def test_roundtrip_of_copy_output():
@@ -62,3 +62,17 @@ def test_browser_url_adds_scheme_for_bare_host():
     assert _browser_url("10.0.0.1:7860/api/v1") == "http://10.0.0.1:7860"
     assert _browser_url("  https://x.pod.test ") == "https://x.pod.test"
     assert _browser_url("") == "http://"          # 空值不抛，由调用方先拦住
+
+
+def test_dedupe_browser_urls_keeps_row_order():
+    """「🌐 打开选中」：几行就几个标签，且顺序跟表里看到的一致"""
+    assert dedupe_browser_urls([
+        "http://a.test:7860/api/v1", "https://b.test:7860/api/v1"]) == [
+        "http://a.test:7860", "https://b.test:7860"]
+
+
+def test_dedupe_browser_urls_skips_empty_and_same_address():
+    """空行不能开出一个“http://”废标签；同一个地址被贴了两行只开一次"""
+    bases = ["", "  ", None, "http://a.test:7860/api/v1", "http://a.test:7860/"]
+    assert dedupe_browser_urls(bases) == ["http://a.test:7860"]
+    assert dedupe_browser_urls([]) == []

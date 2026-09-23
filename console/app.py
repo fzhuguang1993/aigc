@@ -13,7 +13,8 @@ from store import db, task_store
 from store.task_store import COL_ID, COL_STATUS, COL_RUNS
 from registry.manager import (REG, ACCOUNTS, get_account, get_account_load,
                               BatchBalancer, check_all_accounts, first_check_done)
-from workers.submit import do_submit, cancel_one, SubmitOptions
+from workers.submit import (do_submit, cancel_one, SubmitOptions,
+                            format_batch_distribution)
 from workers.scan import print_new_rows, SCAN
 from core.logger import raw_warning, raw_info
 from core.api_client import query_job
@@ -186,6 +187,7 @@ def _submit_by_ids(id_list):
     """按任务ID列表提交，返回 (成功数, 失败数, 跳过数)。
     多条时走注水式批量分配（绕开在途闸门、按全局快照均衡）；单条保持闸门旧行为。"""
     success = fail = skip = 0
+    landed = []        # 提交成功的每条落在哪条线，收尾报分布（与 GUI 同一口径）
     balancer = (BatchBalancer(len(id_list), rescan_every=BALANCE_RESCAN_EVERY)
                 if len(id_list) > 1 else None)
     submitted = 0
@@ -207,11 +209,15 @@ def _submit_by_ids(id_list):
         jid, err, acc_name = do_submit(tid, product, prompt, _current_options(),
                                        balancer=balancer)
         if jid:
+            landed.append(acc_name)     # 只统计提交成功的，与 GUI 同一口径
             print(f"  ✓ 任务 {tid} 提交成功 [{acc_name}]")
             success += 1
         else:
             print(f"  ✗ 任务 {tid} 提交失败：{err}")
             fail += 1
+    note = format_batch_distribution(landed, len(ACCOUNTS))
+    if note:
+        print(f"  {note}")
     return success, fail, skip
 
 

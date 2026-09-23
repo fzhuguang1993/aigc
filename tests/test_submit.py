@@ -323,3 +323,27 @@ class TestRejectedParamParsing:
         assert payload == {"parameters": {"duration": 5}}
         # 路径不存在时不抛异常、不摘任何东西
         assert sub.drop_rejected(payload, [["body", "nope", "x"]]) == []
+
+
+class TestBatchDistributionNote:
+    """收尾那句「本批线路分布」：均衡有没有失效要当场看得见，不能只翻 DEBUG 日志"""
+
+    def test_counts_per_line_in_descending_order(self):
+        note = sub.format_batch_distribution(
+            ["acc1", "acc2", "acc1", "acc3", "acc1", "acc2"], 7)
+        assert note.startswith("本批 6 条分布：")
+        assert note.index("acc1×3") < note.index("acc2×2") < note.index("acc3×1")
+        assert "⚠" not in note                      # 摊开了就不该报警
+
+    def test_warns_when_a_multi_line_batch_used_only_one(self):
+        """同事反馈的现场：多选强制重跑整批只跑了一条线"""
+        note = sub.format_batch_distribution(["acc1"] * 5, 7)
+        assert "acc1×5" in note and "7 条线路只用上了 acc1" in note
+
+    def test_single_line_config_is_not_warned(self):
+        """只配了一条线路时全给它属正常，不该天天喊 ⚠"""
+        assert "⚠" not in sub.format_batch_distribution(["acc1"] * 5, 1)
+
+    def test_empty_batch_has_no_note(self):
+        assert sub.format_batch_distribution([], 7) == ""
+        assert sub.format_batch_distribution([None, None], 7) == ""

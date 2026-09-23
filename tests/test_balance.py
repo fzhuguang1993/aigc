@@ -104,3 +104,19 @@ def test_batch_balancer_skips_unhealthy(monkeypatch):
     accs[0].healthy = False                              # a 挂了，只应选 b
     b = rm.BatchBalancer(3, rescan_every=0)
     assert [b.pick().name for _ in range(3)] == ["b", "b", "b"]
+
+
+def test_batch_balancer_all_unhealthy_still_spreads(monkeypatch):
+    """探活全军覆没时不能塌缩成一条线
+
+    现场：云端没实现 GET /health（实测回 HTML 404，服务其实活着），三轮后所有线
+    标红，旧兜底 `sorted(..., key=fail_count)[:1]` 只留 acc1 → 多选强制重跑的
+    整批全灌一条线、其余全程空转（同事反馈）。"""
+    loads = {"a": 0, "b": 0, "c": 0}
+    accs = _install_fake(monkeypatch, loads)
+    for a in accs:
+        a.healthy = False
+        a.fail_count = 3
+    b = rm.BatchBalancer(9, rescan_every=0)
+    seq = [b.pick().name for _ in range(9)]
+    assert sorted(set(seq)) == ["a", "b", "c"], seq

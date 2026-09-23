@@ -54,6 +54,7 @@ class ConsolePage(QWidget):
 
     def refresh(self):
         from registry.manager import ACCOUNTS, REG, is_active, first_check_done
+        from gui.header import line_light
         checked = first_check_done()      # 未跑过一轮探活前，healthy 只是默认值
         rows = REG.active()
         self.table.setRowCount(len(ACCOUNTS))
@@ -71,12 +72,9 @@ class ConsolePage(QWidget):
                 cloud_tip = ("含同事提交的任务" if src == "cloud" else
                              "云端负载接口不可用，此数只统计了本机，"
                              "看不到同事占了多少——选线会失真")
-            if not checked:
-                status_txt, status_color = "⚪ 待检测", "#8F959E"
-            elif acc.healthy:
-                status_txt, status_color = "🟢 正常", "#1FA45C"
-            else:
-                status_txt, status_color = "🔴 故障", "#E5484D"
+            # 四档灯共用 gui.header.line_light：⚪ 未测 / 🟢 探活应答 / 🟡 服务在但
+            # 探活路径未实现 / 🔴 连不上，不在本页另写一套判定
+            status_txt, status_color = line_light(acc, checked)[1:]
             vals = [acc.name, status_txt, acc.base,
                     acc.concurrency, run, max(acc.concurrency - run, 0),
                     acc.fail_count, cloud_txt]
@@ -94,10 +92,16 @@ class ConsolePage(QWidget):
                         item.setForeground(QColor("#E5484D"))
                 self.table.setItem(i, c, item)
         degraded = sum(1 for v in self._cloud.values() if v and v[1] != "cloud")
+        alive_only = sum(1 for a in ACCOUNTS
+                         if a.healthy and getattr(a, "probe_state", None) == "alive")
+        if not checked:
+            stat = f"共 {len(ACCOUNTS)} 条线路（还没跑过检测）"
+        else:
+            stat = (f"健康线路 {sum(1 for a in ACCOUNTS if a.healthy)}/{len(ACCOUNTS)}"
+                    + (f"（其中 {alive_only} 条只是探活路径未实现，黄灯🟡仍能正常提交）"
+                       if alive_only else ""))
         self.lbl_sum.setText(
-            f"全部线路合计：本地进行中 {sum_run} 条 · "
-            + (f"健康线路 {sum(1 for a in ACCOUNTS if a.healthy)}/{len(ACCOUNTS)}"
-               if checked else f"共 {len(ACCOUNTS)} 条线路（还没跑过检测）")
+            f"全部线路合计：本地进行中 {sum_run} 条 · " + stat
             + (f" · ⚠ {degraded} 条线路云端接口不可用，负载仅含本机" if degraded else ""))
 
     def _fetch_cloud(self):

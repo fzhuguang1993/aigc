@@ -13,11 +13,12 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QMenu, QMessageBox, QFileDialog, QAbstractItemView,
                                QLineEdit, QDateEdit, QCheckBox, QInputDialog, QFrame)
 
-from registry.manager import REG, BatchBalancer
+from registry.manager import REG, ACCOUNTS, BatchBalancer
 from core.config import DEFAULT_STEPS, SUBMIT_PACING, BALANCE_RESCAN_EVERY
 from store import task_store, product_store, app_state
 from utils.desktop_utils import reveal_in_folder
-from workers.submit import do_submit, cancel_one, SubmitOptions
+from workers.submit import (do_submit, cancel_one, SubmitOptions,
+                            format_batch_distribution)
 from gui.dialogs import (TaskDialog, FindReplaceDialog, ForceRerunDialog,
                          ScriptBindDialog)
 from gui.delegates import ProgressDelegate, ProgressRole
@@ -74,9 +75,11 @@ class SubmitWorker(QThread):
         super().__init__()
         self.items = items
         self.options = options   # 提交瞬间的选项快照，避免全局态
+        self.distribution = ""   # 本批实际落线汇总，跑完后给 _on_submit_done 拼进提示
 
     def run(self):
         failed = []
+        landed = []              # 每条提交成功的任务落在哪条线（换线重试后算最终那条）
         # 多条一起提交才启用注水分配器：按全局快照+本批投影均衡选线、绕开在途闸门；
         # 单条仍走原有闸门逻辑（balancer=None）
         balancer = (BatchBalancer(len(self.items), rescan_every=BALANCE_RESCAN_EVERY)
@@ -88,10 +91,15 @@ class SubmitWorker(QThread):
             jid, err, acc = do_submit(tid, product, prompt, self.options,
                                       balancer=balancer)
             if jid:
+                landed.append(acc)        # 只统计真正提交上去的，失败的另有弹窗留痕
                 self.log_msg.emit(f"✓ 任务{tid} 已提交 [{acc}]")
             else:
                 failed.append((tid, err))
                 self.log_msg.emit(f"✗ 任务{tid} 提交失败: {err}")
+        # 收尾报一句本批分布：均衡有没有失效，不能只靠事后翻日志（同事反馈现场）
+        self.distribution = format_batch_distribution(landed, len(ACCOUNTS))
+        if self.distribution:
+            self.log_msg.emit(self.distribution)
         self.all_done.emit(failed)
 
 
@@ -1553,6 +1561,9 @@ class TasksPage(QWidget):
     def _on_submit_done(self, failed):
         """提交结果必留痕：失败只写一行灰色小字会被看成“改了没生效”
         （云端拒绝参数时就是这样：一行提示转瞬即逝，表格里的旧视频、旧时长还在）"""
+        dist = getattr(self.worker, "distribution", "")
+        # 本批落线汇总挂在收尾提示里：一句“只跑了一个线路”能不能当场对出来
+        tail = ("　· " + dist) if dist else ""
         # B3：本次提交失败的任务标红并置顶，改好提示词直接重跑，不用翻找
         self._failed_ids = {tid for tid, _ in failed}
         if failed:
@@ -1560,7 +1571,8 @@ class TasksPage(QWidget):
         else:
             self.refresh()
         if not failed:
-            self.lbl_tip.setText("提交完成，云端生成中…进度条将实时更新，完成后自动下载到 outputs/")
+            self.lbl_tip.setText("提交完成，云端生成中…进度条将实时更新，完成后自动下载到 outputs/"
+                                 + tail)
             return
         reasons = "\n".join(f"  任务{tid}：{why}" for tid, why in failed[:8])
         more = f"\n  …共 {len(failed)} 条" if len(failed) > 8 else ""
@@ -1570,7 +1582,7 @@ class TasksPage(QWidget):
             f"列表里看到的仍是上次跑出来的视频和参数。\n\n{reasons}{more}\n\n"
             "具体报文已写入日志。修正原因后重新【执行选中】即可。")
         self.lbl_tip.setText(f"⚠ {len(failed)} 个任务提交失败（见弹窗与日志），"
-                             f"未提交到云端")
+                             f"未提交到云端" + tail)
 
     def _import_excel(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择任务 Excel", "", "Excel 文件 (*.xlsx)")

@@ -16,6 +16,7 @@ workers/submit.py —— 提交链路（背压 + 负载均衡 + 带退避的换�
 import json
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -275,6 +276,29 @@ def do_submit(row_idx, product, prompt, options=None, *, balancer=None, _sleep=t
         return None, last_err or "所有重试均失败", acc.name
     finally:
         held.sem.release()
+
+
+def format_batch_distribution(landed, total_lines):
+    """把本批提交成功的任务落到哪些线路汇成一句人话：「本批 10 条分布：acc1×4 acc2×3 …」
+
+    只传提交成功的账号名（失败的自有弹窗留痕），否则“分布”会把根本没占线路的失败也算一条。
+
+    为何要专门留这一行：选线是后台做的，“多选强制重跑只跑了一个线路”这种
+    问题以前只能翻 DEBUG 日志复盘，同事反馈时根本说不清当时到底怎么分的。
+    全摊到一条线上（线路不止一条时）额外给 ⚠，把“均衡失效”从口头描述变成现
+    场留痕。
+    """
+    names = [n for n in landed if n]
+    if not names:
+        return ""
+    counter = Counter(names)
+    parts = " ".join(f"{n}×{c}" for n, c in
+                     sorted(counter.items(), key=lambda x: (-x[1], x[0])))
+    note = f"本批 {len(names)} 条分布：{parts}"
+    if len(counter) == 1 and total_lines > 1:
+        note += (f"　⚠ {total_lines} 条线路只用上了 {names[0]}："
+                 "其余线路探活未通过或已排满，去「📡 线路负载」看一眼状态列")
+    return note
 
 
 def cancel_one(task):
