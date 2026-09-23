@@ -11,29 +11,25 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 
 from store import task_store
 from gui import log_sink
+from gui.formatting import secs
 from gui.header import page_header
 from gui.widgets import LoadingOverlay
-from gui.tablekit import FieldManagerDialog, apply_field_layout, enable_drag_with_lock
+from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
+                          SecsItem)
 
-DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间", "用时", "输出文件", "错误信息"]
+DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间",
+                "总用时", "生成", "排队", "输出文件", "错误信息"]
+# 「总用时」= 提交→完成（含在云端排队），「生成」= 云端开始跑→出片，两者差的就是排队。
+# 早期没存云端时间戳的记录拆不出来，「生成」列只能给个「—」——不拿总用时冒充生成耗时。
 HEADERS = [""] + DATA_HEADERS
 CHECK_COL = 0
 COL_START, COL_NUM, COL_PRODUCT, COL_ACCOUNT, COL_STATUS, COL_END, \
-    COL_DUR, COL_OUT, COL_ERR = range(1, 10)
+    COL_DUR, COL_GEN, COL_QUEUE, COL_OUT, COL_ERR = range(1, 12)
 LEFT_COLS = (COL_OUT, COL_ERR)          # 长文本列左对齐，其余居中
+DUR_COLS = (COL_DUR, COL_GEN, COL_QUEUE)   # 三个时长列按秒数排序
+_DUR_KEY = {COL_DUR: "duration", COL_GEN: "gen_sec", COL_QUEUE: "queued_sec"}
 _COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
            "cancelled": "#8F959E"}
-
-
-def _fmt_dur(seconds):
-    """执行用时展示：秒级精度，超过 1 分钟折算分秒"""
-    try:
-        d = int(seconds or 0)
-    except (TypeError, ValueError):
-        return ""
-    if d <= 0:
-        return ""
-    return f"{d // 60}分{d % 60}秒" if d >= 60 else f"{d}秒"
 
 
 class RecordsPage(QWidget):
@@ -109,7 +105,8 @@ class RecordsPage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(COL_OUT, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(COL_ERR, QHeaderView.ResizeMode.Stretch)
         for c, w in {COL_START: 120, COL_NUM: 50, COL_PRODUCT: 120, COL_ACCOUNT: 70,
-                     COL_STATUS: 90, COL_END: 120, COL_DUR: 70}.items():
+                     COL_STATUS: 90, COL_END: 120, COL_DUR: 70,
+                     COL_GEN: 70, COL_QUEUE: 62}.items():
             self.table.setColumnWidth(c, w)
         self.table.itemChanged.connect(self._on_item_changed)
         # 默认「最新在前」：按开始时间倒序，与任务中心口径一致（点表头可改列/方向）
@@ -197,16 +194,19 @@ class RecordsPage(QWidget):
             self.table.setItem(i, CHECK_COL, ck)
             vals = [(r["started_at"] or "")[5:16], r["num"], r["product"], r["account"],
                     r["status"] or "running", (r["finished_at"] or "")[5:16],
-                    _fmt_dur(r.get("duration")),
+                    secs(r.get("duration")),
+                    secs(r.get("gen_sec")), secs(r.get("queued_sec")),
                     r["output"] or "", r["error"] or ""]
             for c0, v in enumerate(vals):
                 c = c0 + 1
-                item = QTableWidgetItem(str(v))
+                # 三个时长列走 SecsItem：显示「4分58秒」而排序按秒数
+                item = (SecsItem(r.get(_DUR_KEY[c])) if c in DUR_COLS
+                        else QTableWidgetItem(str(v)))
                 item.setToolTip(str(v))
                 item.setData(Qt.ItemDataRole.UserRole, r["id"])
-                if c == COL_DUR:
-                    item.setData(Qt.ItemDataRole.DisplayRole,
-                                 int(r.get("duration") or 0))   # 按秒数数值排序
+                if c == COL_GEN:
+                    item.setToolTip("云端开始跑→出片（不含排队）；「—」＝这条是早期记录，"
+                                    "当时没存云端时间戳，可跑回填脚本补")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter
                                       | (Qt.AlignmentFlag.AlignLeft if c in LEFT_COLS
                                          else Qt.AlignmentFlag.AlignCenter))

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 
 from core.config import USER_NAME
 from store import app_state, task_store
+from gui.formatting import secs
 from gui.header import page_header, Card, KpiCard
 from gui.widgets import LoadingOverlay
 from gui.charts import TrendChart, DonutChart, HBarChart, C_OK, C_OK2, C_FAIL, C_FAIL2, C_CANCEL, C_CANCEL2
@@ -75,7 +76,7 @@ class DashboardPage(QWidget):
         self.k_fail = KpiCard("失败", "✖", "#F54A45")
         self.k_cancel = KpiCard("取消", "⊘", "#8F959E")
         self.k_run = KpiCard("正在运行", "◌", "#FF8D19")
-        self.k_dur = KpiCard("平均用时", "⏱", "#0FB5AE")
+        self.k_dur = KpiCard("平均生成时长", "⏱", "#0FB5AE")
         for k in (self.k_total, self.k_ok, self.k_rate, self.k_fail,
                   self.k_cancel, self.k_run, self.k_dur):
             k.setMinimumWidth(125)
@@ -140,13 +141,20 @@ class DashboardPage(QWidget):
         self.k_cancel.set_value(cur["cancel"], *cmp(cur["cancel"], prev["cancel"], False))
         run = st["running"]
         self.k_run.set_value(run, "云端生成中" if run else "空闲")
-        # 成功执行的平均用时（秒），与上期对比，越短越好
+        # 成功执行的平均生成用时（秒，不含排队），与上期对比，越短越好
         avg_c, avg_p = cur.get("avg_dur") or 0, prev.get("avg_dur") or 0
         dt, up = _delta_text(round(avg_c), round(avg_p), False) if avg_p else ("", None)
-        self.k_dur.set_value(f"{avg_c:.0f}秒" if avg_c else "—",
+        self.k_dur.set_value(secs(avg_c) if avg_c else "—",
                              "累计至今" if cum else
                              (dt if (avg_p and avg_c) else
                               ("—" if not avg_c else "均基于本期")), up)
+        # 排队均值放 tooltip：同一条线只跑一个时，总用时里一大半是排队，
+        # 不拆开来就说不清“为什么上次看 15 分钟、这次只要 5 分钟”
+        q = cur.get("avg_queued") or 0
+        self.k_dur.setToolTip(
+                "只算视频在云端真正生成花的时间（开始跑→出片），不含排队"
+                + (f"；本期平均排队 {secs(q)}" if q else "；本期没采到排队时间")
+                + "\n没拆分（早期提交）的记录按总用时计，可用回填脚本补")
 
         self.trend.title = f"每日执行趋势 · {scope}（成功/失败/取消 堆叠）"
         self.trend.set_data(st["daily"])

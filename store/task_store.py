@@ -28,7 +28,7 @@ _CN2DB = {"编号": "num", "品名": "product", "提示词": "prompt",
 
 # 全字段导出（与导入模板列对齐，方便导出→修改→再导入闭环）
 EXPORT_COLUMNS = ["编号", "品名", "提示词", "脚本", "备注", "口播文案", "分镜数",
-                  "状态", "时长", "执行用时", "账号", "job_id",
+                  "状态", "时长", "生成用时", "排队用时", "账号", "job_id",
                   "输出", "URL", "运行次数", "成功次数", "取消次数", "更新时间"]
 
 EXPORT_DIR = Path(EXPORT_DIR_STR)   # 模板/导出目录：可在设置里改，默认运行目录 exports/
@@ -50,6 +50,31 @@ def _parse_ts(ts):
         return datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
 
 
+def _iso_to_dt(ts):
+    """云端时间戳（`2026-09-23T07:32:39.399710+00:00`）→ datetime；解不开返回 None
+
+    只做差值用，不换算本地时区：两端都来自云端，带的是同一个 UTC 偏移。"""
+    s = str(ts or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _span_seconds(start, end):
+    """两个云端时间戳相差的秒数（向下取整）；缺任一端/解不开/负数 → 0"""
+    a, b = _iso_to_dt(start), _iso_to_dt(end)
+    if not a or not b:
+        return 0
+    try:
+        gap = b - a
+    except TypeError:                     # 一端带时区一端不带（云端换了写法）
+        gap = b.replace(tzinfo=None) - a.replace(tzinfo=None)
+    return max(0, int(gap.total_seconds()))
+
+
 # ---------------- 任务 CRUD ----------------
 
 def list_tasks_df():
@@ -65,17 +90,28 @@ def list_tasks_df():
     if len(df):
         df[text_cols] = df[text_cols].fillna("").astype(str)
     df["_id"] = df["id"]
-    # 派生列：执行用时（秒）——优先取最近一次成功执行，没有成功过再取最近终态
+    # 派生列：单条视频的「生成用时」与「排队用时」（秒）
+    # 优先取最近一次成功执行，没成功过再取最近终态；老记录没拆分（gen_sec=0）
+    # 则回退用总用时，至少不给个 0 让人以为生成只用了 0 秒
     durs = {}
     for sql in (
-            "SELECT task_id, duration FROM runs WHERE status='completed' AND duration > 0 "
+            "SELECT task_id, duration, gen_sec, queued_sec FROM runs "
+            "WHERE status='completed' AND duration > 0 "
             "AND id IN (SELECT MAX(id) FROM runs WHERE status='completed' GROUP BY task_id)",
-            "SELECT task_id, duration FROM runs WHERE duration > 0 AND status!='running' "
+            "SELECT task_id, duration, gen_sec, queued_sec FROM runs "
+            "WHERE duration > 0 AND status!='running' "
             "AND id IN (SELECT MAX(id) FROM runs WHERE status!='running' GROUP BY task_id)"):
         for r in db.query(sql):
-            durs.setdefault(r["task_id"], int(r["duration"] or 0))
-    df["执行用时"] = [int(durs.get(i, 0)) for i in df["_id"]] if len(df) \
-        else pd.Series([], dtype=int)
+            g = int(r["gen_sec"] or 0)
+            durs.setdefault(r["task_id"], (g or int(r["duration"] or 0),
+                                           int(r["queued_sec"] or 0), bool(g)))
+    triples = [durs.get(i, (0, 0, False)) for i in df["_id"]]
+    df["生成用时"] = [int(t[0]) for t in triples] if len(df) else pd.Series([], dtype=int)
+    df["排队用时"] = [int(t[1]) for t in triples] if len(df) else pd.Series([], dtype=int)
+    # 辅助列：这条的「生成用时」其实是未拆分的总用时（早期没存云端时间戳）
+    # 不标出来就会拿着含排队的数当生成耗时比
+    df["用时含排队"] = [(not t[2]) and t[0] > 0 for t in triples] if len(df) \
+        else pd.Series([], dtype=bool)
     return df
 
 
@@ -192,7 +228,11 @@ def record_run_start(task_id, num, product, account, job_id):
                (task_id, str(num), product, account, job_id, "running", _now_precise()))
 
 
-def record_run_end(job_id, status, output="", error=""):
+def record_run_end(job_id, status, output="", error="", cloud=None):
+    """终态刻录：`duration` 是提交→完成的总用时（含云端排队），
+    `gen_sec`/`queued_sec` 拆成「真生成」与「排队」两段——数据来自云端回报的
+    `submitted_at / started_at / completed_at`（实测三个都有，见 docs/云端接口字段说明.md），
+    拿本地轮询时刻估会差一个 POLL_INTERVAL，而单条视频生成本身才 5 分钟量级。"""
     now = _now_precise()
     # 执行用时（秒）：本次结束时间 - 开始时间
     dur = 0
@@ -204,9 +244,48 @@ def record_run_end(job_id, status, output="", error=""):
                                          )).total_seconds()))
         except ValueError:
             dur = 0
-    db.execute("UPDATE runs SET status=?, finished_at=?, duration=?, output=?, error=? "
-               "WHERE job_id=? AND finished_at IS NULL",
-               (status, now, dur, output, error, job_id))
+    # 排队/生成拆分：拿不到云端时间戳就留 0（展示层回退用总用时，不拿轮询时刻猜）
+    queued, gen = split_from_cloud(cloud)
+    db.execute("UPDATE runs SET status=?, finished_at=?, duration=?, gen_sec=?, "
+               "queued_sec=?, output=?, error=? WHERE job_id=? AND finished_at IS NULL",
+               (status, now, dur, gen, queued, output, error, job_id))
+
+
+def split_from_cloud(cloud):
+    """云端作业回报 → (排队秒, 生成秒)；字段缺任一端就给 0（当作“不知道”）
+
+    兼容 `{data:{...}}` 包裹（云端接口见过这两种写法，不让拆分因套一层就静默失效）。"""
+    c = cloud if isinstance(cloud, dict) else {}
+    _TS = ("submitted_at", "created_at", "started_at", "start_time",
+           "completed_at", "finished_at", "end_time")
+    if not any(k in c for k in _TS):
+        for key in ("data", "job", "task"):
+            if isinstance(c.get(key), dict):
+                c = c[key]
+                break
+    started = c.get("started_at") or c.get("start_time")
+    finished = c.get("completed_at") or c.get("finished_at") or c.get("end_time")
+    return (_span_seconds(c.get("submitted_at") or c.get("created_at"), started),
+            _span_seconds(started, finished))
+
+
+def update_run_split(job_id, cloud, only_if_empty=True):
+    """用云端回报回填某条执行的「排队/生成」拆分（历史数据回填入口用）
+
+    only_if_empty：已经有数就不覆盖——回填脚本重复跑不会把刚采到的新值刷掉。
+    返回是否真的写了这一行（`db.execute` 回的是 lastrowid，所以自己先查再定）。"""
+    queued, gen = split_from_cloud(cloud)
+    if not (queued or gen):
+        return False
+    rows = db.query("SELECT gen_sec, queued_sec FROM runs WHERE job_id=?", (job_id,))
+    if not rows:
+        return False
+    if only_if_empty and any(int(r["gen_sec"] or 0) or int(r["queued_sec"] or 0)
+                             for r in rows):
+        return False
+    db.execute("UPDATE runs SET gen_sec=?, queued_sec=? WHERE job_id=?",
+               (gen, queued, job_id))
+    return True
 
 
 def attach_run_result(job_id, output=None, error=None):
@@ -310,14 +389,18 @@ def write_import_template(path=None):
 
 _RANGE = ("SELECT COUNT(*) total, SUM(status='completed') ok,"
           " SUM(status IN ('failed','error')) fail, SUM(status='cancelled') cancel,"
-          " AVG(CASE WHEN status='completed' THEN duration END) dur"
+          # 平均生成时长只算 `gen_sec`；没拆分的老记录回退用总用时（偶尔偏大一点，
+          # 也不要把它们从平均值里隐掉——那样看上去反而像“只跑了新的几条”）
+          " AVG(CASE WHEN status='completed' THEN COALESCE(NULLIF(gen_sec,0), duration) END) dur,"
+          " AVG(CASE WHEN status='completed' THEN NULLIF(queued_sec,0) END) qdur"
           " FROM runs WHERE substr(started_at,1,10)")
 
 
 def _sum_row(rows):
     r = rows[0] if rows else {}
     out = {k: int(r.get(k) or 0) for k in ("total", "ok", "fail", "cancel")}
-    out["avg_dur"] = round(float(r.get("dur") or 0), 1)   # 成功执行平均用时（秒）
+    out["avg_dur"] = round(float(r.get("dur") or 0), 1)     # 成功执行平均生成用时（秒）
+    out["avg_queued"] = round(float(r.get("qdur") or 0), 1)  # 平均排队（秒），老记录多未采
     return out
 
 
@@ -473,17 +556,18 @@ def export_runs_rows(rows, fmt="excel", path=None):
 
 def _runs_df(rows):
     cols = ["started_at", "num", "product", "account", "status",
-            "finished_at", "duration", "output", "error"]
+            "finished_at", "duration", "gen_sec", "queued_sec", "output", "error"]
     df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     for c in ("started_at", "finished_at"):     # 展示时去掉微秒尾巴
         if c in df.columns and len(df):
             df[c] = df[c].fillna("").astype(str).str[:19]
     df = df.rename(columns={"started_at": "开始时间", "num": "编号", "product": "品名",
                             "account": "账号", "status": "状态", "finished_at": "结束时间",
-                            "duration": "用时(秒)",
+                            "duration": "总用时(秒)", "gen_sec": "生成用时(秒)",
+                            "queued_sec": "排队用时(秒)",
                             "output": "输出文件", "error": "错误信息"})
     return df[["开始时间", "编号", "品名", "账号", "状态", "结束时间",
-               "用时(秒)", "输出文件", "错误信息"]]
+               "总用时(秒)", "生成用时(秒)", "排队用时(秒)", "输出文件", "错误信息"]]
 
 
 def _stamp():

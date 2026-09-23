@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS runs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id INTEGER, num TEXT, product TEXT, account TEXT, job_id TEXT,
   status TEXT, started_at TEXT, finished_at TEXT, output TEXT, error TEXT,
-  duration INTEGER DEFAULT 0
+  duration INTEGER DEFAULT 0, gen_sec INTEGER DEFAULT 0, queued_sec INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS products(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +53,9 @@ _MIGRATIONS = (
     "ALTER TABLE tasks ADD COLUMN duration INTEGER DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN prompt_changed_at TEXT DEFAULT ''",
     "ALTER TABLE runs ADD COLUMN duration INTEGER DEFAULT 0",
+    # 总用时里混着云端排队：把「真生成」与「排队」拆成两列单独存（云端回报的时间戳算出）
+    "ALTER TABLE runs ADD COLUMN gen_sec INTEGER DEFAULT 0",
+    "ALTER TABLE runs ADD COLUMN queued_sec INTEGER DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN script TEXT DEFAULT ''",
     "ALTER TABLE tasks ADD COLUMN storyboard INTEGER DEFAULT 0",
     # 备注：使用者自己标的管理记号（“已过审”“待重拍”…），不参与业务逻辑

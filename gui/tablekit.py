@@ -1,10 +1,44 @@
 """
-gui/tablekit.py —— 表格通用能力：勾选框列 + 字段管理（显示/隐藏 + 拖拽排序）
+gui/tablekit.py —— 表格通用能力：勾选框列 + 字段管理（显示/隐藏 + 拖拽排序）+ 秒数单元格
 任务中心与执行记录共用同一套逻辑。
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
-                               QListWidget, QListWidgetItem, QVBoxLayout)
+                               QListWidget, QListWidgetItem, QVBoxLayout,
+                               QTableWidgetItem)
+
+from gui.formatting import secs
+
+
+class SecsItem(QTableWidgetItem):
+    """秒数单元格：显示成「4分58秒」，点表头排序仍按秒数比大小
+
+    不这么做两头总有一头错：QTableWidget 内建排序比的是单元格文本，“10分30秒”
+    会被排到“4分58秒”前面；而只挂 DisplayRole=数字又会把格子显示成 298。
+    重载 < 才是文字和顺序两头都对的做法。"""
+    # 秒数存哪个角色：UserRole 已被“行→任务ID”占了；EditRole 也不能用——
+    # QTableWidgetItem 没人给它存过数据时会回落到显示文本，拿回来是“4分58秒”而不是 298
+    SEC_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def __init__(self, seconds=0, parent=None):
+        super().__init__(parent)
+        self.set_secs(seconds)
+
+    def set_secs(self, seconds):
+        try:
+            d = int(seconds or 0)
+        except (TypeError, ValueError):
+            d = 0
+        self.setData(self.SEC_ROLE, d)
+        self.setText(secs(d))
+
+    def seconds(self):
+        return int(self.data(self.SEC_ROLE) or 0)
+
+    def __lt__(self, other):
+        if isinstance(other, SecsItem):
+            return self.seconds() < other.seconds()
+        return super().__lt__(other)
 
 
 class FieldManagerDialog(QDialog):

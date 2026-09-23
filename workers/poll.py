@@ -79,18 +79,19 @@ def poll_worker_for_account(acc_name):
                 last_print[t["job_id"]] = key
 
             if st in {"completed", "failed", "cancelled"}:
-                # 任务终态：先刻录时间戳（执行用时=提交→生成结束），再回写其他字段
+                # 任务终态：先刻录时间戳（总用时=提交→完成，排队/生成拆分用 `s` 里
+                # 云端回报的时间戳），再回写其他字段
                 if st == "completed":
-                    task_store.record_run_end(t["job_id"], st)
+                    task_store.record_run_end(t["job_id"], st, cloud=s)
                     finished.append(t)     # 下载移到打点循环之后，不阻塞其他任务
                 elif st == "cancelled":
                     task_store.update_row(t["row_idx"], **{COL_STATUS: st})
                     task_store.bump(t["row_idx"], COL_CANCEL)
-                    task_store.record_run_end(t["job_id"], st)
+                    task_store.record_run_end(t["job_id"], st, cloud=s)
                     ctx.info(st)
                 else:  # failed
                     task_store.update_row(t["row_idx"], **{COL_STATUS: st})
-                    task_store.record_run_end(t["job_id"], st,
+                    task_store.record_run_end(t["job_id"], st, cloud=s,
                                               error=str(s.get("error", "")))
                     ctx.info(st)
 

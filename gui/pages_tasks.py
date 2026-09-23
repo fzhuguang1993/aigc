@@ -22,9 +22,11 @@ from workers.submit import (do_submit, cancel_one, SubmitOptions,
 from gui.dialogs import (TaskDialog, FindReplaceDialog, ForceRerunDialog,
                          ScriptBindDialog)
 from gui.delegates import ProgressDelegate, ProgressRole
+from gui.formatting import secs
 from gui.widgets import VideoPlayerDialog, HoverPreview, Toast
 from gui.header import page_header
-from gui.tablekit import FieldManagerDialog, apply_field_layout, enable_drag_with_lock
+from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
+                          SecsItem)
 
 STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
                  "cancelled": "#8F959E", "submitted": "#3370FF", "queued": "#3370FF",
@@ -38,14 +40,16 @@ STATUS_ICONS = {"completed": "✓ ", "succeeded": "✓ ", "failed": "✕ ", "err
 # 列表字段全量展示（含以前的隐藏技术字段），“字段管理”里逐个可勾可拖：
 # 任务一多，使用者需要自己能控制看哪几列、列序怎么排
 DATA_HEADERS = ["任务ID", "编号", "品名", "备注", "脚本", "提示词", "状态", "时长",
-                "执行用时", "账号", "运行", "成功", "取消", "口播文案", "分镜数",
+                "生成用时", "排队", "账号", "运行", "成功", "取消", "口播文案", "分镜数",
                 "更新时间", "输出文件", "job_id", "URL"]
 HEADERS = [""] + DATA_HEADERS          # 第 0 列：勾选框
 CHECK_COL = 0
 COL_PID, COL_NUM, COL_PRODUCT, COL_REMARK, COL_SCRIPT, COL_PROMPT, COL_STATUS, \
-    COL_DUR, COL_RUNSEC, COL_ACCOUNT, COL_RUNS, COL_OK, COL_CANCEL, COL_VOICE, \
+    COL_DUR, COL_GEN, COL_QUEUE, COL_ACCOUNT, COL_RUNS, COL_OK, COL_CANCEL, COL_VOICE, \
     COL_STORY, COL_UPDATED, COL_OUT, COL_JOB, COL_URL = range(1, len(DATA_HEADERS) + 1)
-NUM_COLS = (COL_PID, COL_RUNS, COL_OK, COL_CANCEL, COL_DUR, COL_RUNSEC, COL_STORY)
+NUM_COLS = (COL_PID, COL_RUNS, COL_OK, COL_CANCEL, COL_DUR, COL_GEN, COL_QUEUE, COL_STORY)
+# 两个时长列走 SecsItem：显示「4分58秒」而排序按秒数（按文本排会乱）
+SECS_COLS = (COL_GEN, COL_QUEUE)
 STRETCH_COLS = (COL_PROMPT, COL_OUT)
 # 单击/空格弹出全文预览的三列（提示词/脚本/口播文案），值即 df 列名
 PREVIEW_COLS = {COL_PROMPT: "提示词", COL_SCRIPT: "脚本", COL_VOICE: "口播文案"}
@@ -64,6 +68,28 @@ STATUS_FILTERS = [("全部", None),
                   ("已取消", ("cancelled",))]
 NO_TAG = "（无备注）"        # 备注下拉的虚拟选项：一筛就只看没标的
 BLANK = "（未填）"
+
+
+def _dur_tip(row, kind):
+    """「生成用时 / 排队」两列的 tooltip：先说清这一列是什么，再把三段数字对上
+
+    kind 就两个取值："gen" / "queue"。早期没存云端时间戳的记录显示的是
+    含排队的总用时，不标出来就会被当成纯生成耗时拿去比。"""
+    try:
+        gen = int(row["生成用时"] or 0)
+        q = int(row["排队用时"] or 0)
+        unsplit = bool(row["用时含排队"])
+    except (TypeError, ValueError, KeyError):
+        return ""
+    if not gen and not q:
+        return "还没执行过：没得可统计"
+    total = f"排队 {secs(q)} + 生成 {secs(gen)} = 提交到完成 {secs(gen + q)}"
+    if unsplit:
+        return (f"早期记录没拆出排队：这个数是提交到完成一共 {secs(gen)}"
+                if kind == "gen" else "早期记录没拆出排队（可用回填脚本补）")
+    if kind == "gen":
+        return f"云端开始跑 → 出片：{secs(gen)}\n{total}"
+    return f"提交 → 云端开始跑：{secs(q)}（单并发线路批量提交时这段最长）\n{total}"
 
 
 def decide_rerun(items, force, inflight, choice):
@@ -354,7 +380,8 @@ class TasksPage(QWidget):
         for c in STRETCH_COLS:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
         widths = {COL_PID: 60, COL_NUM: 50, COL_PRODUCT: 110, COL_REMARK: 110,
-                  COL_SCRIPT: 90, COL_STATUS: 130, COL_DUR: 52, COL_RUNSEC: 80,
+                  COL_SCRIPT: 90, COL_STATUS: 130, COL_DUR: 52, COL_GEN: 80,
+                  COL_QUEUE: 62,
                   COL_ACCOUNT: 70, COL_RUNS: 50, COL_OK: 50, COL_CANCEL: 50,
                   COL_VOICE: 90, COL_STORY: 56, COL_UPDATED: 95,
                   COL_JOB: 110, COL_URL: 160}
@@ -686,7 +713,7 @@ class TasksPage(QWidget):
         self._update_run_summary(actives)
 
     def _make_item(self, tid, row, r, c, ats, status, out_path):
-        item = QTableWidgetItem()
+        item = SecsItem(0) if c in SECS_COLS else QTableWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, tid)     # 行→任务ID，排序后仍可靠
         pct = None
         if c == CHECK_COL:
@@ -758,15 +785,20 @@ class TasksPage(QWidget):
                 item.setData(Qt.ItemDataRole.DisplayRole, d)   # 数值排序
             item.setText(f"{d}秒" if d else "—")
             item.setToolTip("本任务最后一次提交选的视频时长（执行后自动登记）")
-        elif c == COL_RUNSEC:
+        elif c == COL_GEN:
             try:
-                d = int(row["执行用时"] or 0)
+                d = int(row["生成用时"] or 0)
             except (TypeError, ValueError):
                 d = 0
-            if d:
-                item.setData(Qt.ItemDataRole.DisplayRole, d)   # 数值排序
-            item.setText(f"{d // 60}分{d % 60}秒" if d >= 60 else (f"{d}秒" if d else "—"))
-            item.setToolTip("最近一次有用时记录的云端执行耗时")
+            item.set_secs(d)
+            item.setToolTip(_dur_tip(row, "gen"))
+        elif c == COL_QUEUE:
+            try:
+                d = int(row["排队用时"] or 0)
+            except (TypeError, ValueError):
+                d = 0
+            item.set_secs(d)
+            item.setToolTip(_dur_tip(row, "queue"))
         elif c == COL_ACCOUNT:
             item.setText(str(row["账号"]))
         elif c == COL_RUNS:
