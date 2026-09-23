@@ -105,6 +105,7 @@ def unique_path(directory, stem, suffix):
 
 # ---------------- 文案样本库（追加式 CSV，供后期喂大模型学写脚本） ----------------
 CORPUS_FIELDS = ["提取时间", "平台", "视频标题", "原文链接", "文案"]
+CORPUS_NAME = "文案样本库.csv"      # 全软件只用这一个文件名，界面提示与落盘共用
 
 _PLATFORMS = (("douyin", "抖音"), ("iesdouyin", "抖音"), ("kuaishou", "快手"),
               ("gifshow", "快手"), ("weixin.qq", "视频号"), ("channels", "视频号"),
@@ -209,38 +210,72 @@ def save_api_config(api_dir, base, uid, key, secret=None):
     f.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _one_line(value):
+    """字段内换行折成空格：样本库的硬约定是**一行一条记录**。
+
+    CSV 本身允许字段里带换行（引号包着），Excel 里还是一行，但用记事本/
+    grep/`wc -l` 看就会“一条记录拆成好几行”，批 5 条链接也像只写了一行。
+    口播文案本身是一段连续口语，折行不损语料价值。"""
+    return re.sub(r"[\r\n]+", " ", str(value or "")).strip()
+
+
+def _ensure_header(csv_path, log=None):
+    """保证第一行是表头（新建补写；老文件缺表头则整份前置一行）。
+
+    没表头的 csv 在 Excel 里会把第一条语料当成列名，整列错位；而旧实现只在
+    “文件不存在”时写表头——手写一份空 csv、或上代版本遗留无表头文件，就永远补不回来。"""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerow(CORPUS_FIELDS)
+        return
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        if next(csv.reader(f), None) == CORPUS_FIELDS:
+            return                          # 常见路径：表头已在，不动文件
+    body = csv_path.read_text(encoding="utf-8-sig")
+    tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(CORPUS_FIELDS)
+        f.write(body)
+    tmp.replace(csv_path)                   # 一次性修复，后续追加不再走到这里
+    if log:
+        log("  · 样本库缺表头，已自动补上")
+
+
 def append_corpus(csv_path, title, share_url, text, log=None):
     """向样本库 CSV 追加一条文案（utf-8-sig，Excel 双击不乱码）。
 
-    同一原文链接不重复写入；写失败不阻断主流程，只记提醒。返回是否新写入。
+    三条硬约定（都是针对“看着像被覆盖”的坑）：
+    1. **只追加、不覆写、不去重**：提取到一条文案就多一行，同一链接重复提取也各自
+       留痕（靠「提取时间」区分先后）。旧版按原文链接去重，同一条链接第二次提取
+       “什么都没发生”，看着就像前面的记录被覆盖了。
+    2. **一行一条记录**：一条链接一行，批量提取 N 条就是 N 行，字段内换行被折掉。
+    3. **首行必是表头**：`提取时间,平台,视频标题,原文链接,文案`，缺了自动补。
+
+    写失败不阻断主流程，只记提醒。返回是否写入。
     """
     try:
         csv_path = Path(csv_path)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-        exists = csv_path.exists()
-        if exists:   # 防重：同一链接只收一次
-            with open(csv_path, encoding="utf-8-sig", newline="") as f:
-                if any(row.get("原文链接") == share_url
-                       for row in csv.DictReader(f)):
-                    if log:
-                        log("  · 文案已在样本库（链接重复，不追加）")
-                    return False
-        new = not exists
+        _ensure_header(csv_path, log)
+        # "a" + utf-8-sig：TextIOWrapper 只在文件为空时写 BOM，追加不会在中间插字节
         with open(csv_path, "a", encoding="utf-8-sig", newline="") as f:
             w = csv.DictWriter(f, fieldnames=CORPUS_FIELDS)
-            if new:
-                w.writeheader()
             w.writerow({"提取时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "平台": guess_platform(share_url),
-                        "视频标题": (title or "").strip(),
-                        "原文链接": share_url,
-                        "文案": text.strip()})
+                        "视频标题": _one_line(title),
+                        "原文链接": _one_line(share_url),
+                        "文案": _one_line(text)})
         if log:
-            log(f"  ✓ 样本库追加 1 条 → {csv_path.name}")
+            # 报绝对路径：样本库不在输出目录里时，只报文件名会让人以为“写到的不是这份”
+            # （不回头数总行数：一批 N 条就要全量读 N 遍，改到收尾时统一报一次）
+            log(f"  ✓ 样本库已追加 1 条 → {csv_path}")
         return True
     except OSError as e:
         if log:
-            log(f"  ⚠ 样本库写入失败（不影响本次提取）：{e}")
+            log(f"  ⚠ 样本库写入失败（不影响本次提取）：{e}"
+                + ("　←文件正被 Excel/WPS 占用？关掉它再提取，别在 Excel 里保存旧副本"
+                   if isinstance(e, PermissionError) else ""))
         return False
 
 
@@ -268,7 +303,7 @@ def extract_one(share_url, base, uid, key, out_dir,
                 corpus_file=None, log=None, should_stop=None):
     """处理一条分享链接：去水印视频/图集（dsp）+ 文案（wenan）。
 
-    corpus_file 不为空时，提取到的文案同步追加进样本库 CSV。
+    corpus_file 不为空时，提取到的文案同步**追加**进样本库 CSV（只追不盖）。
     返回 (落盘文件列表, 警告说明列表)；接口失败抛异常由调用方按条记录。
     """
     def _log(msg):
@@ -318,14 +353,16 @@ def extract_one(share_url, base, uid, key, out_dir,
         text = (w.get("text") or w.get("title") or "").strip()
         stem = stem or safe_title(w.get("title") or text[:20])
         if text:
+            # unique_path 是“不覆写”的关键：write_text 是截断写，同名就会冲掉上一条
+            # 文案；靠它遇到同名自动 _2/_3，历史上提过的文案永不丢。
             p = Path(unique_path(out_dir, stem, ".txt"))
             p.write_text(f"{text}\n\n来源：{share_url}\n", encoding="utf-8")
             saved.append(str(p))
             _log(f"  ✓ 文案 → {Path(p).name}")
             if corpus_file:
-                if append_corpus(corpus_file, w.get("title") or stem, share_url,
-                                 text, log=log):
-                    saved.append(str(corpus_file))
+                # 不计入 saved：样本库是旁路语料库，混进去会把“本次落盘 N 个文件”虚增
+                append_corpus(corpus_file, w.get("title") or stem, share_url,
+                              text, log=log)
         else:
             notes.append("文案接口未返回内容")
 

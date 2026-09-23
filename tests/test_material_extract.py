@@ -203,20 +203,123 @@ def test_guess_platform():
     assert me.guess_platform("https://xhslink.com/x") == "其他"
 
 
-def test_append_corpus(tmp_path):
+def test_append_corpus_only_appends(tmp_path):
+    """只追加、不覆写、不去重：提取一条就多一行，同一链接重复提取也各自留痕
+
+    旧版按原文链接去重，同一条链接第二次提取“什么都没发生”，语料反而看着被覆盖了。"""
     import csv
     f = tmp_path / "文案样本库.csv"
     assert me.append_corpus(f, "标题A", "https://v.douyin.com/a", "文案正文A")
-    # 同一链接重复提取：不重复写入
-    assert not me.append_corpus(f, "标题A", "https://v.douyin.com/a", "文案正文A")
-    assert me.append_corpus(f, "标题B", "https://weixin.qq.com/sph/b", "文案，含逗号\n换行")
+    assert me.append_corpus(f, "标题A", "https://v.douyin.com/a", "文案后来改了")
+    assert me.append_corpus(f, "标题B", "https://weixin.qq.com/sph/b", "文案，含逗号")
     with open(f, encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.DictReader(fh))
     assert [r["原文链接"] for r in rows] == ["https://v.douyin.com/a",
+                                             "https://v.douyin.com/a",
                                              "https://weixin.qq.com/sph/b"]
-    assert rows[0]["平台"] == "抖音" and rows[1]["文案"] == "文案，含逗号\n换行"
-    # utf-8-sig：Excel 双击打开不乱码
-    assert f.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert [r["文案"] for r in rows[:2]] == ["文案正文A", "文案后来改了"]
+    assert rows[2]["平台"] == "视频号"
+    raw = f.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")        # utf-8-sig：Excel 双击不乱码
+    assert raw.count(b"\xef\xbb\xbf") == 1        # 追加不在中间插 BOM（否则多出一列乱码）
+
+
+def test_corpus_has_header_and_one_row_per_link(tmp_path):
+    """表头必在第一行，且一行就是一条记录（字段内换行被折成空格）"""
+    import csv
+    f = tmp_path / "文案样本库.csv"
+    me.append_corpus(f, "标题A", "https://v.douyin.com/a", "第一段\n换行也算一条")
+    me.append_corpus(f, "标题B\r\n带回车", "https://v.douyin.com/b", "第二段\r\n正文")
+    lines = f.read_text(encoding="utf-8-sig").splitlines()
+    assert lines[0] == "提取时间,平台,视频标题,原文链接,文案"
+    assert len(lines) == 3                        # 表头 + 2 条，不被内嵌换行撑成4行
+    with open(f, encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["视频标题"] for r in rows] == ["标题A", "标题B 带回车"]
+    assert rows[0]["文案"] == "第一段 换行也算一条"
+
+
+def test_corpus_heals_missing_header(tmp_path):
+    """遗留/手写的无表头文件：自动补上表头，老数据一行不丢
+
+    没表头时 Excel 会把第一条语料当列名，整列错位；旧版只在“文件不存在”时写表头。"""
+    import csv
+    f = tmp_path / "文案样本库.csv"
+    f.write_text("2026-09-21 14:44:00,视频号,老标题,https://v.douyin.com/old,老文案\n",
+                 encoding="utf-8-sig", newline="")
+    assert me.append_corpus(f, "新标题", "https://v.douyin.com/new", "新文案")
+    with open(f, encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["视频标题"] for r in rows] == ["老标题", "新标题"]
+
+
+def test_corpus_appends_every_link_in_batch(monkeypatch, tmp_path):
+    """批量粘多条链接：CSV 里每条一行（不合并、不遗漏），提取时间逐条记录"""
+    import csv
+    seq = {"n": 0}
+
+    def fake_get(url, **k):
+        if "params" not in k:
+            return FakeResp()
+        seq["n"] += 1
+        return FakeResp({"code": 200, "data": {"title": f"作品{seq['n']}",
+                                               "text": f"第{seq['n']}段口播"}})
+
+    monkeypatch.setattr(me.requests, "get", fake_get)
+    corpus = tmp_path / "文案样本库.csv"
+    urls = ["https://v.douyin.com/a", "https://v.douyin.com/b", "https://v.douyin.com/c"]
+    for u in urls:                                # 面板就是这么逐条调的
+        me.extract_one(u, "b", "u", "k", tmp_path, set(), set(),
+                       want_video=False, want_images=False, corpus_file=corpus)
+    with open(corpus, encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["原文链接"] for r in rows] == urls
+    assert [r["文案"] for r in rows] == ["第1段口播", "第2段口播", "第3段口播"]
+
+
+def test_corpus_tolerates_duplicate_links_in_one_paste(tmp_path):
+    """一批里粘了重复链接：提链环节先去重（不重复下载），但 CSV 仍一行一条不丢
+
+    两层口径得分清楚：同一批里的重复链接只提一次，跨批次重复提取则多一行留痕。"""
+    urls = me.extract_share_urls("https://v.douyin.com/a\nhttps://v.douyin.com/a\n"
+                                 "https://v.douyin.com/b")
+    assert urls == ["https://v.douyin.com/a", "https://v.douyin.com/b"]
+    f = tmp_path / "文案样本库.csv"
+    for u in urls:
+        assert me.append_corpus(f, "标题", u, "正文")
+    assert f.read_text(encoding="utf-8-sig").splitlines()[0] == \
+        "提取时间,平台,视频标题,原文链接,文案"
+    assert len(f.read_text(encoding="utf-8-sig").splitlines()) == 3   # 表头 + 2 条
+
+
+def test_extract_one_corpus_accumulates_across_runs(monkeypatch, tmp_path):
+    """同一条链接跑两轮：CSV 两行都在，且样本库不计入「本次落盘文件」（统计不虚增）"""
+    import csv
+
+    def fake_get(url, **k):
+        if "params" not in k:
+            return FakeResp()
+        data = ({"title": "同一标题", "video": ""} if k["params"]["type"] == "dsp"
+                else {"title": "同一标题", "text": "口播正文"})
+        return FakeResp({"code": 200, "data": data})
+
+    monkeypatch.setattr(me.requests, "get", fake_get)
+    corpus = tmp_path / "文案样本库.csv"
+    url = "https://v.douyin.com/abc"
+    products = []
+    for _ in range(2):
+        saved, _notes = me.extract_one(
+            url, "b", "u", "k", tmp_path, set(), set(),
+            want_video=False, want_images=False, corpus_file=corpus, log=lambda m: None)
+        products += [Path(p).name for p in saved]
+    # 单条 txt 靠 unique_path 错名：第二条不会截断覆写第一条
+    assert sorted(products) == ["同一标题.txt", "同一标题_2.txt"]
+    assert str(corpus) not in products
+    with open(corpus, encoding="utf-8-sig", newline="") as fh:
+        assert [r["文案"] for r in csv.DictReader(fh)] == ["口播正文", "口播正文"]
+    # 两份 txt 内容都在（没被后一份截断写冲掉）
+    assert (tmp_path / "同一标题.txt").read_text(encoding="utf-8").strip()
+    assert (tmp_path / "同一标题_2.txt").read_text(encoding="utf-8").strip()
 
 
 def test_extract_one_writes_corpus(monkeypatch, tmp_path):
@@ -231,7 +334,8 @@ def test_extract_one_writes_corpus(monkeypatch, tmp_path):
                               set(), set(), want_video=False, want_images=False,
                               corpus_file=corpus)
     assert corpus.exists() and "每天两条" in corpus.read_text(encoding="utf-8-sig")
-    assert str(corpus) in saved
+    # CSV 不在 saved 里：它是旁路语料库，混进产物列表会把“落盘 N 个文件”虚增
+    assert str(corpus) not in saved and any(p.endswith(".txt") for p in saved)
 
 
 def test_extract_one_wenan_title_fallback(monkeypatch, tmp_path):

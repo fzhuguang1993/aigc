@@ -866,9 +866,10 @@ class MaterialPanel(BasePanel):
         self.api_cfg_box.setVisible(False)
         outer.addWidget(self.api_cfg_box)
 
-        tip = QLabel("直链域名白名单变更无需重新打包：重新导入名单即生效；"
-                     "文案成功后追加到同目录「文案样本库.csv」（积累样本，后期喂大模型学写脚本）")
+        tip = QLabel("直链域名白名单变更无需重新打包：重新导入名单即生效；文案每提取一条"
+                     "追加一行到「文案样本库.csv」（只追加不覆盖，换输出目录也不影响）")
         tip.setObjectName("InlineTip")
+        tip.setToolTip(str(Path(MATERIAL_DIR) / "素材提取" / "文案样本库.csv"))
         outer.addWidget(tip)
 
         self._load_api()                            # 生效值 = api_config.json > 程序默认
@@ -1019,7 +1020,10 @@ class MaterialPanel(BasePanel):
             return None
         out_dir = Path(self.ed_out.text().strip() or str(Path(MATERIAL_DIR) / "素材提取"))
         out_dir.mkdir(parents=True, exist_ok=True)
-        corpus = out_dir / "文案样本库.csv"      # 追加式样本库，跨批次沉淀
+        # 样本库固定在默认素材目录下，**不跟着“保存到”漂**：旧实现是
+        # `输出目录/文案样本库.csv`，换个子目录（按日期分文件夹很常见）等于另起
+        # 一份新库，老行还在原目录里，看着就像“新提取一条把前面的覆盖了”。
+        corpus = Path(MATERIAL_DIR) / "素材提取" / me.CORPUS_NAME
         want = (self.ck_video.isChecked(), self.ck_text.isChecked(),
                 self.ck_images.isChecked())
 
@@ -1068,13 +1072,23 @@ class MaterialPanel(BasePanel):
                     fails += 1
                     log(f"  ✗ 失败：{e}")
                 progress(i + 1, len(urls), "")
-            return {"saved": saved, "fails": fails, "total": len(urls)}
+            return {"saved": saved, "fails": fails, "total": len(urls),
+                    "corpus": str(corpus) if want[1] else ""}
         return fn
 
     def on_result(self, res):
         if isinstance(res, dict):
             self._append_log(f"提取完成：落盘 {len(res['saved'])} 个文件，"
                              f"失败 {res['fails']}/{res['total']} 条 → {self.ed_out.text()}")
+            if res.get("corpus"):
+                # 报绝对路径 + 当前累计行数：一眼确认“前面的行还在”，而不是被覆写了
+                try:
+                    import csv as _csv
+                    with open(res["corpus"], encoding="utf-8-sig", newline="") as f:
+                        n = sum(1 for _ in _csv.DictReader(f))
+                    self._append_log(f"文案样本库（共 {n} 条，只追加不覆盖）：{res['corpus']}")
+                except OSError:
+                    pass
             if res["saved"]:
                 open_path(self.ed_out.text())
 
