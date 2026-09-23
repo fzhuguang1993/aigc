@@ -108,21 +108,61 @@ def _normalize_account_base(url):
 
 
 def _normalized_accounts(accounts):
-    return [{**a, "base": _normalize_account_base(a["base"])}
-            if isinstance(a, dict) and a.get("base") else a
-            for a in accounts]
+    """线路条目归一化：补 /api/v1、补 name/concurrency、容许写成纯字符串。
+
+    `AccountState` 是裸取 `cfg["name"]/["base"]/["concurrency"]` 的，手写
+    config.json 或内置项少一个键就会在 import 阶段 KeyError，整个软件起不来；
+    base 为空的条目本身就没法用，直接丢掉（与 gui.pages_settings.parse_lines 同口径）。"""
+    out = []
+    for i, a in enumerate(accounts or []):
+        if isinstance(a, str):                      # 允许只写一个地址
+            a = {"base": a}
+        if not isinstance(a, dict):
+            continue
+        base = str(a.get("base") or "").strip()
+        if not base:
+            continue
+        try:
+            conc = int(a.get("concurrency") or 1)
+        except (TypeError, ValueError):
+            conc = 1
+        out.append({**a, "name": str(a.get("name") or f"acc{i + 1}"),
+                    "base": _normalize_account_base(base),
+                    "concurrency": max(conc, 1)})
+    return out
+
+
+def _is_placeholder(entry):
+    """模板占位（从 config_local.example.py 抄来的 `<服务地址>` 之类）不算真线路"""
+    base = str((entry.get("base") if isinstance(entry, dict) else entry)
+               or "").strip()
+    return not base or base.startswith("<") or "服务地址" in base
+
+
+def defaults_accounts():
+    """打包内置的默认线路（维护机的 core/config_local.py 编进 exe）。
+    有内置值时，首次配置只问姓名，不再让同事填地址。"""
+    try:
+        from core.config_local import ACCOUNTS as _A
+    except (ImportError, AttributeError):
+        # ImportError：没这份文件（仓库克隆）；AttributeError：文件在但没定义
+        # ACCOUNTS（只配了提取接口凭证）——两种都退回“让使用者自己填地址”，
+        # 不能在这里抛异常把整个软件卡在 import 阶段。
+        return []
+    return _normalized_accounts([a for a in list(_A) if not _is_placeholder(a)])
 
 
 def _load_local_config():
-    """返回 (accounts, user_name)"""
+    """返回 (accounts, user_name)：config.json 优先，没线路时回退内置默认。
+
+    “有 config.json 但里面没 accounts”是正常状态：开发机首配只存姓名
+    （线路每次启动现读 config_local.py，改内置地址立刻生效），
+    所以空列表不能当成“用户把线路删光了”，设置页本来就拦着不许保存空线路。"""
     if CONFIG_JSON.exists():
         data = _json_data()
-        return data.get("accounts", []), data.get("user_name", "")
-    try:
-        from core.config_local import ACCOUNTS as _A
-        return list(_A), ""
-    except ImportError:
-        return [], ""
+        accounts = data.get("accounts") or defaults_accounts()
+        return accounts, data.get("user_name", "")
+    return defaults_accounts(), ""
 
 
 _accounts, USER_NAME = _load_local_config()

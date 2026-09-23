@@ -10,7 +10,7 @@ from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QHeaderView, QMessageBox, QCheckBox, QApplication,
-                               QFileDialog, QInputDialog)
+                               QFileDialog, QInputDialog, QAbstractItemView)
 
 from core.config import (CONFIG_JSON, USER_NAME, ACCOUNTS, SCRIPT_CHECK,
                          DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR)
@@ -130,21 +130,29 @@ class SettingsPage(QWidget):
         self.dirs_box.setVisible(False)
         lay.addWidget(self.dirs_box)
 
-        lay.addWidget(QLabel("API 服务地址（一个地址 = 一个账号，双击单元格可编辑）："))
+        lay.addWidget(QLabel("API 服务地址（一个地址 = 一个账号，双击单元格可编辑；"
+                             "拖动/Ctrl 可多选行，删除只弹一次确认）："))
         self.acc_table = QTableWidget(0, 3)
         self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数"])
         self.acc_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.acc_table.setColumnWidth(0, 110)
         self.acc_table.setColumnWidth(2, 70)
+        # 行高兜底：样式表里 QTableWidget::item 有 padding 5px，默认行高（~25px）
+        # 会把地址文字上下裁掉一截，双击编辑时尤其痛苦
+        self.acc_table.verticalHeader().setDefaultSectionSize(36)
+        # 整行选中 + 连续多选：鼠标按住拖就能圈好几行，配合批量删除
+        self.acc_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.acc_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         lay.addWidget(self.acc_table, 1)
 
         bar = QHBoxLayout()
         b_add = QPushButton("＋ 添加地址")
         b_add.setObjectName("GhostBtn")
         b_add.clicked.connect(lambda: self._add_row())
-        b_del = QPushButton("🗑 删除选中行")
+        b_del = QPushButton("🗑 删除所选行")
         b_del.setObjectName("GhostBtn")
-        b_del.clicked.connect(self._del_row)
+        b_del.setToolTip("可先用鼠标拖动多选几行；删除只弹一次确认，一次删掉全部选中行")
+        b_del.clicked.connect(self._del_rows)
         b_check = QPushButton("🔌 测试连通性")
         b_check.setObjectName("GhostBtn")
         b_check.clicked.connect(self._check)
@@ -244,9 +252,21 @@ class SettingsPage(QWidget):
         self.acc_table.setItem(r, 1, QTableWidgetItem(base))
         self.acc_table.setItem(r, 2, QTableWidgetItem(str(conc)))
 
-    def _del_row(self):
-        r = self.acc_table.currentRow()
-        if r >= 0:
+    def _del_rows(self):
+        """批量删除：选中几删几，一次确认全删（旧实现无确认且只能删当前一行）"""
+        rows = sorted({idx.row() for idx in self.acc_table.selectionModel().selectedRows()})
+        if not rows:
+            QMessageBox.information(self, "提示", "先用鼠标点选/拖选要删的线路行")
+            return
+        names = "、".join(self.acc_table.item(r, 0).text() or f"第{r + 1}行"
+                          for r in rows[:6]) + ("…" if len(rows) > 6 else "")
+        if QMessageBox.question(
+                self, "删除线路",
+                f"确定删除选中的 {len(rows)} 条线路？（{names}）\n"
+                "删除后仍需点「💾 保存设置」才写入配置。") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        for r in reversed(rows):              # 从大到小删，行号不位移
             self.acc_table.removeRow(r)
 
     def _pick_dir(self, ed):

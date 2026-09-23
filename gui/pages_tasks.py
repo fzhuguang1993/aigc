@@ -267,12 +267,16 @@ class TasksPage(QWidget):
         self.table.setHorizontalHeaderLabels(HEADERS)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        # 不再 NoSelection：启用 Qt 自带的鼠标按住拖框选（橡皮筋），框到的行
+        # 同步勾上勾选框（见 _on_rubber_band），与“跨页勾选”共用同一集合
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setWordWrap(False)
         self.table.setMouseTracking(True)
+        # 框选靠「按下→拖动→松开」自己识别（见 eventFilter）：不用
+        # itemSelectionChanged，否则点一下勾选框取消时被连带选中的行会反手又勾上
         self.table.setItemDelegate(ProgressDelegate(self.table))
         # 勾选列：固定宽度、不参与排序
         self.table.setColumnWidth(CHECK_COL, 36)
@@ -339,6 +343,7 @@ class TasksPage(QWidget):
         self.worker = None
         self._filtered = []        # [(tid, row), ...] 筛选后的全量
         self._selected_ids = set() # 跨页保留的选中集合
+        self._drag_anchor = None   # 鼠标框选的按下起点（区分单击与拖选）
         self._gather_ids = set()   # 上一批需要置顶聚集的任务（替换命中/新导入）
         self._user_sort_col = None # 用户点过的排序列；None=未排序，保留聚集顺序
         self._page = 1
@@ -619,7 +624,8 @@ class TasksPage(QWidget):
             item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             item.setCheckState(Qt.CheckState.Checked if tid in self._selected_ids
                                else Qt.CheckState.Unchecked)
-            item.setToolTip("勾选后可跨页保留，支持批量执行/删除")
+            item.setToolTip("勾选后可跨页保留，支持批量执行/删除；"
+                            "按住鼠标在表上拖出框，框到的行会一次全部勾上")
         elif c == COL_PID:
             item.setData(Qt.ItemDataRole.DisplayRole, tid)
         elif c == COL_NUM:
@@ -743,6 +749,28 @@ class TasksPage(QWidget):
             self._selected_ids.add(tid)
         else:
             self._selected_ids.discard(tid)
+        self._update_sel_label()
+
+    def _on_rubber_band(self):
+        """把当前选中的行勾上（只增不减，取消请点勾或「清除选择」）。
+
+        由 eventFilter 在确认「真的拖动过鼠标」后调用，不挂 itemSelectionChanged：
+        点勾选框取消勾选时该行也会被视为选中，会被反手又勾回去。
+        完事清掉 Qt 高亮：用户真正依赖的是勾选框（跨页保留、驱动批量操作）。"""
+        if self._syncing:
+            return
+        rows = {idx.row() for idx in self.table.selectedIndexes()}
+        self._syncing = True
+        for r in rows:
+            it = self.table.item(r, CHECK_COL)
+            if it is None or it.checkState() == Qt.CheckState.Checked:
+                continue
+            it.setCheckState(Qt.CheckState.Checked)
+            tid = it.data(Qt.ItemDataRole.UserRole)
+            if tid is not None:
+                self._selected_ids.add(tid)
+        self.table.clearSelection()
+        self._syncing = False
         self._update_sel_label()
 
     def _on_header_clicked(self, logical):
@@ -1061,6 +1089,24 @@ class TasksPage(QWidget):
 
     def eventFilter(self, obj, e):
         from PySide6.QtCore import QEvent
+        # 框选识别：在表视口上按住拖动超 16px 后的松开 = 一次框选，把框到的行勾上
+        # （位移不够当普通单击处理，不碰勾选态——否则点勾选框会连带选中互相打架）
+        if obj is self.table.viewport():
+            if e.type() == QEvent.Type.MouseButtonPress \
+                    and e.button() == Qt.MouseButton.LeftButton:
+                self._drag_anchor = e.position().toPoint()
+            elif e.type() == QEvent.Type.MouseButtonRelease \
+                    and e.button() == Qt.MouseButton.LeftButton:
+                anchor = self._drag_anchor
+                self._drag_anchor = None
+                if anchor is not None and \
+                        (e.position().toPoint() - anchor).manhattanLength() > 16:
+                    self._on_rubber_band()
+                else:
+                    # 单击不框选：顺手清掉 Qt 的行高亮。启用框选后单击也会高亮
+                    # 整行，而这里的“真选中”是勾选框（跨页保留、驱动批量操作），
+                    # 留着高亮会让人误以为这行被选上了。
+                    self.table.clearSelection()
         if obj is self.table and e.type() == QEvent.Type.KeyPress \
                 and e.key() == Qt.Key.Key_Space and self._hover_cell:
             self._popup_preview(*self._hover_cell)

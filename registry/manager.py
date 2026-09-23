@@ -9,6 +9,9 @@ registry.py —— 任务注册 + 账号状态 + 负载均衡
    失去对该任务的跟踪。
 2. 负载读数取 max(云端队列, 本机在途)。云端从提交成功到出现在 /jobs 里有几秒
    延迟，只看云端会被自己连续灌穿。
+3. `AccountState.healthy` 默认 True 只表示「还没测过，先当可用」（否则刚开机的
+   几十秒里一条线都不能提交），**不等于检测通过**：展示层必须先问
+   `first_check_done()`，没测过就写「检测中/待检测」，不能画绿灯。
 """
 import random
 import time
@@ -16,8 +19,9 @@ import threading
 
 from core.config import (ACCOUNTS as CONFIG_ACCOUNTS, LOAD_CACHE_TTL, JOBS_LIMIT,
                          LOAD_TIE_BAND, SUBMIT_GATE, GATE_WAIT_TIMEOUT,
-                         GATE_POLL_INTERVAL, BALANCE_RESCAN_EVERY)
-from core.api_client import list_jobs
+                         GATE_POLL_INTERVAL, BALANCE_RESCAN_EVERY,
+                         HEALTH_FAIL_THRESHOLD, HEALTH_CHECK_INTERVAL)
+from core.api_client import list_jobs, health
 from core.logger import raw_info, raw_warning
 
 # 云端任务终态：除了这几个，其余一律视为「还在排队或还在跑」
@@ -95,6 +99,15 @@ class AccountState:
         self.fail_count = 0
 
 ACCOUNTS = [AccountState(c) for c in CONFIG_ACCOUNTS]
+
+# 首轮真实探活是否已完成：`AccountState.healthy` 默认 True 只是「还没测过就先
+# 当作可用」（否则刚开机一分钟都不能提交），但它绝不该被当成检测结果展示。
+# 界面在事件置位前显示「检测中」，避免用户看到一排凭默认值亮起的绿灯。
+FIRST_CHECK_DONE = threading.Event()
+
+
+def first_check_done():
+    return FIRST_CHECK_DONE.is_set()
 
 
 def get_account(name):
@@ -311,19 +324,41 @@ class BatchBalancer:
         return acc
 
 
-def health_monitor_worker():
-    while True:
-        for acc in ACCOUNTS:
+# 一轮检测里的尝试次数：瞬时抖动（网络闪断、云端重启）不该一次就计失败
+HEALTH_ATTEMPTS = 2
+
+
+def check_all_accounts():
+    """逐条线路真实探活一次，更新 healthy/fail_count。
+
+    启动时必须立即跑一遍：旧实现先睡 30 秒才首检，AccountState 默认
+    healthy=True，刚开软件的绿灯全是「缓存的默认值」而非检测结果。"""
+    for acc in ACCOUNTS:
+        fails = 0
+        for _ in range(HEALTH_ATTEMPTS):        # 瞬时抖动重试一次，两次全败才计失败
             try:
-                from core.api_client import health
                 health(acc.base)
-                if not acc.healthy:
-                    raw_info(f"{acc.name} 恢复健康")
-                acc.healthy = True
-                acc.fail_count = 0
-            except Exception as e:
-                acc.fail_count += 1
-                if acc.fail_count >= 3 and acc.healthy:
-                    acc.healthy = False
-                    raw_warning(f"{acc.name} 标记为不可用（连续失败 {acc.fail_count} 次）")
-        time.sleep(30)
+                fails = 0
+                break
+            except Exception:
+                fails += 1
+                if fails < HEALTH_ATTEMPTS:
+                    time.sleep(0.5)
+        if not fails:
+            if not acc.healthy:
+                raw_info(f"{acc.name} 恢复健康")
+            acc.healthy = True
+            acc.fail_count = 0
+        else:
+            acc.fail_count += 1
+            if acc.fail_count >= HEALTH_FAIL_THRESHOLD and acc.healthy:
+                acc.healthy = False
+                raw_warning(f"{acc.name} 标记为不可用（连续失败 {acc.fail_count} 次）")
+    FIRST_CHECK_DONE.set()
+
+
+def health_monitor_worker():
+    check_all_accounts()          # 先检后睡：界面首屏就是真实状态
+    while True:
+        time.sleep(HEALTH_CHECK_INTERVAL)
+        check_all_accounts()

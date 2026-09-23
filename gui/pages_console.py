@@ -53,7 +53,8 @@ class ConsolePage(QWidget):
         self._cloud = {}   # name -> 云端负载 or None
 
     def refresh(self):
-        from registry.manager import ACCOUNTS, REG, is_active
+        from registry.manager import ACCOUNTS, REG, is_active, first_check_done
+        checked = first_check_done()      # 未跑过一轮探活前，healthy 只是默认值
         rows = REG.active()
         self.table.setRowCount(len(ACCOUNTS))
         sum_run = 0
@@ -70,7 +71,13 @@ class ConsolePage(QWidget):
                 cloud_tip = ("含同事提交的任务" if src == "cloud" else
                              "云端负载接口不可用，此数只统计了本机，"
                              "看不到同事占了多少——选线会失真")
-            vals = [acc.name, "🟢 正常" if acc.healthy else "🔴 故障", acc.base,
+            if not checked:
+                status_txt, status_color = "⚪ 待检测", "#8F959E"
+            elif acc.healthy:
+                status_txt, status_color = "🟢 正常", "#1FA45C"
+            else:
+                status_txt, status_color = "🔴 故障", "#E5484D"
+            vals = [acc.name, status_txt, acc.base,
                     acc.concurrency, run, max(acc.concurrency - run, 0),
                     acc.fail_count, cloud_txt]
             for c, v in enumerate(vals):
@@ -78,7 +85,7 @@ class ConsolePage(QWidget):
                 if c != 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if c == 1:
-                    item.setForeground(QColor("#1FA45C" if acc.healthy else "#E5484D"))
+                    item.setForeground(QColor(status_color))
                 if c == 5 and int(v) == 0:
                     item.setForeground(QColor("#F5A623"))
                 if c == 7:
@@ -89,7 +96,8 @@ class ConsolePage(QWidget):
         degraded = sum(1 for v in self._cloud.values() if v and v[1] != "cloud")
         self.lbl_sum.setText(
             f"全部线路合计：本地进行中 {sum_run} 条 · "
-            f"健康线路 {sum(1 for a in ACCOUNTS if a.healthy)}/{len(ACCOUNTS)}"
+            + (f"健康线路 {sum(1 for a in ACCOUNTS if a.healthy)}/{len(ACCOUNTS)}"
+               if checked else f"共 {len(ACCOUNTS)} 条线路（还没跑过检测）")
             + (f" · ⚠ {degraded} 条线路云端接口不可用，负载仅含本机" if degraded else ""))
 
     def _fetch_cloud(self):

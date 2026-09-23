@@ -3,10 +3,11 @@ gui/main_window.py —— 主窗口：左侧导航 + 页面栈 + 状态栏，2 �
 """
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon, QCursor
 from PySide6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                                QListWidget, QStackedWidget, QLabel, QPushButton,
                                QMessageBox)
@@ -70,6 +71,11 @@ class MainWindow(QMainWindow):
         self.lbl_health = QLabel()
         self.lbl_health.setObjectName("SideStatus")
         self.lbl_health.setWordWrap(True)
+        # 灯不是只读装饰：点一下立刻逐条真实探活（后台线程，不卡界面）
+        self.lbl_health.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.lbl_health.setToolTip("点击重新检测全部线路（后台线程，几秒后刷新）")
+        self.lbl_health.mousePressEvent = lambda e: self._recheck_health()
+        self._checking = False
         slay.addWidget(self.lbl_health)
         body.addWidget(sidebar)
 
@@ -121,10 +127,36 @@ class MainWindow(QMainWindow):
         self._update_side_status()
 
     def _update_side_status(self):
-        from registry.manager import ACCOUNTS
+        if self._checking:                # 检测中不被 2 秒定时刷打断
+            return
+        from registry.manager import ACCOUNTS, first_check_done
         from core.config import USER_NAME
-        dots = "  ".join("🟢" if a.healthy else "🔴" for a in ACCOUNTS)
-        self.lbl_health.setText(f"服务：{dots or '无'}\n当前用户：{USER_NAME or '未配置'}")
+        if not first_check_done():
+            # 首轮探活还没回来：此刻的 healthy 只是默认值，不能当结果画成绿灯
+            dots = "检测中…" if ACCOUNTS else "无线路"
+        else:
+            dots = "  ".join("🟢" if a.healthy else "🔴" for a in ACCOUNTS)
+        self.lbl_health.setText(f"服务：{dots}\n当前用户：{USER_NAME or '未配置'}")
+
+    def _recheck_health(self):
+        """手动触发一轮真实检测：绿灯必须是测出来的，不是默认值"""
+        if self._checking:
+            return
+        self._checking = True
+        self.lbl_health.setText("服务：检测中…")
+
+        def run():
+            from registry.manager import check_all_accounts
+            try:
+                check_all_accounts()
+            finally:
+                # 回主线程复位（QTimer.singleShot 线程安全）
+                QTimer.singleShot(0, self._recheck_done)
+        threading.Thread(target=run, daemon=True, name="recheck").start()
+
+    def _recheck_done(self):
+        self._checking = False
+        self._update_side_status()
 
     def open_output_dir(self):
         """打开（并自动创建）输出文件夹"""

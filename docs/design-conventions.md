@@ -41,7 +41,7 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | # | 场景 | 优先 | 回退 | 实现位置 |
 |---|------|------|------|----------|
 | 1 | 运行时目录（DB/日志/输出/ui_state 落地处） | 环境变量 `AIGC_HOME` | 打包版＝**exe 所在目录**，开发版＝**仓库根**（`_runtime_dir()`）。⚠ 绝不能用 `Path.cwd()`：cwd 是「从哪个目录启动」而不是「软件在哪」，换目录启动会另建一份空 `data/aigc.db`，看板从零开始（内测现场就是被这个误判成「统计不持久化」）。（口径单实在 `core/paths.py`，因为首次运行向导要赶在 config 加载前算出目录，不能 `from core.config import`） | `core/paths.py: RUNTIME_DIR` → `core/config.py` |
-| 2 | 用户配置 | 运行目录 `config.json`（首运向导生成） | `core/config_local.py`（开发环境） | `core/config.py: _load_local_config` |
+| 2 | 用户配置 | 配置家 `config.json`（首运向导/首配弹窗生成） | **exe 内置线路**（维护机 `core/config_local.py` 的 `ACCOUNTS`，打包时编进去）→ 首次只问姓名；两者都没有才回退出“自己粘地址”。⚠ `config.json` 里 **没 `accounts` 键也算这种回退**（开发机首配只存姓名，改 `config_local.py` 要能立刻生效） | `core/config.py: _load_local_config/defaults_accounts` |
 | 2b | 账号 base 后缀 | 已是 `…/api/v1` 原样使用 | 缺失时加载端自动补齐（手写 config.json 漏后缀会 POST 打根路径返 405） | `core/config.py: _normalize_account_base` |
 | 3 | 文件命名姓名 | `config.json` 的 `user_name` | Excel「命名规则」sheet | `utils/excel_utils.py: load_name_rule` |
 | 4 | 参考图 | 产品中心该品名登记图片 | 无（为空则不带参考图提交） | `workers/submit.py: build_payload` |
@@ -50,7 +50,7 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 7 | 账号选择 | 健康线路中负载最低，且**负载相近（差 ≤`LOAD_TIE_BAND`）的随机挑一条** | 全部不可用时选 `fail_count` 最小的 | `registry/manager.py: pick_account` |
 | 8 | 提交重试换线 | 其他健康账号中**负载最低的**（`pick_account(exclude=当前)`，换线 + 指数退避 2/4/8s，封顶 10s） | 无备选账号时原账号退避重试 | `workers/submit.py: _next_account / do_submit` |
 | 9 | 口播文案/分镜数自动识别 | 提交链路（执行时）字段为空且能从提示词识别 → 自动补齐（不限时长；口播已有/分镜已识别则不覆盖） | 识别不出留空，规范检测退而用提示词；失败静默不影响提交 | `workers/submit.py: do_submit` + `processors/script_extractor.py: ensure_script_fields` |
-| 10 | 账号健康标记 | `health` 连续成功 | 连续失败 ≥3 次标记不可用，监控线程自动恢复 | `registry/manager.py: health_monitor_worker` |
+| 10 | 账号健康标记 | **启动立即真实探活一轮**（`check_all_accounts` 先检后睡），一轮内 `HEALTH_ATTEMPTS=2` 次全败才计一次失败 | 连续失败 ≥`HEALTH_FAIL_THRESHOLD(3)` 轮才标不可用（防网络闪断误杀），监控线程自动恢复并清零；`healthy` 默认 True 只是“未测先当可用”，展示层靠 `first_check_done()` 先显示「检测中/⚪ 待检测」而不是绿灯；侧栏灯可点击手动重测 | `registry/manager.py: check_all_accounts/health_monitor_worker` + `gui/main_window.py: _recheck_health` |
 | 11 | 下载文件名防撞 | `next_seq()` 扫描已有文件取最大序号 +1 | 序号仍撞名（强制重跑/抽卡时同任务并发多 job）则线性探测下一个可用序号 | `processors/video_processor.py: process_outputs` |
 | 12 | 已完成任务重跑 | 提示词在上次执行后改过 → 自动识别为「迭代执行」，无需确认 | 没改过 → 弹窗确认是否「强制重跑」，单条时可选抽卡次数（同提示词并发多 job） | `store/task_store.py: iter_ready` + `gui/dialogs.py: ForceRerunDialog` |
 | 13 | 任务编辑重置执行态 | 提示词变了 → 重置状态/运行次数（否则永远进不了待办） | 只改品名/脚本 → 不动执行态，不影响迭代/重跑判定 | `gui/pages_tasks.py: _edit_current` |
@@ -69,6 +69,9 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 26 | 任务表列布局与筛选条件 | 「⚙ 字段管理」可增删排序**全部 19 个字段**，布局存 `ui_state.json: tasks_fields`；品名/状态/备注三个下拉筛选与搜索框是 **AND** 关系 | 首次无记录时默认收起 `job_id`/`URL` 两列（技术字段，排障时在字段管理里勾出）；下拉候选值来自 `filter_choices()`（DISTINCT），空档用虚值 `（未填）`/`（无备注）`；重建下拉必须 `blockSignals`，否则 `currentIndexChanged→refresh` 自调递归 | `gui/pages_tasks.py: _restore_field_layout/_sync_filter_choices` + `store/task_store.py: filter_choices` |
 | 27 | 看板统计口径 | 时间范围可选「今日/近7天/近14天/近30天/近90天/**全部（累计）**」，选中的范围跨重启沿用（`ui_state.json: dash_range`） | 「全部」＝`days=None`，从第一条记录累计至今、**永不清零**；没有等长的上一周期可比，故 `prev` 全 0，界面据此把环比改成「累计至今」字样；按天明细只列有记录的天（截最近 60 天） | `store/task_store.py: range_stats/report_stats` + `gui/pages_dashboard.py` |
 | 28 | 云端响应必需字段在 api_client 出口取 | `submit_job` 直接返回 job_id 字符串、`upload_asset` 返 asset_id：都走 `_field()`（容忍 `jobId`/顶层 `id`/`{data:{...}}` 包裹），取不到抛 **ApiError 并回显响应原文** | 绝不在调用方裸取 `resp["job_id"]`：KeyError 到提交层被 `except Exception` 当成「线路故障」，健康线路被接连标不可用，日志只剩一句 `'job_id'`（线上真实踩过，批量提交全线停摊）；万一真冒出意外异常，提交层报 `类型: 消息`（如 `KeyError: 'job_id'`）不留裸一词 | `core/api_client.py: _field` + `workers/submit.py: do_submit` |
+| 29 | 内置线路归一化 | `_normalized_accounts()` 是唯一口径：补 `/api/v1`、补 `name/concurrency`、容许写成纯字符串、丢掉空 base；`defaults_accounts()` 额外剔除模板占位（`<服务地址>`） | 缺文件（ImportError）与有文件但没定义 ACCOUNTS（AttributeError）一律返回 []，回到“自己粘地址”；绝不能在 import 阶段抛异常把软件卡死（`AccountState` 是裸取 `cfg["concurrency"]` 的）。首配写盘走 `setup_wizard.save_first_config()`（弹窗与向导共用）；`_freeze_accounts()`：打包版把内置地址固化进 config.json，开发机只存姓名。⚠ 向导不能 `from core.config import`，`core/setup_wizard.py: _builtin_defaults` 与 config 那份要同步改 | `core/config.py: _normalized_accounts/defaults_accounts` + `core/setup_wizard.py` |
+| 30 | 表格里的“选中”算哪个 | **任务中心：勾选框是唯一口径**（跨页保留、驱动执行/取消/删除/写备注）；鼠标按住拖框（位移 >16px 才算框选）只把框到的行**勾上**并立即清掉 Qt 高亮 | 不用 `itemSelectionChanged`（点勾选框取消时该行也会被当作选中，会反手又勾回去）；单击也清高亮，避免“看着选中了其实没勾”；只增不减，取消靠点勾或「清除选择」 | `gui/pages_tasks.py: _on_rubber_band/eventFilter` |
+| 31 | 多行批量删除的确认次数 | 设置页线路表：整行选中（SelectRows）+ 连续多选（ExtendedSelection），**一次确认删完全部选中行**（从大到小 `removeRow` 避免行号位移） | 未选中只提示不误删；删后仍需点「💾 保存设置」才写盘（不默默改配置）。旧实现无确认且只能删当前一行，多选时弹 N 次窗 | `gui/pages_settings.py: _del_rows` |
 
 ### 4.1 三个文本字段的分工（勿混淆）
 

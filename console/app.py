@@ -12,7 +12,7 @@ from core.config import (COL_PRODUCT, COL_PROMPT, DEFAULT_DURATION,
 from store import db, task_store
 from store.task_store import COL_ID, COL_STATUS, COL_RUNS
 from registry.manager import (REG, ACCOUNTS, get_account, get_account_load,
-                              BatchBalancer)
+                              BatchBalancer, check_all_accounts, first_check_done)
 from workers.submit import do_submit, cancel_one, SubmitOptions
 from workers.scan import print_new_rows, SCAN
 from core.logger import raw_warning, raw_info
@@ -78,6 +78,10 @@ def show_health():
     print("\n" + "=" * 80)
     print("【账号健康 + 负载】")
     print("=" * 80)
+    if not first_check_done():
+        # 默认 healthy=True 只是「还没测」，命令行里当场测一轮再报
+        print("（首次查看，正在逐条真实探活…）")
+        check_all_accounts()
     print(f"{'账号':<8} {'状态':<10} {'负载':<8} {'并发':<8} 地址")
     print("-" * 80)
     for acc in ACCOUNTS:
