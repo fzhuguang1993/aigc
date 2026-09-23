@@ -12,7 +12,8 @@ from core.config import (COL_PRODUCT, COL_PROMPT, DEFAULT_DURATION,
 from store import db, task_store
 from store.task_store import COL_ID, COL_STATUS, COL_RUNS
 from registry.manager import (REG, ACCOUNTS, get_account, get_account_load,
-                              BatchBalancer, check_all_accounts, first_check_done)
+                              BatchBalancer, check_all_accounts, first_check_done,
+                              is_active)
 from workers.submit import (do_submit, cancel_one, SubmitOptions,
                             format_batch_distribution)
 from workers.scan import print_new_rows, SCAN
@@ -204,6 +205,12 @@ def _submit_by_ids(id_list):
             continue
         if balancer and submitted:
             time.sleep(SUBMIT_PACING)   # 批量推送小间隔，仅防连发
+        # 命令行是“你说跑就跑”的排障入口，不拦、不弹确认，但必须提一句：
+        # 旧实现静默多提交一份，新旧两份同时占并发、各下一个成品
+        running = [t for t in REG.get_all_by_row(tid) if is_active(t["status"])]
+        if running:
+            print(f"  ⚠ 任务 {tid} 还有 {len(running)} 个执行没跑完，这次会再提交一份"
+                  f"（共 {len(running) + 1} 份同时在跑）；要先取消请用 GUI「⏹ 取消选中」")
         submitted += 1
         product = str(task.get(COL_PRODUCT) or task["product"] or "").strip()
         jid, err, acc_name = do_submit(tid, product, prompt, _current_options(),

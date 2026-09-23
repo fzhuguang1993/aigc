@@ -109,6 +109,7 @@ QTableCornerButton::section { background: #F5F6F7; border: none; }
 
 #PageTitle { font-size: 20px; font-weight: bold; }
 #PageTip { color: #8F959E; }
+#PageWarn { color: #D83931; font-weight: bold; }
 #InlineTip { color: #3370FF; }
 #DialogTitle { font-size: 18px; font-weight: bold; }
 

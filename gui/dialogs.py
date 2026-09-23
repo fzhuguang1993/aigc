@@ -264,28 +264,50 @@ class FindReplaceDialog(QDialog):
 
 
 class ForceRerunDialog(QDialog):
-    """已完成、但提示词没改过的任务被要求重跑时的确认弹窗；
-    单条重跑时额外提供「抽卡次数」（AI 随机性，同一条提示词多跑几遍挑效果最好的）"""
+    """重跑确认弹窗。两种背景都要它能说清（同一个入口点下去，两类任务可能都有）：
+
+    1. **已跑完但提示词没改**（force）：旧版只会一句“已经执行成功过”，这是原先唯一的
+       弹窗形态；
+    2. **还有执行在云端排队/生成中**（running）：不先取消就重提，新旧两份会同时占
+       并发、各出一个成品（同事反馈现场）。这种情况多一个「⏹ 取消并重跑」按钮，
+       并把它设为默认项。
+
+    单条重跑时额外提供「抽卡次数」（AI 随机性，同一条提示词多跑几遍挑效果最好的）。"""
 
     MAX_REPEAT = 20
 
     def __init__(self, parent=None, task_id=None, count=1, allow_repeat=False,
-                 params_note=""):
+                 params_note="", running=None):
         super().__init__(parent)
         self.setWindowTitle("强制重跑")
         self.setFixedWidth(420)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 20, 24, 20)
+        running = running or {}          # {任务ID: 正在进行的执行个数}
+        # 本次选择：“取消并重跑”与“保留并直接重跑”是两个按钮、一份文案，
+        # 靠 self.cancel_first 区分，不用 QDialog.Accepted 的变体玩花样
+        self.cancel_first = False
 
-        if count == 1:
-            text = (f"任务{task_id} 已经执行成功过，且提示词与上次执行相比没有改动。\n"
-                    "确认要重跑一遍看看效果吗？")
-        else:
-            text = (f"勾选的 {count} 个任务都已执行成功过，且提示词都没有改动。\n"
-                    "确认要把它们各重跑一遍吗？")
-        lbl = QLabel(text)
-        lbl.setWordWrap(True)
-        lay.addWidget(lbl)
+        lines = []
+        if count:
+            if count == 1:
+                lines.append(f"任务{task_id} 已经执行成功过，且提示词与上次执行相比没有改动。\n"
+                             "确认要重跑一遍看看效果吗？")
+            else:
+                lines.append(f"勾选的 {count} 个任务都已执行成功过，且提示词都没有改动。\n"
+                             "确认要把它们各重跑一遍吗？")
+        if running:
+            n_exec = sum(running.values())
+            ids = "、".join(str(t) for t in sorted(running)[:6]) + ("…" if len(running) > 6 else "")
+            lines.append(f"另有 {len(running)} 个任务（共 {n_exec} 个执行）还在云端排队/生成中："
+                         f"任务{ids}")
+            lines.append("直接重跑会让新旧两份同时占并发额度，而且各生成一个成品。")
+        for i, text in enumerate(lines):
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            if i == len(lines) - 1 and running:
+                lbl.setObjectName("PageWarn")     # 最后一句是要避开的那个坑，得显眼
+            lay.addWidget(lbl)
 
         if params_note:
             # 把本次真正会用的参数写脸上：“改了时长/步数没生效”的困惑
@@ -319,18 +341,39 @@ class ForceRerunDialog(QDialog):
         b_cancel = QPushButton("跳过")
         b_cancel.setObjectName("GhostBtn")
         b_cancel.clicked.connect(self.reject)
-        b_ok = QPushButton("强制重跑")
-        b_ok.clicked.connect(self.accept)
         btns.addWidget(b_cancel)
-        btns.addWidget(b_ok)
+        if running:
+            # “保留并直接重跑”得能点到（抽卡补跑、新旧两份都要），但不能是默认项
+            b_keep = QPushButton("🔁 直接重跑")
+            b_keep.setObjectName("GhostBtn")
+            b_keep.setToolTip("不发取消请求，正在跑的那些继续跑完：\n"
+                              "同一任务会新旧两份同时占并发，各自生成一个成品")
+            b_keep.clicked.connect(self.accept)
+            b_do = QPushButton("⏹ 取消并重跑")
+            b_do.setDefault(True)          # 回车就是它：多数情况下这才是想要的
+            b_do.setToolTip("先给还在跑的执行发取消请求，再提交本次的新任务")
+            b_do.clicked.connect(self._pick_cancel_first)
+            btns.addWidget(b_keep)
+            btns.addWidget(b_do)
+        else:
+            b_ok = QPushButton("强制重跑")
+            b_ok.setDefault(True)
+            b_ok.clicked.connect(self.accept)
+            btns.addWidget(b_ok)
         lay.addLayout(btns)
 
+    def _pick_cancel_first(self):
+        self.cancel_first = True
+        self.accept()
+
     @staticmethod
-    def ask(parent, task_id=None, count=1, allow_repeat=False, params_note=""):
-        """确认返回 {"repeat": n}；取消返回 None"""
+    def ask(parent, task_id=None, count=1, allow_repeat=False, params_note="",
+            running=None):
+        """确认返回 {"repeat": n, "cancel_first": bool}；取消（跳过）返回 None"""
         dlg = ForceRerunDialog(parent, task_id=task_id, count=count,
-                               allow_repeat=allow_repeat, params_note=params_note)
+                               allow_repeat=allow_repeat, params_note=params_note,
+                               running=running)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
         repeat = dlg.spin_repeat.value() if dlg.spin_repeat else 1
-        return {"repeat": repeat}
+        return {"repeat": repeat, "cancel_first": dlg.cancel_first}

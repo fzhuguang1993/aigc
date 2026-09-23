@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QMenu, QMessageBox, QFileDialog, QAbstractItemView,
                                QLineEdit, QDateEdit, QCheckBox, QInputDialog, QFrame)
 
-from registry.manager import REG, ACCOUNTS, BatchBalancer
+from registry.manager import REG, ACCOUNTS, BatchBalancer, is_active
 from core.config import DEFAULT_STEPS, SUBMIT_PACING, BALANCE_RESCAN_EVERY
 from store import task_store, product_store, app_state
 from utils.desktop_utils import reveal_in_folder
@@ -66,20 +66,81 @@ NO_TAG = "（无备注）"        # 备注下拉的虚拟选项：一筛就只�
 BLANK = "（未填）"
 
 
+def decide_rerun(items, force, inflight, choice):
+    """把重跑弹窗的答案落到「提交清单 + 待取消清单」上（纯函数，便于回归）
+
+    items    已经确定要提交的（新任务 + 改过提示词的迭代执行）
+    force    需确认才能重跑的（已完成、提示词没改）
+    inflight {任务ID: [还在跑的执行]}，由 REG 算出
+    choice   None = 点「跳过」；否则 {"repeat": n, "cancel_first": bool}
+
+    「跳过」不只跳过 force：正在跑的那几条也要退出本批——它们就是用户不想再
+    加一份的那些，否则“跳过”了还会多出一个成品。返回 (items, to_cancel)。"""
+    if choice is None:
+        drop = {it[0] for it in force} | set(inflight)
+        return [it for it in items if it[0] not in drop], []
+    items = items + [it for it in force for _ in range(choice["repeat"])]
+    to_cancel = ([at for ats in inflight.values() for at in ats]
+                 if choice.get("cancel_first") else [])
+    return items, to_cancel
+
+
+def inflight_execs(tids):
+    """{任务ID: [还在排队/还在跑的执行]}——只看本机本次会话提交过的
+
+    只认 `REG` 不认数据库里的状态：重启后 REG 是空的，而库里的 running
+    可能是上一辈子留下的（轮询线程只管本次会话提交的 job），拿它当
+    “还在跑”会误报，对着一个早就跑完的 job 发取消请求。
+    代价：软件重启后重跑同一任务不会提示“先取消”，那份旧 job 也已脱离跟踪，
+    要去「📡 线路负载」页看云端真实队列。"""
+    out = {}
+    for tid in tids:
+        ats = [at for at in REG.get_all_by_row(tid) if is_active(at["status"])]
+        if ats:
+            out[tid] = ats
+    return out
+
+
+def cancel_inflight(to_cancel, log=None):
+    """提交前先把在跑的执行取消掉，返回 (成功数, 失败数)；log 回调用于播报
+
+    抽出来写成函数而不是写死在 `SubmitWorker.run` 里：取消失败不阻断提交（发
+    不出去就新旧两份同时在跑，得让人看见），但不能为了测它就得去跑一个线程。"""
+    if not to_cancel:
+        return 0, 0
+    if log:
+        log(f"⏹ 先取消 {len(to_cancel)} 个还在跑的执行…")
+    ok = 0
+    for at in to_cancel:
+        if cancel_one(at):
+            ok += 1
+    if log:
+        log(f"⏹ 已发送 {ok}/{len(to_cancel)} 个取消请求"
+            + ("，失败的见日志" if ok < len(to_cancel) else "")
+            + "；云端释放额度要几秒，单并发线路可能要等一下空位")
+    return ok, len(to_cancel) - ok
+
+
 class SubmitWorker(QThread):
     """后台提交线程，避免上传参考图时卡住界面"""
     log_msg = Signal(str)
     all_done = Signal(list)      # 参数：[(任务ID, 失败原因), …]，全部成功时为空列表
 
-    def __init__(self, items, options):
+    def __init__(self, items, options, to_cancel=None):
         super().__init__()
         self.items = items
         self.options = options   # 提交瞬间的选项快照，避免全局态
+        # 提交前先取消的旧执行（「⏹ 取消并重跑」选出来的）：取消也是 HTTP 请求，
+        # 放本线程做而不是 _run 里，否则几十条选中任务能把界面卡住
+        self.to_cancel = to_cancel or []
         self.distribution = ""   # 本批实际落线汇总，跑完后给 _on_submit_done 拼进提示
 
     def run(self):
         failed = []
         landed = []              # 每条提交成功的任务落在哪条线（换线重试后算最终那条）
+        if self.to_cancel:
+            # 先取消再提交：取消也是 HTTP 请求，放本线程做才不卡界面
+            cancel_inflight(self.to_cancel, self.log_msg.emit)
         # 多条一起提交才启用注水分配器：按全局快照+本批投影均衡选线、绕开在途闸门；
         # 单条仍走原有闸门逻辑（balancer=None）
         balancer = (BatchBalancer(len(self.items), rescan_every=BALANCE_RESCAN_EVERY)
@@ -1503,6 +1564,10 @@ class TasksPage(QWidget):
                 return
         else:
             tids = [tid for tid, _ in self._filtered]
+        # 先查哪些任务还有执行在跑（抽卡没结束、跑一半又点了一次「执行选中」）：
+        # 分类口径要靠它——旧实现不查，给还在跑的任务念“已经执行成功过”这种错文案，
+        # 确认后又不取消那份在跑的直接再提交，新旧两份同时占并发、各出一个成品
+        inflight = inflight_execs(tids)
         items = []
         iterated = 0
         force = []                       # 已完成但提示词没改过，需确认是否强制重跑
@@ -1512,6 +1577,10 @@ class TasksPage(QWidget):
                 continue
             prompt = (t["prompt"] or "").strip()
             if not prompt:
+                continue
+            if tid in inflight:
+                # 还在跑的不归“强制重跑”那档：归到提交清单，由同一个弹窗问要不要先取消
+                items.append((tid, t["product"], prompt))
                 continue
             if t["status"] and t["status"] not in RETRYABLE and int(t["runs"] or 0) > 0:
                 # 已完成过：若提示词在上次执行后又改过 → 自动识别为“迭代执行”；
@@ -1527,18 +1596,26 @@ class TasksPage(QWidget):
 
         repeated = 1
         options = self._current_options()      # 一次点击一个快照，弹窗与提交用的是同一组参数
-        if force:
+        to_cancel = []
+        skipped = False
+        if force or inflight:
             single = len(force) == 1 and not items
-            d = ForceRerunDialog.ask(self, task_id=force[0][0] if single else None,
-                                     count=len(force), allow_repeat=single,
-                                     params_note=f"{options.duration}秒 / {options.steps} 步")
-            if d is not None:
-                repeated = d["repeat"]
-                for it in force:
-                    items.extend([it] * repeated)
+            choice = ForceRerunDialog.ask(
+                self, task_id=force[0][0] if single else None,
+                count=len(force), allow_repeat=single,
+                params_note=f"{options.duration}秒 / {options.steps} 步",
+                running={tid: len(ats) for tid, ats in inflight.items()})
+            items, to_cancel = decide_rerun(items, force, inflight, choice)
+            if choice is None:
+                force = []          # 跳过的这批不能再用“含 N 个强制重跑”的口径报
+                skipped = True
+            else:
+                repeated = choice["repeat"]
 
         if not items:
-            self.lbl_tip.setText("没有可执行的任务：请确认已填写提示词；改过提示词的已完成任务会自动按迭代重跑")
+            self.lbl_tip.setText(
+                "已按「跳过」处理：没重跑任何任务，在跑的那几条保持原样" if skipped
+                else "没有可执行的任务：请确认已填写提示词；改过提示词的已完成任务会自动按迭代重跑")
             return
         self.lbl_tip.setText(f"正在提交 {len(items)} 个任务"
                              f"（本次：{options.duration}秒 / {options.steps} 步）"
@@ -1546,8 +1623,9 @@ class TasksPage(QWidget):
                              + (f"；任务{force[0][0]} 抽 {repeated} 次卡"
                                 if repeated > 1 and len(force) == 1
                                 else f"；含 {len(force)} 个强制重跑" if force else "")
+                             + (f"；先取消 {len(to_cancel)} 个在跑的执行" if to_cancel else "")
                              + "…")
-        self.worker = SubmitWorker(items, options)
+        self.worker = SubmitWorker(items, options, to_cancel)
         self._failed_ids = set()      # B3：新一批提交，清空上次的失败标红
         self._expect_done = True       # E3：本批在等完成，跑完后轻提醒
         # 每条进度都带上本批参数：否则一行「✓ 任务6 已提交」就把上面那句
