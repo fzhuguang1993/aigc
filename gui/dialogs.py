@@ -11,7 +11,9 @@ from store import product_store
 
 class TaskDialog(QDialog):
     """task=None 为新建；编辑时传 {"num","product","script","prompt","remark"}
-    品名/脚本均可留空：通版素材可以不关联任何产品/脚本"""
+    品名/脚本均可留空：通版素材可以不关联任何产品/脚本
+    编号不给改：它是文件命名（品名_编号_姓名）和数据行的锚，改了已有
+    产物的对应关系就断了，所以表单里干脆不放编号输入框，只随 data() 透传"""
 
     def __init__(self, parent=None, task=None):
         super().__init__(parent)
@@ -21,8 +23,7 @@ class TaskDialog(QDialog):
         lay.setContentsMargins(24, 20, 24, 20)
 
         form = QFormLayout()
-        self.ed_num = QLineEdit(str(task["num"]) if task else "")
-        self.ed_num.setPlaceholderText("例如 1（用于文件命名）")
+        self._num = str((task or {}).get("num") or "")   # 只做透传，不给编辑
         # 品名：可从产品中心下拉选择，也可手动输入新名称，通版素材可留空
         self.ed_product = QComboBox()
         self.ed_product.setEditable(True)
@@ -47,8 +48,6 @@ class TaskDialog(QDialog):
         self.ed_prompt.setPlainText((task or {}).get("prompt", ""))
         self.ed_prompt.setPlaceholderText("描述你想要的视频内容，越具体生成效果越好…\n"
                                           "支持单元格内多行：换行会原样保存并可预览")
-        if task:
-            form.addRow("编 号", self.ed_num)      # 仅编辑时可改；新建时编号自增，不展示
         form.addRow("品 名", self.ed_product)
         form.addRow("", self.lbl_ref)
         form.addRow("备 注", self.ed_remark)
@@ -122,7 +121,7 @@ class TaskDialog(QDialog):
         super().accept()
 
     def data(self):
-        return {"num": self.ed_num.text().strip(),
+        return {"num": self._num,
                 "product": self.ed_product.currentText().strip(),
                 "remark": self.ed_remark.text().strip(),
                 "script": self.ed_script.toPlainText().strip(),

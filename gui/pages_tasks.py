@@ -1541,7 +1541,8 @@ class TasksPage(QWidget):
                                      "script": t["script"], "prompt": t["prompt"],
                                      "remark": t["remark"]})
         if data:
-            upd = {"编号": data["num"], "品名": data["product"],
+            # 编号不写回：弹窗里已经拿掉输入框，编号建好就不给改（文件命名锚）
+            upd = {"品名": data["product"],
                    "脚本": data["script"], "备注": data["remark"]}
             if data["prompt"] != (t["prompt"] or ""):
                 # 改了提示词才重置执行态；只改脚本不影响迭代/重跑判定
