@@ -30,17 +30,48 @@ def _request(method, url, timeout=30, **kwargs):
     return r
 
 
+# 云端不同接口把载荷包在外层对象里的写法（取键时按顺序拆开再找）
+_ENVELOPES = ("data", "job", "task")
+
+
+def _field(resp_json, *names):
+    """从响应 JSON 里取必需字段（容忍 {data:{...}} 包裹）。
+
+    取不到抛 ApiError 并回显响应原文片段——绝不裸取 json["job_id"]：
+    KeyError 到了提交层会被 except Exception 当成「线路坏了」，
+    健康线路被接连标不可用，日志只剩一句 'job_id'（线上真实踩过）。
+    """
+    node = resp_json if isinstance(resp_json, dict) else {}
+    for key in _ENVELOPES:
+        inner = node.get(key)
+        if isinstance(inner, dict) and any(n in inner for n in names):
+            node = inner
+            break
+    for n in names:
+        value = node.get(n)
+        if value:
+            return value
+    snippet = str(resp_json)[:200]
+    expected = "、".join(names)
+    raise ApiError(f"响应格式异常：云端未返回 {expected}，实际响应：{snippet}")
+
+
 def upload_asset(base, file_path, asset_type="image"):
     # 元组超时：连接 10 秒（地址错时快速失败），大文件读取仍给 300 秒
     with open(file_path, "rb") as f:
         r = _request("POST", f"{base}/assets", timeout=(10, 300),
                      params={"asset_type": asset_type}, files={"file": f})
-    return r.json()["asset_id"]
+    return _field(r.json(), "asset_id", "id")
 
 
 def submit_job(base, payload):
-    """提交生成任务，返回任务 JSON（含 job_id）。失败抛 ApiError。"""
-    return _request("POST", f"{base}/jobs", timeout=(10, 60), json=payload).json()
+    """提交生成任务，直接返回云端给的 job_id 字符串。失败抛 ApiError。
+
+    旧实现返回整个 JSON、由调用方裸取 ["job_id"]：云端换响应格式时报错
+    是一句看不出原因的 'job_id'，这里改在出口处取键+格式异常归因。
+    """
+    return _field(_request("POST", f"{base}/jobs", timeout=(10, 60),
+                           json=payload).json(), "job_id", "jobId", "id")
 
 
 def query_job(base, job_id):

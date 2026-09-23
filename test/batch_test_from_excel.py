@@ -214,7 +214,7 @@ def submit_with_materials(row_idx, product, prompt, ref_text):
     for attempt in range(3):
         try:
             resp = submit_job(acc.base, payload)
-            job_id = resp["job_id"]
+            job_id = resp["job_id"] if isinstance(resp, dict) else resp  # 新版直接返回 job_id 字符串
             ctx.job_id = job_id
             ctx.info("提交成功")
             REG.add(job_id, row_idx, acc.name, prompt, product)

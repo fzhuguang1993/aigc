@@ -68,6 +68,7 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 25 | 备注字段 `remark` | 任务表「备注」列：右键「🏷 写备注」/ 双击该列就地改；已勾选则**批量写同一句**，留空＝清除 | 备注**不参与任何业务判定**（不进 payload、不影响 `prompt_changed_at`/迭代/重跑判定），只走 `update_row`；老库靠 `_MIGRATIONS` 的 `ALTER TABLE` 平滑升级 | `store/db.py` + `store/task_store.py` + `gui/pages_tasks.py: _edit_remark` |
 | 26 | 任务表列布局与筛选条件 | 「⚙ 字段管理」可增删排序**全部 19 个字段**，布局存 `ui_state.json: tasks_fields`；品名/状态/备注三个下拉筛选与搜索框是 **AND** 关系 | 首次无记录时默认收起 `job_id`/`URL` 两列（技术字段，排障时在字段管理里勾出）；下拉候选值来自 `filter_choices()`（DISTINCT），空档用虚值 `（未填）`/`（无备注）`；重建下拉必须 `blockSignals`，否则 `currentIndexChanged→refresh` 自调递归 | `gui/pages_tasks.py: _restore_field_layout/_sync_filter_choices` + `store/task_store.py: filter_choices` |
 | 27 | 看板统计口径 | 时间范围可选「今日/近7天/近14天/近30天/近90天/**全部（累计）**」，选中的范围跨重启沿用（`ui_state.json: dash_range`） | 「全部」＝`days=None`，从第一条记录累计至今、**永不清零**；没有等长的上一周期可比，故 `prev` 全 0，界面据此把环比改成「累计至今」字样；按天明细只列有记录的天（截最近 60 天） | `store/task_store.py: range_stats/report_stats` + `gui/pages_dashboard.py` |
+| 28 | 云端响应必需字段在 api_client 出口取 | `submit_job` 直接返回 job_id 字符串、`upload_asset` 返 asset_id：都走 `_field()`（容忍 `jobId`/顶层 `id`/`{data:{...}}` 包裹），取不到抛 **ApiError 并回显响应原文** | 绝不在调用方裸取 `resp["job_id"]`：KeyError 到提交层被 `except Exception` 当成「线路故障」，健康线路被接连标不可用，日志只剩一句 `'job_id'`（线上真实踩过，批量提交全线停摊）；万一真冒出意外异常，提交层报 `类型: 消息`（如 `KeyError: 'job_id'`）不留裸一词 | `core/api_client.py: _field` + `workers/submit.py: do_submit` |
 
 ### 4.1 三个文本字段的分工（勿混淆）
 

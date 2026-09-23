@@ -72,7 +72,7 @@ class TestSubmitSuccess:
 
         def fake_submit(base, payload):
             assert base == accs["acc1"].base
-            return {"job_id": "job-42"}
+            return "job-42"
 
         monkeypatch.setattr(sub, "submit_job", fake_submit)
         jid, err, acc_name = do_submit(tid, "品名A", "提示词X",
@@ -88,7 +88,7 @@ class TestSubmitSuccess:
         """时长/步数/KOL 必须走显式参数：payload 与 REG 里都应是提交时的快照"""
         captured = {}
         monkeypatch.setattr(sub, "submit_job",
-                            lambda base, payload: captured.update(payload) or {"job_id": "j1"})
+                            lambda base, payload: captured.update(payload) or "j1")
         tid = task_store.add_task("002", "品名B", "提示词Y")
         do_submit(tid, "品名B", "提示词Y", SubmitOptions(duration=12, steps=42))
 
@@ -107,7 +107,7 @@ class TestSubmitSuccess:
         assert SubmitOptions(steps=0).steps == 1
 
     def test_run_record_created(self, accs, monkeypatch):
-        monkeypatch.setattr(sub, "submit_job", lambda base, payload: {"job_id": "j9"})
+        monkeypatch.setattr(sub, "submit_job", lambda base, payload: "j9")
         tid = task_store.add_task("003", "品名C", "提示词Z")
         do_submit(tid, "品名C", "提示词Z", SubmitOptions())
         runs = task_store.list_runs()
@@ -123,7 +123,7 @@ class TestRetryAndFailover:
             calls.append(base)
             if "acc1" in base:
                 raise ApiError("HTTP 502: bad gateway", 502)
-            return {"job_id": "job-77"}
+            return "job-77"
 
         monkeypatch.setattr(sub, "submit_job", flaky)
         sleeps = []
@@ -178,7 +178,7 @@ class TestRetryAndFailover:
             used.append(base)
             if len(used) == 1:
                 raise ApiError("HTTP 500", 500)
-            return {"job_id": "j5"}
+            return "j5"
 
         monkeypatch.setattr(sub, "submit_job", only_log)
         tid = task_store.add_task("006", "品名F", "提示词U")
@@ -209,7 +209,7 @@ class TestPayloadFieldNames:
     def test_payload_only_uses_known_fields(self, accs, monkeypatch):
         captured = {}
         monkeypatch.setattr(sub, "submit_job",
-                            lambda base, payload: captured.update(payload) or {"job_id": "j"})
+                            lambda base, payload: captured.update(payload) or "j")
         tid = task_store.add_task("010", "品名J", "提示词Q")
         do_submit(tid, "品名J", "提示词Q", SubmitOptions(duration=15, steps=50))
 
@@ -224,7 +224,7 @@ class TestPayloadFieldNames:
         """loras 元素同样严格：只认 name / strength"""
         captured = {}
         monkeypatch.setattr(sub, "submit_job",
-                            lambda base, payload: captured.update(payload) or {"job_id": "j"})
+                            lambda base, payload: captured.update(payload) or "j")
         tid = task_store.add_task("011", "品名K", "提示词P")
         do_submit(tid, "品名K", "提示词P", SubmitOptions())
         for lora in captured["parameters"]["loras"]:
@@ -264,7 +264,7 @@ class TestRejectedParams:
                 raise ApiError('HTTP 422: {"details":{"errors":['
                                '{"type":"extra_forbidden",'
                                '"loc":["body","parameters","inference_steps"]}]}}', 422)
-            return {"job_id": "j-healed"}
+            return "j-healed"
 
         monkeypatch.setattr(sub, "submit_job", deny_once)
         tid = task_store.add_task("008", "品名H", "提示词S")
@@ -282,6 +282,19 @@ class TestRejectedParams:
         tid = task_store.add_task("009", "品名I", "提示词R")
         jid, err, _ = do_submit(tid, "品名I", "提示词R", SubmitOptions())
         assert jid is None and "HTTP 400" in err
+
+    def test_unexpected_exception_reported_with_type(self, accs, monkeypatch):
+        """非 ApiError 的意外异常（如 KeyError）：不能只报 'job_id' 这种
+        看不出原因的一词，必须带异常类型；失败原因递到返回值"""
+        def weird(base, payload):
+            raise KeyError("job_id")
+
+        monkeypatch.setattr(sub, "submit_job", weird)
+        tid = task_store.add_task("012", "品名L", "提示词O")
+        jid, err, _ = do_submit(tid, "品名L", "提示词O", SubmitOptions(),
+                                _sleep=lambda s: None)
+        assert jid is None
+        assert "KeyError" in err and "job_id" in err
 
 
 class TestRejectedParamParsing:

@@ -21,7 +21,28 @@ class FakeResp:
 def test_submit_job_success_returns_json(monkeypatch):
     monkeypatch.setattr(api.requests, "request",
                         lambda m, u, **kw: FakeResp(200, {"job_id": "j1"}))
-    assert api.submit_job("http://x/api/v1", {}) == {"job_id": "j1"}
+    assert api.submit_job("http://x/api/v1", {}) == "j1"
+
+
+def test_submit_job_tolerates_alternative_shapes(monkeypatch):
+    """云端响应格式容错：驼峰 jobId / 顶层 id / {data:{...}} 包裹都能取到"""
+    for payload, want in ({"jobId": "j2"}, "j2"), ({"id": "j3"}, "j3"), \
+                         ({"data": {"job_id": "j4"}}, "j4"):
+        monkeypatch.setattr(api.requests, "request",
+                            lambda m, u, _p=payload, **kw: FakeResp(200, _p))
+        assert api.submit_job("http://x/api/v1", {}) == want
+
+
+def test_submit_job_missing_job_id_raises_readable_error(monkeypatch):
+    """回归（线上事故）：云端 200 但没有 job_id 时，旧实现调用方裸取键报
+    KeyError 'job_id'，被提交层当成「线路坏了」误杀健康线路。
+    现在必须抛 ApiError 且把云端响应原文回显出来，一眼看出格式差异"""
+    monkeypatch.setattr(api.requests, "request",
+                        lambda m, u, **kw: FakeResp(200, {"task_uuid": "abc"}))
+    with pytest.raises(api.ApiError) as e:
+        api.submit_job("http://x/api/v1", {})
+    assert "响应格式异常" in str(e.value)
+    assert "task_uuid" in str(e.value)          # 云端实际返回了什么看得见
 
 
 def test_http_error_raises_apierror_with_status(monkeypatch):

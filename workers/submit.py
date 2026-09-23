@@ -238,7 +238,9 @@ def do_submit(row_idx, product, prompt, options=None, *, balancer=None, _sleep=t
                 payload = build_payload(acc.base, prompt, ctx, options, product)
                 built_for = acc.base
             try:
-                job_id = submit_job(acc.base, payload)["job_id"]
+                # submit_job 已在出口处取好 job_id（响应格式异常抛 ApiError
+                # 并回显原文），这里绝不裸取键：KeyError 会被下面当成线路故障
+                job_id = submit_job(acc.base, payload)
                 _register_success(acc, row_idx, job_id, prompt, product,
                                   ctx, options.duration)
                 ctx.info("提交成功")

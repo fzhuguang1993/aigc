@@ -121,7 +121,7 @@ class MockCloud:
                 self.by_account[acc] += 1
                 if self._enable:
                     self._active[job_id] = time.time()
-            return {"job_id": job_id}
+            return job_id          # submit_job 契约：直接返回 job_id 字符串
         finally:
             with self.lock:
                 self.inflight -= 1
