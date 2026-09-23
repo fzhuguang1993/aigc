@@ -5,8 +5,8 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtGui import QShortcut, QKeySequence, QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QHeaderView, QMessageBox, QCheckBox, QApplication,
@@ -18,6 +18,27 @@ from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT
+
+# 线路表列号：末列是行内「打开接口」按钮（setCellWidget，不进 _rows/不写配置）
+COL_NAME, COL_BASE, COL_CONC, COL_OPEN = range(4)
+
+# 行高（px）：微软雅黑 13px 光行距就接近 26px，再叠上全局样式表 item 的
+# 上下 padding，25px 默认行高会把地址文字上下各切一刀；36px 仍顶到边，
+# 现按使用者体感再抬 25%。
+ROW_H = 45
+
+
+def _browser_url(base):
+    """线路地址是给程序打的（带 /api/v1），浏览器要开的是根地址
+
+    直接开 …/api/v1 只会看到一堆接口报错页；补上 http:// 前缀，否则浏览器
+    会把“192.168.0.5:7860”当关键词去搜。"""
+    url = str(base or "").strip().rstrip("/")
+    if url.endswith("/api/v1"):
+        url = url[:-len("/api/v1")]
+    if "://" not in url:
+        url = "http://" + url
+    return url
 
 
 def _same_path(a, b):
@@ -131,15 +152,20 @@ class SettingsPage(QWidget):
         lay.addWidget(self.dirs_box)
 
         lay.addWidget(QLabel("API 服务地址（一个地址 = 一个账号，双击单元格可编辑；"
-                             "拖动/Ctrl 可多选行，删除只弹一次确认）："))
-        self.acc_table = QTableWidget(0, 3)
-        self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数"])
-        self.acc_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.acc_table.setColumnWidth(0, 110)
-        self.acc_table.setColumnWidth(2, 70)
-        # 行高兜底：样式表里 QTableWidget::item 有 padding 5px，默认行高（~25px）
-        # 会把地址文字上下裁掉一截，双击编辑时尤其痛苦
-        self.acc_table.verticalHeader().setDefaultSectionSize(36)
+                             "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」"
+                             "用浏览器看这条线路）："))
+        self.acc_table = QTableWidget(0, 4)
+        self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数", "打开"])
+        self.acc_table.horizontalHeader().setSectionResizeMode(COL_BASE,
+                                                               QHeaderView.ResizeMode.Stretch)
+        self.acc_table.setColumnWidth(COL_NAME, 110)
+        self.acc_table.setColumnWidth(COL_CONC, 70)
+        self.acc_table.setColumnWidth(COL_OPEN, 86)
+        # 行高见 ROW_H；本表再把 item 上下 padding 收到 3px，给文字留出富余
+        self.acc_table.verticalHeader().setDefaultSectionSize(ROW_H)
+        self.acc_table.setStyleSheet(
+            "QTableWidget::item { padding: 3px 8px; border-bottom: 1px solid #EFF0F1; }"
+            "QTableWidget::item:selected { background: #EAF1FF; color: #1F2329; }")
         # 整行选中 + 连续多选：鼠标按住拖就能圈好几行，配合批量删除
         self.acc_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.acc_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -248,17 +274,55 @@ class SettingsPage(QWidget):
     def _add_row(self, name="acc1", base="", conc=1):
         r = self.acc_table.rowCount()
         self.acc_table.insertRow(r)
-        self.acc_table.setItem(r, 0, QTableWidgetItem(name))
-        self.acc_table.setItem(r, 1, QTableWidgetItem(base))
-        self.acc_table.setItem(r, 2, QTableWidgetItem(str(conc)))
+        self.acc_table.setItem(r, COL_NAME, QTableWidgetItem(name))
+        self.acc_table.setItem(r, COL_BASE, QTableWidgetItem(base))
+        self.acc_table.setItem(r, COL_CONC, QTableWidgetItem(str(conc)))
+        self._set_open_btn(r)
+
+    def _set_open_btn(self, r):
+        """每行一个「🌐 打开」：用默认浏览器看这条线路（看服务健不健康、有没有重启）
+
+        按钮不记行号也不记地址：行会被删、地址会被双击改，两个都可能在创建后变，
+        所以点击时现查自己在哪一行、那一行的地址是什么。"""
+        btn = QPushButton("🌐 打开")
+        btn.setObjectName("GhostBtn")
+        btn.setToolTip("用浏览器打开本行接口（自动去掉地址末尾的 /api/v1）")
+        btn.setStyleSheet("padding: 2px 6px;")      # 行内用紧凑内边距，不被全局按钮样式顶大
+        btn.setFixedHeight(30)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Tab 不该跳进行里抢焦点
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda _=False, b=btn: self._open_api(b))
+        self.acc_table.setCellWidget(r, COL_OPEN, btn)
+        return btn
+
+    def _open_api(self, btn):
+        """按按钮所在行取当前地址开浏览器（地址改过就开改后的，不是创建时那一份）"""
+        r = -1
+        for i in range(self.acc_table.rowCount()):
+            if self.acc_table.cellWidget(i, COL_OPEN) is btn:
+                r = i
+                break
+        item = self.acc_table.item(r, COL_BASE) if r >= 0 else None
+        base = item.text().strip() if item else ""
+        if not base:
+            QMessageBox.information(self, "提示", "这一行还没填接口地址")
+            return
+        url = _browser_url(base)
+        if not QDesktopServices.openUrl(QUrl(url)):
+            QMessageBox.warning(self, "打不开", f"系统没能打开浏览器：\n{url}")
 
     def _del_rows(self):
         """批量删除：选中几删几，一次确认全删（旧实现无确认且只能删当前一行）"""
-        rows = sorted({idx.row() for idx in self.acc_table.selectionModel().selectedRows()})
+        sel = self.acc_table.selectionModel()
+        # selectedRows() 要求整行（全部列）都选中才计数，而末列是按钮（只有 widget
+        # 没有 item）——一旦选区没铺满列就会返回空，表现为“点了删除没反应”。
+        # 取两个口径的并集：整行选中与逐格选中都能删干净。
+        rows = sorted({idx.row() for idx in sel.selectedRows()}
+                      | {idx.row() for idx in sel.selectedIndexes()})
         if not rows:
             QMessageBox.information(self, "提示", "先用鼠标点选/拖选要删的线路行")
             return
-        names = "、".join(self.acc_table.item(r, 0).text() or f"第{r + 1}行"
+        names = "、".join(self.acc_table.item(r, COL_NAME).text() or f"第{r + 1}行"
                           for r in rows[:6]) + ("…" if len(rows) > 6 else "")
         if QMessageBox.question(
                 self, "删除线路",
@@ -278,10 +342,10 @@ class SettingsPage(QWidget):
     def _rows(self):
         out = []
         for r in range(self.acc_table.rowCount()):
-            name = self.acc_table.item(r, 0).text().strip()
-            base = self.acc_table.item(r, 1).text().strip()
+            name = self.acc_table.item(r, COL_NAME).text().strip()
+            base = self.acc_table.item(r, COL_BASE).text().strip()
             try:
-                conc = int(self.acc_table.item(r, 2).text())
+                conc = int(self.acc_table.item(r, COL_CONC).text())
             except (TypeError, ValueError):
                 conc = 1
             if base:

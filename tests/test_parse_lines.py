@@ -1,12 +1,12 @@
 """
-tests/test_parse_lines.py —— 线路配置「一键复制 / 粘贴导入」的解析回归
+tests/test_parse_lines.py —— 线路配置纯函数回归（粘贴导入解析 / 行内打开接口）
 
 粘贴入口接受三种来源（本软件复制的输出、纯地址数组、整份 config.json），
 解析失败必须返回 None 而不是抛异常——GUI 据此保持表格原样。
 """
 import json
 
-from gui.pages_settings import parse_lines
+from gui.pages_settings import _browser_url, parse_lines
 
 
 def test_roundtrip_of_copy_output():
@@ -48,3 +48,17 @@ def test_unparseable_input_returns_none():
     """返回 None 而不是抛异常，GUI 才能保持表格不动"""
     for bad in ["", "   ", "不是 JSON", "[1,2,3]", '{"foo": 1}', "[]"]:
         assert parse_lines(bad) is None, bad
+
+
+def test_browser_url_strips_api_v1_for_humans():
+    """行内「🌐 打开」要开根地址：…/api/v1 是给程序打的，浏览器里只能看到接口报错页"""
+    assert _browser_url("http://a.test:7860/api/v1") == "http://a.test:7860"
+    assert _browser_url("http://a.test:7860/api/v1/") == "http://a.test:7860"   # 带尾斜杠
+    assert _browser_url("http://a.test:7860") == "http://a.test:7860"           # 已没后缀
+
+
+def test_browser_url_adds_scheme_for_bare_host():
+    """手写地址漏了 http:// 时，浏览器会把“10.0.0.1:7860”当关键词去搜"""
+    assert _browser_url("10.0.0.1:7860/api/v1") == "http://10.0.0.1:7860"
+    assert _browser_url("  https://x.pod.test ") == "https://x.pod.test"
+    assert _browser_url("") == "http://"          # 空值不抛，由调用方先拦住

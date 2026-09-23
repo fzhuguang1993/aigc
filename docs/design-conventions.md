@@ -73,6 +73,7 @@ core(配置/日志/HTTP) → store(SQLite 持久化) → workers(提交/轮询/�
 | 30 | 表格里的“选中”算哪个 | **任务中心：勾选框是唯一口径**（跨页保留、驱动执行/取消/删除/写备注）；鼠标按住拖框（位移 >16px 才算框选）只把框到的行**勾上**并立即清掉 Qt 高亮 | 不用 `itemSelectionChanged`（点勾选框取消时该行也会被当作选中，会反手又勾回去）；单击也清高亮，避免“看着选中了其实没勾”；只增不减，取消靠点勾或「清除选择」 | `gui/pages_tasks.py: _on_rubber_band/eventFilter` |
 | 31 | 多行批量删除的确认次数 | 设置页线路表：整行选中（SelectRows）+ 连续多选（ExtendedSelection），**一次确认删完全部选中行**（从大到小 `removeRow` 避免行号位移） | 未选中只提示不误删；删后仍需点「💾 保存设置」才写盘（不默默改配置）。旧实现无确认且只能删当前一行，多选时弹 N 次窗 | `gui/pages_settings.py: _del_rows` |
 | 32 | 文案样本库只能追加 | 素材提取的 `文案样本库.csv` **只追加、不覆写、不去重**：提取到一条文案就多一行，同一链接重复提取也各自留痕（靠「提取时间」区分）；**一行一条记录**（字段内换行折成空格，`wc -l` 才等于记录数）；**首行必是表头**，遗留无表头文件自动前置补上；路径固定在 `material/素材提取/`，**不跟着“保存到”漂** | 旧版三宗罪都被当成“前面的记录被覆盖了”：按原文链接去重（重复提取什么都没写）、样本库建在输出目录下（换目录＝换库）、只在文件不存在时写表头。CSV 被 Excel/WPS 占用时追加报 PermissionError → 只记日志不阻断，并提醒别在 Excel 里保存旧副本（那才是真覆盖） | `video_text_tools/material_extract.py: append_corpus/_ensure_header/_one_line` + `gui/tool_panels.py: MaterialPanel._task` |
+| 33 | 表格行内按钮（操作列） | `setCellWidget` 放按钮时，点击回调**只记按钮对象**，行号与单元格值都在点击时现查（`cellWidget(i, COL) is btn` 反查行）；按钮 `NoFocus` 不抢 Tab；列号用模块常量（`COL_NAME/COL_BASE/COL_CONC/COL_OPEN`）而不是魔法数字 | 不能 `lambda row=r, base=base` 捕获创建时的值：行会被删（行号位移）、地址会被双击改，两种都是“点开上一行的地址”；删除后也不重绑按钮（反查天然正确）。行高 45px（`ROW_H`）+ 本表 `item{padding:3px}`：雅黑 13px 行距已接近 26px，默认行高会把地址文字上下切掉。加了 widget 列之后 `selectedRows()` 只在选区铺满全部列时才计数（末列没 item），批删要再并上 `selectedIndexes()` 的行号 | `gui/pages_settings.py: _set_open_btn/_open_api/_del_rows` |
 
 ### 4.1 三个文本字段的分工（勿混淆）
 
