@@ -12,7 +12,7 @@ from core.config import EXPORT_DIR as EXPORT_DIR_STR
 from store import db
 
 COL_ID = "编号"; COL_PRODUCT = "品名"; COL_PROMPT = "提示词"
-COL_SCRIPT = "脚本"; COL_STORYBOARD = "分镜数"
+COL_SCRIPT = "脚本"; COL_STORYBOARD = "分镜数"; COL_TAG = "标签"
 COL_STATUS = "状态"; COL_ACCOUNT = "账号"; COL_JOB_ID = "job_id"
 COL_OUTPUT = "输出"; COL_URL = "URL"; COL_DURATION = "时长"
 COL_RUNS = "运行次数"; COL_SUCCESS = "成功次数"; COL_CANCEL = "取消次数"
@@ -24,10 +24,10 @@ _CN2DB = {"编号": "num", "品名": "product", "提示词": "prompt",
           "输出": "output", "URL": "url",
           "运行次数": "runs", "成功次数": "success", "取消次数": "cancels",
           "口播文案": "script_text", "更新时间": "updated_at", "时长": "duration",
-          "备注": "remark"}
+          "备注": "remark", "标签": "tag"}
 
 # 全字段导出（与导入模板列对齐，方便导出→修改→再导入闭环）
-EXPORT_COLUMNS = ["编号", "品名", "提示词", "脚本", "备注", "口播文案", "分镜数",
+EXPORT_COLUMNS = ["编号", "品名", "标签", "提示词", "脚本", "备注", "口播文案", "分镜数",
                   "状态", "时长", "生成用时", "排队用时", "账号", "job_id",
                   "输出", "审核", "URL", "运行次数", "成功次数", "取消次数", "更新时间"]
 
@@ -138,7 +138,7 @@ def filter_choices():
         vals.discard("")
         return sorted(vals)
     return {"products": _distinct("product"), "scripts": _distinct("script"),
-            "remarks": _distinct("remark")}
+            "remarks": _distinct("remark"), "tags": _distinct("tag")}
 
 
 def add_task(num, product, prompt, script="", script_text="", storyboard=0, remark=""):
@@ -207,7 +207,7 @@ def delete_tasks(ids):
 _RESTORE_COLS = ["id", "num", "product", "prompt", "status", "account", "job_id",
                  "output", "url", "runs", "success", "cancels", "script_text",
                  "updated_at", "duration", "prompt_changed_at", "script",
-                 "storyboard", "remark", "prompt_zh"]
+                 "storyboard", "remark", "tag", "prompt_zh"]
 
 
 def restore_tasks(rows):

@@ -15,9 +15,10 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 
 from registry.manager import REG, ACCOUNTS, BatchBalancer, is_active
 from core.config import DEFAULT_STEPS, SUBMIT_PACING, BALANCE_RESCAN_EVERY
+from core import tags as tag_lib
 from store import task_store, product_store, app_state
 from utils.desktop_utils import reveal_in_folder, copy_paths_to_clipboard
-from processors import output_mark
+from processors import output_mark, archiver
 from workers.submit import (do_submit, cancel_one, SubmitOptions,
                             format_batch_distribution)
 from gui.dialogs import (TaskDialog, FindReplaceDialog, ForceRerunDialog,
@@ -40,12 +41,12 @@ STATUS_ICONS = {"completed": "✓ ", "succeeded": "✓ ", "failed": "✕ ", "err
                 "submitted": "⏩ ", "queued": "⏩ "}
 # 列表字段全量展示（含以前的隐藏技术字段），“字段管理”里逐个可勾可拖：
 # 任务一多，使用者需要自己能控制看哪几列、列序怎么排
-DATA_HEADERS = ["任务ID", "编号", "品名", "备注", "脚本", "提示词", "状态", "时长",
+DATA_HEADERS = ["任务ID", "编号", "品名", "标签", "备注", "脚本", "提示词", "状态", "时长",
                 "生成用时", "排队", "账号", "运行", "成功", "取消", "口播文案", "分镜数",
                 "更新时间", "输出文件", "job_id", "URL"]
 HEADERS = [""] + DATA_HEADERS          # 第 0 列：勾选框
 CHECK_COL = 0
-COL_PID, COL_NUM, COL_PRODUCT, COL_REMARK, COL_SCRIPT, COL_PROMPT, COL_STATUS, \
+COL_PID, COL_NUM, COL_PRODUCT, COL_TAG, COL_REMARK, COL_SCRIPT, COL_PROMPT, COL_STATUS, \
     COL_DUR, COL_GEN, COL_QUEUE, COL_ACCOUNT, COL_RUNS, COL_OK, COL_CANCEL, COL_VOICE, \
     COL_STORY, COL_UPDATED, COL_OUT, COL_JOB, COL_URL = range(1, len(DATA_HEADERS) + 1)
 SECS_COLS = (COL_GEN, COL_QUEUE)     # 两个时长列走 SecsItem：显示「4分58秒」而排序按秒数
@@ -66,6 +67,7 @@ STATUS_FILTERS = [("全部", None),
                   ("失败", ("failed", "error", "timeout")),
                   ("已取消", ("cancelled",))]
 NO_TAG = "（无备注）"        # 备注下拉的虚拟选项：一筛就只看没标的
+NO_TAGGED = "（未打标）"     # 标签下拉的虚拟选项：一筛就只看没打标签的
 BLANK = "（未填）"
 
 
@@ -259,12 +261,20 @@ class TasksPage(QWidget):
         b_fields = QPushButton("⚟ 字段管理")
         b_fields.setObjectName("GhostBtn")
         b_fields.setToolTip("控制显示哪些列，拖动表头可直接调整列顺序")
-        for b in (b_cancel, b_del, b_clean, b_io, b_fields):
+        b_archive = QPushButton("📦 批量归档")
+        b_archive.setObjectName("GhostBtn")
+        b_archive.setToolTip(
+            "把生成文件夹里散着的成品，按【日期 / 产品 / 标签】归进子文件夹，\n"
+            "方便后续整理进素材库。以任务表为准逐条搬运（不丢审片标记、\n"
+            "任务中心里的输出路径同步更新）；只搬位置、不改文件名。\n"
+            "没打标签的会归到「未打标」，产品没填的归到「未填品名」。")
+        for b in (b_cancel, b_del, b_clean, b_io, b_fields, b_archive):
             b.setObjectName("GhostBtn")
         for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del, b_clean, b_io,
-                  b_fields):
+                  b_fields, b_archive):
             bar.addWidget(b)
         b_clean.clicked.connect(self._cleanup_bad)
+        b_archive.clicked.connect(self._archive)
         # 留存几个引导/快捷键目标（首次上手气泡、顶部待办数量都要用）
         self.b_new, self.b_run, self.b_io = b_new, b_run, b_io
         self.b_runall, self.b_fields = b_runall, b_fields
@@ -300,7 +310,7 @@ class TasksPage(QWidget):
         fbar = QHBoxLayout()
         fbar.addWidget(QLabel("🔍"))
         self.ed_search = QLineEdit()
-        self.ed_search.setPlaceholderText("搜索品名/编号/脚本/提示词/口播文案，回车过滤")
+        self.ed_search.setPlaceholderText("搜索品名/编号/标签/脚本/提示词/口播文案，回车过滤")
         self.ed_search.setFixedWidth(240)
         self.ed_search.returnPressed.connect(lambda: (self._goto_first_page(), self.refresh()))
         fbar.addWidget(self.ed_search)
@@ -311,12 +321,14 @@ class TasksPage(QWidget):
         fbar.addWidget(b_replace)
         self.b_replace_btn = b_replace
         fbar.addSpacing(12)
-        # 下拉筛选：任务上百条后光靠搜索框拦不住，要能按品名/状态/备注直接分档
+        # 下拉筛选：任务上百条后光靠搜索框拦不住，要能按品名/状态/标签/备注直接分档
         self.cb_f_product = QComboBox()
         self.cb_f_status = QComboBox()
+        self.cb_f_tag = QComboBox()
         self.cb_f_remark = QComboBox()
         for lbl, cb in (("品名", self.cb_f_product),
                         ("状态", self.cb_f_status),
+                        ("标签", self.cb_f_tag),
                         ("备注", self.cb_f_remark)):
             cb.setMinimumContentsLength(8)
             cb.setToolTip(f"按{lbl}筛选任务（与搜索框/日期是“并且”关系）")
@@ -386,7 +398,7 @@ class TasksPage(QWidget):
         enable_drag_with_lock(self.table, lock_count=1)
         for c in STRETCH_COLS:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
-        widths = {COL_PID: 60, COL_NUM: 50, COL_PRODUCT: 110, COL_REMARK: 110,
+        widths = {COL_PID: 60, COL_NUM: 50, COL_PRODUCT: 110, COL_TAG: 84, COL_REMARK: 110,
                   COL_SCRIPT: 90, COL_STATUS: 130, COL_DUR: 52, COL_GEN: 80,
                   COL_QUEUE: 62,
                   COL_ACCOUNT: 70, COL_RUNS: 50, COL_OK: 50, COL_CANCEL: 50,
@@ -556,7 +568,7 @@ class TasksPage(QWidget):
         self._user_sort_col = None
         self.ed_search.clear()
         self.cb_date.setChecked(False)   # 触发 toggled→refresh
-        for cb in (self.cb_f_product, self.cb_f_status, self.cb_f_remark):
+        for cb in (self.cb_f_product, self.cb_f_status, self.cb_f_tag, self.cb_f_remark):
             cb.blockSignals(True)        # 不逐个触发 refresh
             cb.setCurrentIndex(0)
             cb.blockSignals(False)
@@ -572,8 +584,15 @@ class TasksPage(QWidget):
 
         重建期间必屏蔽信号：否则 addItem 会再触发一次 refresh（自调递归）。"""
         ch = task_store.filter_choices()
+        # 标签候选：设置里的词库优先，再补上库里有、但词库已删掉的旧标签（不丢筛选项）
+        tag_opts = list(tag_lib.load())
+        for t in ch["tags"]:
+            if t not in tag_opts:
+                tag_opts.append(t)
         for cb, items in ((self.cb_f_product,
                            [("", "全部"), (BLANK, BLANK)] + [(p, p) for p in ch["products"]]),
+                          (self.cb_f_tag,
+                           [("", "全部"), (NO_TAGGED, NO_TAGGED)] + [(t, t) for t in tag_opts]),
                           (self.cb_f_remark,
                            [("", "全部"), (NO_TAG, NO_TAG)] + [(t, t) for t in ch["remarks"]])):
             keep = cb.currentData()
@@ -592,8 +611,9 @@ class TasksPage(QWidget):
             self.cb_f_status.blockSignals(False)
 
     def _match_choice(self, row):
-        """品名/状态/备注三个下拉：选了具体值就必须命中（选“全部”＝不限）"""
+        """品名/状态/标签/备注四个下拉：选了具体值就必须命中（选“全部”＝不限）"""
         for cb, col, blank in ((self.cb_f_product, "品名", BLANK),
+                               (self.cb_f_tag, "标签", NO_TAGGED),
                                (self.cb_f_remark, "备注", NO_TAG)):
             want = cb.currentData()
             if not want:
@@ -614,7 +634,8 @@ class TasksPage(QWidget):
         kw = self.ed_search.text().strip().lower()
         if not kw:
             return True
-        hay = " ".join([str(row["品名"]), str(row["编号"]), str(row["脚本"]),
+        hay = " ".join([str(row["品名"]), str(row["编号"]), str(row["标签"]),
+                        str(row["脚本"]),
                         str(row["提示词"]), str(row["口播文案"]),
                         str(row["备注"])]).lower()
         return kw in hay
@@ -735,6 +756,11 @@ class TasksPage(QWidget):
             item.setText(str(row["编号"]))
         elif c == COL_PRODUCT:
             item.setText(str(row["品名"]))
+        elif c == COL_TAG:
+            tg = str(row["标签"])
+            item.setText(tg)
+            item.setToolTip((tg or "（双击选标签，归档时按它分文件夹；可先勾选多个再批量打）")
+                            + "\n标签词库在「设置 → 🏷 内容标签」里维护")
         elif c == COL_REMARK:
             rk = str(row["备注"])
             item.setText(rk[:24])
@@ -1256,6 +1282,8 @@ class TasksPage(QWidget):
     def _on_cell_double(self, r, c):
         if c == COL_OUT:
             return                     # 单击已播放，双击不再重复、也不进编辑窗
+        elif c == COL_TAG:
+            self._edit_tag(r)          # 标签从词库选，不弹整个任务窗
         elif c == COL_REMARK:
             self._edit_remark(r)         # 备注要的是“随手一笔”，不弹整个任务窗
         elif c != CHECK_COL:
@@ -1280,6 +1308,33 @@ class TasksPage(QWidget):
             return
         for tid in tids:
             task_store.update_row(tid, **{"备注": text.strip()})
+        self.refresh()
+
+    def _edit_tag(self, r):
+        """选标签：只能从词库挑（保证归档目录名规范）；先勾选多个就一次批量打。
+
+        选「（未打标）」＝清除标签。词库不够用去「设置 → 🏷 内容标签」新增。
+        标签不参与执行/迭代/重跑判定，只用于筛选与归档分组。"""
+        tids = sorted(self._selected_ids) or [self._row_tid(r)]
+        tids = [t for t in tids if t is not None]
+        if not tids:
+            return
+        single = len(tids) == 1
+        cur = ((task_store.get_task(tids[0]) or {}).get("tag") or "") if single else ""
+        choices = [NO_TAGGED] + tag_lib.load()
+        if cur and cur not in choices:            # 库里有但词库已删的旧标签：仍列出
+            choices.insert(1, cur)
+        start = choices.index(cur) if cur in choices else 0
+        text, ok = QInputDialog.getItem(
+            self, "选标签" if single else f"选标签（{len(tids)} 个任务）",
+            f"任务{tids[0]} 标签：" if single
+            else f"一次写入 {len(tids)} 个已勾选任务（选「{NO_TAGGED}」＝清除）：",
+            choices, start, False)
+        if not ok:
+            return
+        new = "" if text == NO_TAGGED else text
+        for tid in tids:
+            task_store.update_row(tid, **{"标签": new})
         self.refresh()
 
     def _cell_path(self, r):
@@ -1368,6 +1423,37 @@ class TasksPage(QWidget):
         self.lbl_tip.setText(msg)
         self.refresh()
 
+    def _archive(self):
+        """批量归档：把生成文件夹里散着的成品按【日期/产品/标签】归进子文件夹。
+
+        先算清单给一眼预览（按产品/标签汇总条数），确认后才真搬；
+        搬完同步库里的输出路径与审片标记（见 processors.archiver）。"""
+        items = archiver.plan()
+        if not items:
+            QMessageBox.information(
+                self, "没有需要归档的成品",
+                "生成文件夹里已经是【日期/产品/标签】结构，\n"
+                "或库里没有可定位的成品文件（同事手工放进目录的视频不在归档范围）。")
+            return
+        summ = archiver.summary(items)
+        lines = "\n".join(f"　{p} ／ {t}：{n} 条" for p, t, n in summ[:12])
+        if len(summ) > 12:
+            lines += f"\n　…… 另外 {len(summ) - 12} 组"
+        if QMessageBox.question(
+                self, "批量归档",
+                f"将把 {len(items)} 个成品按【日期 / 产品 / 标签】归进子文件夹：\n"
+                f"{lines}\n\n只搬位置、不改文件名；任务输出路径与审片标记会同步更新。\n"
+                "确定归档？") != QMessageBox.StandardButton.Yes:
+            return
+        st = archiver.run(items)
+        msg = f"📦 已归档 {len(st['moved'])} 个成品到 日期/产品/标签 子文件夹"
+        if st["failed"]:
+            msg += f"；{len(st['failed'])} 个失败：{st['failed'][0][1]}"
+            QMessageBox.warning(self, "部分归档失败", msg)
+        else:
+            self.lbl_tip.setText(msg)
+        self.refresh()
+
     def _on_context_menu(self, pos):
         """表格右键菜单：播放/定位/复制/标记 · 编辑/备注/检测/删除"""
         idx = self.table.indexAt(pos)
@@ -1409,6 +1495,9 @@ class TasksPage(QWidget):
         menu.addAction(("🏷 写备注（已选 " + str(n_sel) + " 个）") if n_sel
                        else "🏷 写备注（当前任务）",
                        lambda: self._edit_remark(r))
+        menu.addAction(("🏷 选标签（已选 " + str(n_sel) + " 个）") if n_sel
+                       else "🏷 选标签（当前任务）",
+                       lambda: self._edit_tag(r))
         menu.addAction(f"📝 批量绑定脚本（{'已选 ' + str(n_sel) + ' 个' if n_sel else '当前 1 个'}）",
                        lambda: self._bind_script(r))
         menu.addAction("🧐 口播规范检测", lambda: self._check_script(r))

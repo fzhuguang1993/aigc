@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS tasks(
   duration INTEGER DEFAULT 0, prompt_changed_at TEXT DEFAULT '',
   script TEXT DEFAULT '', storyboard INTEGER DEFAULT 0,
   remark TEXT DEFAULT '',
+  tag TEXT DEFAULT '',
   prompt_zh TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS runs(
@@ -72,6 +73,9 @@ _MIGRATIONS = (
     # 提示词中文对照：提示词很多是英文写的，机翻一份中文只给人看，
     # 不参与提交（提交永远用原文），所以单独开一列，不覆盖 prompt。
     "ALTER TABLE tasks ADD COLUMN prompt_zh TEXT DEFAULT ''",
+    # 内容标签：给任务归一个内容类型（开场钩子/活动促销/情景剧…），
+    # 词库在设置里维护；批量归档时就按它把成品归进「日期/产品/标签」子目录。
+    "ALTER TABLE tasks ADD COLUMN tag TEXT DEFAULT ''",
 )
 
 

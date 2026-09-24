@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineE
 from core.config import (CONFIG_JSON, USER_NAME,
                          DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR)
 from core import naming
+from core import tags as tag_lib
 from gui.header import page_header
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT
 from gui.widgets import VideoPlayerDialog
@@ -64,6 +65,20 @@ class SettingsPage(QWidget):
         nrow.addWidget(b_naming)
         lay.addLayout(nrow)
         self._refresh_naming()
+
+        # ---------- 内容标签词库（保存即生效：任务表「标签」列与归档目录名都靠它） ----------
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel("内容标签："))
+        self.lbl_tags = QLabel()
+        self.lbl_tags.setObjectName("InlineTip")
+        self.lbl_tags.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        b_tags = QPushButton("🏷 管理标签…")
+        b_tags.setObjectName("GhostBtn")
+        b_tags.clicked.connect(self._edit_tags)
+        trow.addWidget(self.lbl_tags, 1)
+        trow.addWidget(b_tags)
+        lay.addLayout(trow)
+        self._refresh_tags()
 
         # ---------- 视频预览框大小（UI 偏好，存 ui_state.json，拖动即时生效、不用重启） ----------
         prow = QHBoxLayout()
@@ -202,6 +217,23 @@ class SettingsPage(QWidget):
         from gui.dialogs_naming import NamingRuleDialog   # 只在打开时导入，减启动开销
         if NamingRuleDialog(self).exec():
             self._refresh_naming()
+
+    # ---------- 内容标签词库（与命名规则一样：自己写盘、保存即生效） ----------
+    def _refresh_tags(self):
+        """把当前词库写成一行；任务表标签下拉与归档目录名都按它来"""
+        self.lbl_tags.setText("、".join(tag_lib.load()))
+        self.lbl_tags.setToolTip(
+            "给任务打内容标签用的一组词，也是批量归档时的子文件夹名。\n"
+            "点右侧「🏷 管理标签…」可新增/删除/排序（保存后立即生效，不用重启）。")
+
+    def _edit_tags(self):
+        from gui.dialogs_tags import TagManagerDialog     # 只在打开时导入
+        if TagManagerDialog(self).exec():
+            self._refresh_tags()
+            w = self.window()
+            page = getattr(w, "page_tasks", None)        # 让任务表筛选下拉同步新词库
+            if page is not None and hasattr(page, "refresh"):
+                page.refresh()
 
     # ---------- 视频预览框大小（存 ui_state，与播放器共享同一个键） ----------
     def _load_preview_scale(self):
