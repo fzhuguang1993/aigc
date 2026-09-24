@@ -253,6 +253,12 @@ class TasksPage(QWidget):
             "把所有标了「👎 不可用」的成品一次移到回收站（能搜回来）。\n"
             "只删视频文件与它们的标记，不删任务、也不删执行记录：\n"
             "那次执行确实发生过，成功率与平均生成时长不该因为事后删片而变")
+        b_purge = QPushButton("🧹 清理未批准")
+        b_purge.setToolTip(
+            "反向清理：只保留标了「👍 可用」的成品，其余没标可用的\n"
+            "成品文件（含标了不可用的、和从没标过的）一次移到回收站。\n"
+            "某任务清完没有任何可用成品了，任务行也一并删（删除后可撤销）。\n"
+            "在跑/排队、还没出片的任务不受影响；需输入「确认删除」才执行。")
         b_io = QPushButton("📁 导入/导出")
         # 注意：QPushButton.setMenu 配合全局样式表会导致点击无反应，改为手动弹出菜单
         self._io_menu = self._build_io_menu()
@@ -268,12 +274,13 @@ class TasksPage(QWidget):
             "方便后续整理进素材库。以任务表为准逐条搬运（不丢审片标记、\n"
             "任务中心里的输出路径同步更新）；只搬位置、不改文件名。\n"
             "没打标签的会归到「未打标」，产品没填的归到「未填品名」。")
-        for b in (b_cancel, b_del, b_clean, b_io, b_fields, b_archive):
+        for b in (b_cancel, b_del, b_clean, b_purge, b_io, b_fields, b_archive):
             b.setObjectName("GhostBtn")
-        for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del, b_clean, b_io,
-                  b_fields, b_archive):
+        for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del, b_clean, b_purge,
+                  b_io, b_fields, b_archive):
             bar.addWidget(b)
         b_clean.clicked.connect(self._cleanup_bad)
+        b_purge.clicked.connect(self._purge_unapproved)
         b_archive.clicked.connect(self._archive)
         # 留存几个引导/快捷键目标（首次上手气泡、顶部待办数量都要用）
         self.b_new, self.b_run, self.b_io = b_new, b_run, b_io
@@ -1422,6 +1429,63 @@ class TasksPage(QWidget):
             msg += f"；{len(st['failed'])} 个失败：{st['failed'][0][1]}"
         self.lbl_tip.setText(msg)
         self.refresh()
+
+    def _purge_unapproved(self):
+        """一键清理未批准：只保留标了「可用」的成品，其余连文件带任务一起删。
+
+        与「清理不可用」相反、也更狠：没标可用的成品文件一律进回收站，
+        清完没有可用成品残留的任务行也一并删（任务行可撤销，文件从回收站可捞回）。
+        因影响大，需手动输入“确认删除”四个字才执行。"""
+        plan = task_store.purge_unapproved_plan()
+        if not plan:
+            QMessageBox.information(
+                self, "没有待清理的成品",
+                "现存成品都已标「可用」（或还没有已出片的成品）。\n"
+                "在视频上点「👍 可用」保留，其余的会在这里被清掉。")
+            return
+        n_files = sum(len(it["drop"]) for it in plan)
+        n_tasks = sum(1 for it in plan if it["drop_task"])
+        mb = sum(it["size"] for it in plan) / 1024 / 1024
+        preview = "\n".join(
+            f"  · {it['product']}：删 {len(it['drop'])} 个"
+            + ("（连任务一起删）" if it["drop_task"] else "（保留任务）")
+            for it in plan[:10])
+        if len(plan) > 10:
+            preview += f"\n  …… 另外 {len(plan) - 10} 个任务"
+        text = (f"将删除 {n_files} 个没标「可用」的成品（约 {mb:.0f} MB），"
+                f"其中 {n_tasks} 个任务清完没有可用成品，任务行一并删除。\n"
+                f"{preview}\n\n"
+                "· 成品文件移到【回收站】，误清可从回收站捞回；\n"
+                "· 被删的任务行可在提示条 6 秒内点「撤销」恢复；\n"
+                "· 没出片的任务（在跑/失败）不受影响；今日成品同样会清。\n\n"
+                "此操作影响较大，请输入【确认删除】四个字以继续：")
+        word, ok = QInputDialog.getText(self, "一键清理未批准成品", text)
+        if not ok:
+            return
+        if word.strip() != "确认删除":
+            self.lbl_tip.setText("已取消：未输入「确认删除」")
+            return
+        # 删前抓快照（只快照会被整条删的任务），供 6 秒内撤销
+        rows = [task_store.get_task(it["id"]) for it in plan if it["drop_task"]]
+        rows = [r for r in rows if r]
+        st = task_store.purge_unapproved(plan)
+        msg = f"🧹 已清理 {len(st['trashed'])} 个未批准成品（移到回收站）"
+        if st["tasks_deleted"]:
+            msg += f"，删除 {len(st['tasks_deleted'])} 个任务"
+        if st["tasks_kept"]:
+            msg += f"，{st['tasks_kept']} 个任务保留可用成品"
+        self.refresh()
+        if st["failed"]:
+            QMessageBox.warning(
+                self, "部分清理失败",
+                msg + f"；{len(st['failed'])} 个文件没删成：{st['failed'][0][1]}\n"
+                      "（删除失败的成品对应任务已保守保留，可重试）")
+        elif st["tasks_deleted"]:
+            self._show_toast(msg, action_text="↶ 撤销任务",
+                             on_action=lambda rs=rows: self._undo_delete(rs),
+                             color="#F54A45", msec=6000)
+        else:
+            self.lbl_tip.setText(msg)
 
     def _archive(self):
         """批量归档：把生成文件夹里散着的成品按【日期/产品/标签】归进子文件夹。

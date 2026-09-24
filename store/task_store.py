@@ -672,6 +672,73 @@ def daily_report_stats(now_hm=None):
     }
 
 
+# ---------------- 一键清理：只保留标了「可用」的成品 ----------------
+
+def purge_unapproved_plan():
+    """列出「有成品文件但没标可用」的清理清单（只读，不改任何东西）。
+
+    只纳入磁盘上真实存在成品文件的任务：在跑/排队、失败但没出片的任务一律
+    不动——它们没有可判定的成品，误删会伤到在途工作。判定按文件级：
+      - keep：该任务下标了「可用」的现存成品（保留）；
+      - drop：其余现存成品（没标记 / 标了不可用），待删；
+      - drop_task：清理后该任务已无任何可用成品 → 任务行也一并删。
+    今日生成的成品不特殊保护：只要没标可用就纳入（确认框里会先看清条数）。
+    """
+    marks = marks_by_path()
+    plan = []
+    for r in db.query("SELECT id, product, output FROM tasks "
+                      "WHERE COALESCE(output,'') != '' ORDER BY id"):
+        exist = [p for p in _split_outputs(r["output"]) if Path(p).is_file()]
+        if not exist:
+            continue                       # 无成品文件：在跑/失败无出片，不动
+        keep = [p for p in exist if marks.get(_mark_key(p), "") == MARK_OK]
+        drop = [p for p in exist if marks.get(_mark_key(p), "") != MARK_OK]
+        if not drop:
+            continue                       # 全部已标可用：无需清理
+        plan.append({"id": r["id"],
+                     "product": (r["product"] or "").strip() or "未填品名",
+                     "keep": keep, "drop": drop, "drop_task": not keep,
+                     "size": sum(Path(p).stat().st_size for p in drop)})
+    return plan
+
+
+def purge_unapproved(plan=None):
+    """执行清理：未标可用的成品移进回收站；无可用成品残留的任务整条删除。
+
+    文件走系统回收站（误清可从回收站捞回）。任务行是硬删——调用方要先自行
+    get_task() 抓快照，删后在 Toast 里 restore_tasks() 才能撤销（见 pages_tasks）。
+    保留任务行的（还有可用成品）：把已删路径从 output 字段剪掉，只剩现存文件。
+    某任务有成品删除失败时，保守不删它的任务行，留待下次重试。
+    """
+    from utils.desktop_utils import move_to_trash
+    items = plan if plan is not None else purge_unapproved_plan()
+    trashed, failed, tasks_deleted = [], [], []
+    tasks_kept = freed = 0
+    for it in items:
+        targets = [p for p in it["drop"] if Path(p).is_file()]
+        sizes = {p: Path(p).stat().st_size for p in targets}
+        ok, bad = move_to_trash(targets) if targets else ([], [])
+        trashed.extend(ok)
+        failed.extend(bad)
+        freed += sum(sizes.get(p, 0) for p in ok)
+        for p in ok:
+            set_file_mark(p, "")           # 文件已走：清掉孤儿标记
+        if it.get("drop_task") and not bad:
+            delete_tasks([it["id"]])
+            tasks_deleted.append(it["id"])
+        else:
+            # 保留任务行（本就该留，或删除失败被迫保留）：剪掉已不存在的输出路径
+            kept = [p for p in _split_outputs(
+                        (get_task(it["id"]) or {}).get("output") or "")
+                    if Path(p).is_file()]
+            db.execute("UPDATE tasks SET output=? WHERE id=?",
+                       ("; ".join(kept), it["id"]))
+            if not it.get("drop_task"):
+                tasks_kept += 1
+    return {"trashed": trashed, "failed": failed, "freed": freed,
+            "tasks_deleted": tasks_deleted, "tasks_kept": tasks_kept}
+
+
 def export_tasks(fmt="excel", path=None):
     df = list_tasks_df()
     return _dump(df[EXPORT_COLUMNS], fmt, path, f"任务表_{_stamp()}")
