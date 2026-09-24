@@ -186,6 +186,7 @@ class SettingsPage(QWidget):
         lay.addLayout(prow)
 
         # ---------- 输出目录：默认隐藏，Alt+W（Mac ⌘+W）口令解锁后才出现（不暴露入口） ----------
+        # 解锁同时放开上方的「线路/接口设置」区：一个口令管全部维护人区域
         self._dirs_unlocked = False
         self.dirs_box = QWidget()
         dbox = QVBoxLayout(self.dirs_box)
@@ -212,9 +213,17 @@ class SettingsPage(QWidget):
         self.dirs_box.setVisible(False)
         lay.addWidget(self.dirs_box)
 
-        lay.addWidget(QLabel("API 服务地址（一个地址 = 一个账号，双击单元格可编辑；"
-                             "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」看"
-                             "单条线路，要一次对比几条就用下方「🌐 打开选中」）："))
+        # ---------- 线路/接口设置：默认隐藏，维护人口令解锁才给看 ----------
+        # 接口地址本身就是访问凭证，不能在日常使用时摆在界面上露给人看；
+        # 普通使用者只走「配置包」分发线路，编辑入口对维护人保留（Alt+W）。
+        self.api_box = QWidget()
+        abox = QVBoxLayout(self.api_box)
+        abox.setContentsMargins(0, 0, 0, 0)
+        abox.setSpacing(8)
+
+        abox.addWidget(QLabel("API 服务地址（一个地址 = 一个账号，双击单元格可编辑；"
+                              "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」看"
+                              "单条线路，要一次对比几条就用下方「🌐 打开选中」）："))
         self.acc_table = QTableWidget(0, 4)
         self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数", "打开"])
         self.acc_table.horizontalHeader().setSectionResizeMode(COL_BASE,
@@ -230,7 +239,7 @@ class SettingsPage(QWidget):
         # 整行选中 + 连续多选：鼠标按住拖就能圈好几行，配合批量删除
         self.acc_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.acc_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        lay.addWidget(self.acc_table, 1)
+        abox.addWidget(self.acc_table, 1)
 
         bar = QHBoxLayout()
         b_add = QPushButton("＋ 添加地址")
@@ -261,8 +270,6 @@ class SettingsPage(QWidget):
         b_paste.setToolTip("读取剪贴板里的线路配置覆盖当前表格（改完记得保存）；"
                            "支持「📋 复制线路」的输出、纯地址数组、或整份 config.json")
         b_paste.clicked.connect(self._paste_lines)
-        b_save = QPushButton("💾 保存设置")
-        b_save.clicked.connect(self._save)
         bar.addWidget(b_add)
         bar.addWidget(b_del)
         bar.addWidget(b_open_sel)
@@ -270,14 +277,13 @@ class SettingsPage(QWidget):
         bar.addWidget(b_copy)
         bar.addWidget(b_paste)
         bar.addStretch(1)
-        bar.addWidget(b_save)
-        lay.addLayout(bar)
+        abox.addLayout(bar)
 
         self._load_current()
         self._checker = None
 
-        # ---------- 脚本 AI 检测接口（规范卡口播检测用，可留空） ----------
-        lay.addWidget(QLabel("脚本 AI 检测接口（可选 —— 「🧐 口播规范检测」的 AI 智能检测用，不配置也能用本地规则检测）："))
+        # ---------- 脚本 AI 检测接口（规范卡口播检测用，可留空；也属于接口配置） ----------
+        abox.addWidget(QLabel("脚本 AI 检测接口（可选 —— 「🧐 口播规范检测」的 AI 智能检测用，不配置也能用本地规则检测）："))
         crow = QHBoxLayout()
         self.ck_ai = QCheckBox("启用")
         self.ck_ai.setChecked(bool(SCRIPT_CHECK.get("enabled")))
@@ -295,7 +301,14 @@ class SettingsPage(QWidget):
         self.ed_ai_model.setPlaceholderText("gpt-4o-mini")
         self.ed_ai_model.setFixedWidth(140)
         crow.addWidget(self.ed_ai_model)
-        lay.addLayout(crow)
+        abox.addLayout(crow)
+        self.api_box.setVisible(False)
+        lay.addWidget(self.api_box, 1)
+        # 锁着的时候给一句人话：告诉使用者线路从哪来，但不暴露解锁入口
+        tip = QLabel("线路与各接口地址由维护人管理：需要换线路时找维护人要一份配置包，\n"
+                     "用下方「📥 一键导入配置」导入即可，不用手敲任何地址。")
+        tip.setStyleSheet("color:#6B7280;")
+        lay.addWidget(tip)
 
         # ---------- 配置迁移（加密包）：线路/接口凭证/命名规则/界面偏好一键搬家 ----------
         lay.addWidget(QLabel(
@@ -319,6 +332,16 @@ class SettingsPage(QWidget):
         mrow.addWidget(b_pkg_imp)
         mrow.addStretch(1)
         lay.addLayout(mrow)
+
+        # ---------- 保存：常驻底部，不跟着线路区一起藏 ----------
+        # 锁着的时候也能存姓名/命名规则；线路表在隐藏状态下仍持着启动值，
+        # _rows() 原样写回等于没动，不会把同事导进配置的线路弄丢。
+        srow = QHBoxLayout()
+        b_save = QPushButton("💾 保存设置")
+        b_save.clicked.connect(self._save)
+        srow.addWidget(b_save)
+        srow.addStretch(1)
+        lay.addLayout(srow)
 
         # 维护人入口：Alt+W（Mac ⌘+W）唤出口令框，验证通过才显示「输出目录」；
         # 仅当停在设置页时激活（show/hideEvent 开关），避免别处误触。
@@ -358,7 +381,7 @@ class SettingsPage(QWidget):
         app_state.set_value(VideoPlayerDialog.SCALE_KEY, val)
         self.lbl_preview_scale.setText(f"{val}%")
 
-    # ---------- 维护人入口：口令解锁隐藏的「输出目录」 ----------
+    # ---------- 维护人入口：口令解锁隐藏的「线路/接口设置 + 输出目录」 ----------
     def _summon_dirs(self):
         if self._dirs_unlocked:               # 已展开则不重复要口令
             return
@@ -367,12 +390,14 @@ class SettingsPage(QWidget):
         if not ok:
             return
         if code == API_MAINTAINER_CODE:
+            self.api_box.setVisible(True)
             self.dirs_box.setVisible(True)
             self._dirs_unlocked = True
         else:
             QMessageBox.warning(self, "口令错误", "维护人口令不正确")
 
     def _relock_dirs(self):
+        self.api_box.setVisible(False)
         self.dirs_box.setVisible(False)
         self._dirs_unlocked = False
 
