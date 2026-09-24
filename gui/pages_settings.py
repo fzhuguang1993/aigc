@@ -11,7 +11,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QHeaderView, QMessageBox, QCheckBox, QApplication,
-                               QFileDialog, QInputDialog, QAbstractItemView)
+                               QFileDialog, QInputDialog, QAbstractItemView, QSlider)
 
 from core.config import (CONFIG_JSON, USER_NAME, ACCOUNTS, SCRIPT_CHECK,
                          DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR)
@@ -20,6 +20,8 @@ from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT
+from gui.widgets import VideoPlayerDialog
+from store import app_state
 
 # 线路表列号：末列是行内「打开接口」按钮（setCellWidget，不进 _rows/不写配置）
 COL_NAME, COL_BASE, COL_CONC, COL_OPEN = range(4)
@@ -159,6 +161,29 @@ class SettingsPage(QWidget):
         lay.addLayout(nrow)
         self._refresh_naming()
 
+        # ---------- 视频预览框大小（UI 偏好，存 ui_state.json，拖动即时生效、不用重启） ----------
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("视频预览框大小："))
+        self.sl_preview = QSlider(Qt.Orientation.Horizontal)
+        self.sl_preview.setRange(VideoPlayerDialog.SCALE_MIN, VideoPlayerDialog.SCALE_MAX)
+        self.sl_preview.setSingleStep(5)
+        self.sl_preview.setPageStep(10)
+        self.sl_preview.setFixedWidth(200)
+        self.lbl_preview_scale = QLabel()          # 先连信号、再 setValue，保证初始不落盘
+        b_pv_reset = QPushButton("恢复默认")
+        b_pv_reset.setObjectName("GhostBtn")
+        b_pv_reset.setToolTip("回到 100%（即已整体缩小 30% 后的默认基准大小）")
+        b_pv_reset.clicked.connect(
+            lambda: self.sl_preview.setValue(VideoPlayerDialog.SCALE_DEFAULT))
+        self.sl_preview.valueChanged.connect(self._preview_scale_changed)
+        self.sl_preview.setValue(self._load_preview_scale())
+        prow.addWidget(self.sl_preview)
+        prow.addWidget(self.lbl_preview_scale)
+        prow.addWidget(b_pv_reset)
+        prow.addWidget(QLabel("（向左更小、向右更大；相对默认缩小 30% 后的基准等比缩放，下次打开播放器即生效）"))
+        prow.addStretch(1)
+        lay.addLayout(prow)
+
         # ---------- 输出目录：默认隐藏，Alt+W（Mac ⌘+W）口令解锁后才出现（不暴露入口） ----------
         self._dirs_unlocked = False
         self.dirs_box = QWidget()
@@ -293,6 +318,21 @@ class SettingsPage(QWidget):
         from gui.dialogs_naming import NamingRuleDialog   # 只在打开时导入，减启动开销
         if NamingRuleDialog(self).exec():
             self._refresh_naming()
+
+    # ---------- 视频预览框大小（存 ui_state，与播放器共享同一个键） ----------
+    def _load_preview_scale(self):
+        try:
+            v = int(app_state.get(VideoPlayerDialog.SCALE_KEY)
+                    or VideoPlayerDialog.SCALE_DEFAULT)
+        except (TypeError, ValueError):
+            v = VideoPlayerDialog.SCALE_DEFAULT
+        return max(VideoPlayerDialog.SCALE_MIN,
+                   min(VideoPlayerDialog.SCALE_MAX, v))
+
+    def _preview_scale_changed(self, val):
+        val = int(val)
+        app_state.set_value(VideoPlayerDialog.SCALE_KEY, val)
+        self.lbl_preview_scale.setText(f"{val}%")
 
     # ---------- 维护人入口：口令解锁隐藏的「输出目录」 ----------
     def _summon_dirs(self):

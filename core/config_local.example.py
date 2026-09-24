@@ -17,3 +17,11 @@ ACCOUNTS = [
 MATERIAL_API_BASE = "https://<提取接口地址>/home/api"
 MATERIAL_API_UID = "<你的 UID>"
 MATERIAL_API_KEY = "<你的 Key>"
+
+# 机器翻译接口（火山引擎「文本翻译」）：任务弹窗里 Alt+W 唤出的
+# 「提示词中文对照 / 改完中文改回英文」。不填也能开软件，点翻译时才提示未配置。
+# 开通与申请：https://console.volcengine.com/ （对象存储同账号的访问密钥即可）
+TRANSLATE = {
+    "ak": "<你的 AccessKeyID>",
+    "sk": "<你的 SecretAccessKey>",
+}

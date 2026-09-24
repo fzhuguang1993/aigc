@@ -454,7 +454,7 @@ class TasksPage(QWidget):
         self._player = None        # 视频窗口引用，防 GC
         self._tour_bubble = None   # 首次上手引导气泡引用，防 GC
         self._tour_started = False # 引导只在首次显示时跑一遍
-        self.hover = HoverPreview()  # 全文预览浮层（单击/空格唤起，任意键关闭）
+        self.hover = HoverPreview(host=self)  # 全文预览浮层（单击/空格唤起，任意键关闭，Alt+W 除外）
         self._hover_cell = None      # 鼠标最后所在的 (row, col)，空格键弹整列用
         self._toasts = []            # 右下角浮层引用，防 GC
         self._failed_ids = set()     # 本次提交失败的任务：标红+置顶，便于改后重跑
@@ -728,7 +728,7 @@ class TasksPage(QWidget):
             item.setCheckState(Qt.CheckState.Checked if tid in self._selected_ids
                                else Qt.CheckState.Unchecked)
             item.setToolTip("勾选后可跨页保留，支持批量执行/删除；"
-                            "按住鼠标在表上拖出框，框到的行会一次全部勾上")
+                            "按住鼠标在表上拖出框，框到的行会取反：没勾的勾上、已勾的取消")
         elif c == COL_PID:
             item.setData(Qt.ItemDataRole.DisplayRole, tid)
         elif c == COL_NUM:
@@ -873,10 +873,12 @@ class TasksPage(QWidget):
         self._update_sel_label()
 
     def _on_rubber_band(self):
-        """把当前选中的行勾上（只增不减，取消请点勾或「清除选择」）。
+        """把框到的行【取反】：没勾的勾上，已经勾上的取消勾选。
 
         由 eventFilter 在确认「真的拖动过鼠标」后调用，不挂 itemSelectionChanged：
         点勾选框取消勾选时该行也会被视为选中，会被反手又勾回去。
+        只增不减的旧写法逼着用户「框错了只能一行行点回去」或去按「清除选择」，
+        而框选本身就像 Excel 的拖选——再框一次应当是把这批撤掉。
         完事清掉 Qt 高亮：用户真正依赖的是勾选框（跨页保留、驱动批量操作）。"""
         if self._syncing:
             return
@@ -884,12 +886,17 @@ class TasksPage(QWidget):
         self._syncing = True
         for r in rows:
             it = self.table.item(r, CHECK_COL)
-            if it is None or it.checkState() == Qt.CheckState.Checked:
+            if it is None:
                 continue
-            it.setCheckState(Qt.CheckState.Checked)
             tid = it.data(Qt.ItemDataRole.UserRole)
-            if tid is not None:
-                self._selected_ids.add(tid)
+            if it.checkState() == Qt.CheckState.Checked:
+                it.setCheckState(Qt.CheckState.Unchecked)
+                if tid is not None:
+                    self._selected_ids.discard(tid)
+            else:
+                it.setCheckState(Qt.CheckState.Checked)
+                if tid is not None:
+                    self._selected_ids.add(tid)
         self.table.clearSelection()
         self._syncing = False
         self._update_sel_label()
@@ -1537,9 +1544,10 @@ class TasksPage(QWidget):
         t = task_store.get_task(tid)
         if not t:
             return
-        data = TaskDialog.ask(self, {"num": t["num"], "product": t["product"],
+        data = TaskDialog.ask(self, {"id": tid, "num": t["num"], "product": t["product"],
                                      "script": t["script"], "prompt": t["prompt"],
-                                     "remark": t["remark"]})
+                                     "remark": t["remark"],
+                                     "prompt_zh": t.get("prompt_zh") or ""})
         if data:
             # 编号不写回：弹窗里已经拿掉输入框，编号建好就不给改（文件命名锚）
             upd = {"品名": data["product"],
@@ -1548,6 +1556,8 @@ class TasksPage(QWidget):
                 # 改了提示词才重置执行态；只改脚本不影响迭代/重跑判定
                 upd.update({"提示词": data["prompt"], "状态": "", "运行次数": 0})
             task_store.update_row(tid, **upd)
+            # 中文对照：翻完又改了原文的，那份译文就对不上了，清掉比留着骗人强
+            task_store.set_prompt_zh(tid, data["prompt_zh"] if data["zh_valid"] else "")
             self.refresh()
 
     def _bind_script(self, r):
@@ -1611,10 +1621,13 @@ class TasksPage(QWidget):
     def _new_task(self):
         data = TaskDialog.ask(self)
         if data and data["prompt"]:
-            task_store.add_task(data["num"] or (task_store.task_count() + 1),
-                                data["product"], data["prompt"],
-                                script=data.get("script", ""),
-                                remark=data.get("remark", ""))
+            tid = task_store.add_task(data["num"] or (task_store.task_count() + 1),
+                                      data["product"], data["prompt"],
+                                      script=data.get("script", ""),
+                                      remark=data.get("remark", ""))
+            # 新建时翻的对照：任务 id 到手才能补写进库
+            if tid and data.get("zh_valid"):
+                task_store.set_prompt_zh(tid, data["prompt_zh"])
             self.refresh()
 
     def _del_selected(self):
@@ -1681,6 +1694,8 @@ class TasksPage(QWidget):
             for tid, _o, _n in hits:
                 t = task_store.get_task(tid)
                 task_store.update_row(tid, **{"提示词": (t["prompt"] or "").replace(find, repl)})
+                # 原文被批量改了，旧的中文对照就对不上了，同步清掉（留着会骗人）
+                task_store.set_prompt_zh(tid, "")
         n = self._gather_matches(hit_ids)
         self.lbl_tip.setText(
             f"已按「{find}」勾选并置顶 {n} 个任务，可直接「执行选中」（提示词未改动）"

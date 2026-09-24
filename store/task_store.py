@@ -168,6 +168,15 @@ def update_row(task_id, **fields):
     db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", args)
 
 
+def set_prompt_zh(task_id, text):
+    """只写「提示词中文对照」
+
+    不进 _CN2DB、也刻意不走 update_row：对照译文只是给人看的附属品，
+    跟着 update_row 会把 updated_at / prompt_changed_at 一起刷掉，
+    在「迭代执行」判定里就成了“提示词又改了、这条要重跑”。"""
+    db.execute("UPDATE tasks SET prompt_zh=? WHERE id=?", (str(text or ""), task_id))
+
+
 def iter_ready(task_id):
     """提示词在上次执行之后又改过 → 应视为“迭代执行”，允许重跑"""
     t = get_task(task_id)
@@ -198,7 +207,7 @@ def delete_tasks(ids):
 _RESTORE_COLS = ["id", "num", "product", "prompt", "status", "account", "job_id",
                  "output", "url", "runs", "success", "cancels", "script_text",
                  "updated_at", "duration", "prompt_changed_at", "script",
-                 "storyboard", "remark"]
+                 "storyboard", "remark", "prompt_zh"]
 
 
 def restore_tasks(rows):

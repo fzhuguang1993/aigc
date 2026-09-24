@@ -5,14 +5,17 @@ import html
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor
+from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QTimer, Signal, QKeyCombination
+from PySide6.QtGui import (QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor,
+                           QRegion, QPainterPath, QTransform, QKeySequence)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
                                QPushButton, QLabel, QWidget, QMessageBox,
-                               QComboBox, QSizeGrip, QSizePolicy)
+                               QComboBox, QSizeGrip, QSizePolicy, QLineEdit, QInputDialog)
 
+from core import translate
+from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
 from store import app_state
 from utils.desktop_utils import open_path, reveal_in_folder
 
@@ -41,6 +44,7 @@ STEP_KEY = "player_step_sec"
 # 也不用 WA_TranslucentBackground 做真圆角：透明窗口叠硬解视频在 Windows 上
 # 会把画面区域变成一块黑，宁可角上直角。
 _SHELL_QSS = """
+#PlayerRoot { background:#15171C; }
 #PlayerShell { background:#15171C; border:1px solid #2A2E37; border-radius:10px; }
 #PlayerShell QLabel { color:#C9CFDA; background:transparent; font-size:12px; }
 #PlayerShell QLabel#FileName { color:#F2F5FA; font-size:12px; font-weight:600; }
@@ -55,7 +59,17 @@ _SHELL_QSS = """
 #PlayerShell QComboBox { background:#252A33; color:#DCE1EA; border:0;
     border-radius:6px; padding:3px 6px; }
 #PlayerShell QComboBox QAbstractItemView { background:#252A33; color:#DCE1EA;
-    selection-background-color:#3370FF; border:1px solid #3A4150; }
+    selection-background-color:#3370FF; selection-color:#FFFFFF;
+    border:1px solid #3A4150; outline:none; }
+/* 弹层列表的每个条目：默认深底浅字，鼠标划过/选中给蓝底白字。
+   必须显式写 ::item，否则会被应用级浅色主题里的
+   `QComboBox QAbstractItemView::item:hover/selected {background:#EAF1FF}` 顶掉——
+   表现就是深黑列表上冒出一个几乎白色的选中块，看不清也反人类。 */
+#PlayerShell QComboBox QAbstractItemView::item { color:#DCE1EA; background:#252A33;
+    padding:4px 8px; min-height:22px; }
+#PlayerShell QComboBox QAbstractItemView::item:hover,
+#PlayerShell QComboBox QAbstractItemView::item:selected {
+    background:#3370FF; color:#FFFFFF; }
 #PlayerShell QSlider::groove:horizontal { height:6px; background:#31363F; border-radius:3px; }
 #PlayerShell QSlider::sub-page:horizontal { background:#3370FF; border-radius:3px; }
 #PlayerShell QSlider::handle:horizontal { width:16px; height:16px; margin:-5px 0;
@@ -132,8 +146,15 @@ class VideoPlayerDialog(QDialog):
     marked = Signal(str, str)
 
     MIN_W, MIN_H = 360, 220             # 画面区最小尺寸（也是没报出视频尺寸时的兜底）
-    FILL_W, FILL_H = 0.88, 0.94         # 自适应时画面可占屏幕可用区的比例
+    # 自适应时画面可占屏幕可用区的比例。已在原 0.88 / 0.94 基础上整体缩小约 30%，
+    # 作为新的默认基准；设置页「视频预览框大小」的百分比再在这个基准上乘系数。
+    FILL_W, FILL_H = 0.62, 0.66
+    FALLBACK_FILL = 0.35                # 后端还没报视频尺寸时的半屏兜底，同样缩过（原 0.5）
     REFIT_EPS = 0.015                   # 宽高比变化超过这个值才重摆（不跟用户抢尺寸）
+    SHELL_RADIUS = 10                   # 外壳圆角半径（与 _SHELL_QSS 的 border-radius 对齐）
+    # 预览框大小缩放（百分比）：存 ui_state，播放器每次打开时读取即时生效。
+    SCALE_KEY = "player_preview_scale"
+    SCALE_MIN, SCALE_MAX, SCALE_DEFAULT = 40, 160, 100
 
     def __init__(self, parent, file_path, allow_mark=False):
         super().__init__(parent)
@@ -146,6 +167,8 @@ class VideoPlayerDialog(QDialog):
         self._last_size = None           # 视频真实宽高（退出全屏时重摆一次）
 
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("PlayerRoot")        # 供 #PlayerRoot 规则给四角补上深色底，避免白角
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)   # 让 #PlayerRoot 背景真能绘出来
         self.setStyleSheet(_SHELL_QSS)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizeGripEnabled(True)
@@ -453,6 +476,41 @@ class VideoPlayerDialog(QDialog):
     def _avail(self):
         return (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
 
+    def _scale_factor(self):
+        """预览框大小系数：读设置页写入的百分比（存 ui_state），限幅 40%~160%
+
+        100% 即「整体缩小 30% 后的新基准」；每次开播放器时重读，改完下次打开即生效。"""
+        try:
+            v = int(app_state.get(self.SCALE_KEY) or self.SCALE_DEFAULT)
+        except (TypeError, ValueError):
+            v = self.SCALE_DEFAULT
+        v = max(self.SCALE_MIN, min(self.SCALE_MAX, v))
+        return v / 100.0
+
+    def _apply_round_mask(self):
+        """把无边框窗口沿圆角剪出一个真圆角（用遮罩而不是透明窗口）
+
+        以前只给 #PlayerShell 做了 border-radius，外层 QDialog 仍是直角，
+        壳子圆角外的四个小三角露出窗口默认白底——就是那个“白角突出”。
+        不用 WA_TranslucentBackground（会把硬解视频变黑），改用 setMask 把窗口
+        区域剪成圆角矩形：四角直接透明掉到桌面，客户区仍完全不透明，视频不受影响。"""
+        if self._fullscreen:
+            self.clearMask()
+            return
+        w, h, r = self.width(), self.height(), self.SHELL_RADIUS
+        if w <= 0 or h <= 0:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, w, h, r, r)
+        # 本 PySide6 不支持 QRegion(QPainterPath, FillRule) 重载（会回退到
+        # 要求 QPolygon/QRect 的重载报错、遮罩为空）。转成多边形再构 region。
+        poly = path.toFillPolygon(QTransform()).toPolygon()
+        self.setMask(QRegion(poly))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._apply_round_mask()
+
     def _place(self, w, h):
         """摆窗 + 居中（居中按可用区算，别被菜单栏/Dock 顶到屏幕外）"""
         avail = self._avail()
@@ -467,7 +525,9 @@ class VideoPlayerDialog(QDialog):
             # 先按半屏给一个够大的窗，不要把播放器开成一个巴掌大的方块，
             # 等视频尺寸到了再按真实比例重摆一次。
             avail = self._avail()
-            self._place(int(avail.width() * 0.5), int(avail.height() * 0.5))
+            s = self._scale_factor()
+            self._place(int(avail.width() * self.FALLBACK_FILL * s),
+                        int(avail.height() * self.FALLBACK_FILL * s))
 
     def _on_video_size(self, *_):
         """视频尺寸变化的通知：尺寸要自己从 sink 上取
@@ -494,7 +554,9 @@ class VideoPlayerDialog(QDialog):
             return
         self._fitted = cur
         avail = self._avail()
-        scale = min(avail.width() * self.FILL_W / w, avail.height() * self.FILL_H / h)
+        s = self._scale_factor()
+        scale = min(avail.width() * self.FILL_W * s / w,
+                    avail.height() * self.FILL_H * s / h)
         self._place(max(int(w * scale), self.MIN_W + 60),
                     max(int(h * scale), self.MIN_H + 60))
         # 上面的尺寸是「整窗」而不是「画面」，布局会把画面区压成另一个比例；
@@ -708,13 +770,21 @@ class HoverPreview(QScrollArea):
     两种模式：
     - 钉住（show_pinned）：单击/空格唤起，Popup 模式抓取键盘，任意键关闭、点其它地方也关闭；
     - 悬停（show_at + hide_soon）：保留旧延时防抖机制，钉住模式下不生效。
+
+    钉住模式里 Alt+W（macOS ⌘+W）是“任意键关闭”的例外：它不关窗，而是维护人的
+    中文对照开关。提示词多是英文写的，正在读预览时最想知道中文，不该逼人到
+    编辑弹窗里再翻一遍。第一次要口令，之后同一份内容在原文/对照间来回切。
     """
 
     WIDTH = 460
     MAX_H = 340
     HIDE_DELAY = 300        # ms：离开单元格后给移入浮层留的反应时间
+    # 单独按下修饰键（比如先按住 Alt）不算“按了个键”：否则 Alt+W 的第一个键
+    # 就把浮层关掉了，组合键永远按不出来
+    MOD_KEYS = (Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt,
+                Qt.Key.Key_Meta, Qt.Key.Key_CapsLock)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, host=None):
         super().__init__(parent)
         # ToolTip 窗口标志：不抢焦点、永远浮在最上层
         self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
@@ -742,6 +812,21 @@ class HoverPreview(QScrollArea):
         self._hide_timer.setInterval(self.HIDE_DELAY)
         self._hide_timer.timeout.connect(self._check_hide)
 
+        # ---- 维护人翻译（只在钉住模式下可用）----
+        # 浮层本身是 Popup，收不到 QShortcut，所以在 keyPressEvent 里自己比对按键
+        self._summon = QKeySequence(MAINTAINER_SHORTCUT)[0]
+        self._host = host or parent       # 口令框要有宿主窗口，否则孤零零弹在屏幕正中
+        self._pin_text = ""               # 当前钉住的那份原文
+        self._pin_rich = True
+        self._zh = ""                     # 当前内容的中文对照
+        self._zh_src = ""                 # 对照对应的原文（内容换了就得重翻）
+        self._showing_zh = False
+        self._unlocked = False            # 口令验过一次就不再问（本会话内）
+        self._busy = False
+        self._tip = ""                    # 一次性提示（无需翻译之类）
+        self._err = ""
+        self._worker = None
+
     def set_keep_rect(self, rect):
         self._keep_rect = rect
 
@@ -749,18 +834,51 @@ class HoverPreview(QScrollArea):
     def pinned(self):
         return self._pinned
 
+    def _to_html(self, text, highlight):
+        if highlight:
+            return _highlight_cjk_html(text)
+        return "<br>".join(html.escape(line) for line in str(text or "").split("\n"))
+
+    def _fit(self):
+        self.label.adjustSize()
+        h = min(self.label.sizeHint().height() + 24, self.MAX_H)
+        self.setFixedHeight(h)
+
     def _render(self, text, rich_text):
+        """悬停模式：只铺内容，不带翻译尾注（没解锁的人不该看见 Alt+W）"""
         self._hide_timer.stop()
         if rich_text:
             # 富文本：中文字高亮，换行用 <br> 还原
             self.label.setTextFormat(Qt.TextFormat.RichText)
-            self.label.setText(_highlight_cjk_html(text))
+            self.label.setText(self._to_html(text, True))
         else:
             self.label.setTextFormat(Qt.TextFormat.PlainText)
             self.label.setText(text.rstrip())
-        self.label.adjustSize()
-        h = min(self.label.sizeHint().height() + 24, self.MAX_H)
-        self.setFixedHeight(h)
+        self._fit()
+
+    def _repaint(self):
+        """钉住模式重绘：内容 + 一行灰色尾注，高度跟着尾注一起算"""
+        body = self._zh if self._showing_zh else self._pin_text
+        # 中文高亮是给“英文里夹中文”用的，整篇对照再刷黄底就成了满屏荧光笔
+        self.label.setTextFormat(Qt.TextFormat.RichText)
+        self.label.setText(self._to_html(body, self._pin_rich and not self._showing_zh)
+                           + self._foot())
+        self._fit()
+
+    def _foot(self):
+        if not self._unlocked:
+            return ""
+        if self._busy:
+            tip = "🌐 翻译中，稍等…"
+        elif self._err:
+            tip = "⚠ " + self._err
+        elif self._tip:
+            tip = self._tip
+        elif self._showing_zh:
+            tip = "中文对照（提交给云端的仍是原文）· 再按 Alt+W 回原文"
+        else:
+            tip = "按 Alt+W 看中文对照 · 其它键关闭"
+        return '<br><span style="color:#8F959E;">{}</span>'.format(html.escape(tip))
 
     def show_pinned(self, text, pos, rich_text=True):
         """单击/空格唤起：钉住显示，任意键关闭（Popup 模式自带键盘抓取）"""
@@ -768,8 +886,13 @@ class HoverPreview(QScrollArea):
             self.hide()
             return
         self._pinned = True
+        self._pin_text = text
+        self._pin_rich = rich_text
+        self._showing_zh = False      # 换了内容就先看原文，别拿上一段的对照糊弄
+        self._tip = ""
+        self._err = ""
         self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        self._render(text, rich_text)
+        self._repaint()
         self.move(self.clamp_to_screen(pos))
         self.show()
         self.setFocus()                         # Popup 模式下确保键盘事件进浮层
@@ -812,11 +935,80 @@ class HoverPreview(QScrollArea):
             self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
 
     def keyPressEvent(self, e):
-        if self._pinned:
-            e.accept()
-            self.hide()          # 钉住模式下：再按任意键关闭
+        if not self._pinned:
+            super().keyPressEvent(e)
             return
-        super().keyPressEvent(e)
+        e.accept()
+        if e.key() in self.MOD_KEYS:
+            return                              # 只按下了修饰键：浮层留着等第二个键
+        if QKeyCombination(e.modifiers(), Qt.Key(e.key())) == self._summon:
+            self._summon_zh()
+            return
+        self.hide()              # 其余任意键关闭
+
+    # ================= 维护人：就地看中文对照 =================
+    def _summon_zh(self):
+        if not self._unlocked:
+            self._unlock()
+        elif self._showing_zh:
+            self._showing_zh = False
+            self._repaint()
+        elif self._zh and self._zh_src == self._pin_text:
+            self._showing_zh = True             # 翻过了直接切，不再发请求
+            self._repaint()
+        else:
+            self._translate()
+
+    def _unlock(self):
+        """口令框是模态窗，会把 Popup 的键盘抓取顶掉：先收窗再问，问完原样钉回来"""
+        text, rich, pos = self._pin_text, self._pin_rich, self.pos()
+        self.hide()
+        host = self._host or self
+        code, ok = QInputDialog.getText(host, "维护人验证", "请输入维护人口令：",
+                                        QLineEdit.EchoMode.Password)
+        if ok and code == API_MAINTAINER_CODE:
+            self._unlocked = True
+            self.show_pinned(text, pos, rich)
+            self._translate()
+            return
+        self.show_pinned(text, pos, rich)       # 没通过也别把人正在看的内容弄丢
+        if ok:
+            QMessageBox.warning(host, "口令错误", "维护人口令不正确")
+
+    def _translate(self):
+        if self._busy:
+            return
+        self._err = ""
+        self._tip = ""
+        if not translate.has_latin(self._pin_text):
+            self._tip = "没看到英文，无需翻译"
+            self._repaint()
+            return
+        self._busy = True
+        self._repaint()
+        src = self._pin_text                    # 回来后比对：期间可能已经换看了另一条
+        self._worker = ToolWorker(lambda log, progress, stop: (src, translate.translate_mixed(src)),
+                                  self)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
+    def _on_done(self, res):
+        self._worker = None
+        self._busy = False
+        self._tip = ""
+        if isinstance(res, Exception):
+            self._err = str(res) or type(res).__name__
+        else:
+            src, zh = res
+            if src != self._pin_text:
+                self._tip = "看的已经换了内容，这次结果不用了"
+            else:
+                self._zh = str(zh or "")
+                self._zh_src = src
+                self._showing_zh = bool(self._zh)
+                if not self._zh:
+                    self._tip = "没翻出内容"
+        self._repaint()
 
     def clamp_to_screen(self, pos):
         """防止浮层超出屏幕右侧/底部"""

@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   script_text TEXT DEFAULT '', updated_at TEXT DEFAULT '',
   duration INTEGER DEFAULT 0, prompt_changed_at TEXT DEFAULT '',
   script TEXT DEFAULT '', storyboard INTEGER DEFAULT 0,
-  remark TEXT DEFAULT ''
+  remark TEXT DEFAULT '',
+  prompt_zh TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS runs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,6 +69,9 @@ _MIGRATIONS = (
     "ALTER TABLE tasks ADD COLUMN storyboard INTEGER DEFAULT 0",
     # 备注：使用者自己标的管理记号（“已过审”“待重拍”…），不参与业务逻辑
     "ALTER TABLE tasks ADD COLUMN remark TEXT DEFAULT ''",
+    # 提示词中文对照：提示词很多是英文写的，机翻一份中文只给人看，
+    # 不参与提交（提交永远用原文），所以单独开一列，不覆盖 prompt。
+    "ALTER TABLE tasks ADD COLUMN prompt_zh TEXT DEFAULT ''",
 )
 
 

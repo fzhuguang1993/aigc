@@ -83,20 +83,39 @@ class ProgressDelegate(QStyledItemDelegate):
                 band.setColorAt(0.0, QColor(255, 255, 255, 0))
                 band.setColorAt(0.5, QColor(255, 255, 255, 120))
                 band.setColorAt(1.0, QColor(255, 255, 255, 0))
-                path_clip = painter.clipPath()
+                # 必须 save/restore 包住裁剪：没开裁剪时 clipPath() 返回的是空路径，
+                # 再 setClipPath(空) 等于把绘制区剪成空——后面那句 drawText 就静默
+                # 什么都不画。表现就是「进度条一长、百分比数字整个消失」
+                # （光带要 fill_w>30 才画，所以是过了某个比例才开始丢，看着像遮挡）。
+                painter.save()
                 painter.setClipRect(QRectF(rect.x(), rect.y(),
                                            max(fill_w, 10), rect.height()))
                 painter.setBrush(band)
+                painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawRect(QRectF(x0, rect.y(), band_w, rect.height()))
-                painter.setClipPath(path_clip)
+                painter.restore()
 
         # 条上标注百分比：加大加粗
         f = QFont(option.font)
         f.setPointSizeF(max(f.pointSizeF(), 10.5) + 1.5)
         f.setBold(True)
         painter.setFont(f)
-        painter.setPen(QPen(QColor("#FFFFFF") if pct >= 40 else QColor("#1F2329")))
-        painter.drawText(QRectF(rect), Qt.AlignmentFlag.AlignCenter, f"{pct}%")
+        # 数字按「填充边界」分两段着色：落在蓝条上的那半截用白字，落在灰槽上的
+        # 那半截用深字。以前是整串按 pct>=40 一刀切换成白色，而文字居中，
+        # 40%~60% 这段必然有一半笔画压在浅灰底上（白字配灰槽），看着像数字缺半边。
+        txt = f"{pct}%"
+        fill_w = max(fill_w, 10) if pct > 0 else 0
+        painter.save()
+        painter.setClipRect(QRectF(rect.x(), rect.y(), fill_w, rect.height()))
+        painter.setPen(QPen(QColor("#FFFFFF")))
+        painter.drawText(QRectF(rect), Qt.AlignmentFlag.AlignCenter, txt)
+        painter.restore()
+        painter.save()
+        painter.setClipRect(QRectF(rect.x() + fill_w, rect.y(),
+                                   max(rect.width() - fill_w, 0), rect.height()))
+        painter.setPen(QPen(QColor("#1F2329")))
+        painter.drawText(QRectF(rect), Qt.AlignmentFlag.AlignCenter, txt)
+        painter.restore()
         painter.restore()
 
     def sizeHint(self, option, index):

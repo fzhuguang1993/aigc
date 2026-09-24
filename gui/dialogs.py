@@ -2,28 +2,41 @@
 gui/dialogs.py —— 新建 / 编辑任务弹窗、查找/替换弹窗、批量绑定脚本弹窗
 """
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                                QPlainTextEdit, QPushButton, QHBoxLayout, QLabel,
-                               QCheckBox, QComboBox, QMessageBox, QSpinBox)
+                               QCheckBox, QComboBox, QMessageBox, QSpinBox,
+                               QWidget, QInputDialog)
 
-from store import product_store
+from core import translate
+from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
+from store import product_store, task_store
 
 
 class TaskDialog(QDialog):
     """task=None 为新建；编辑时传 {"num","product","script","prompt","remark"}
     品名/脚本均可留空：通版素材可以不关联任何产品/脚本
     编号不给改：它是文件命名（品名_编号_姓名）和数据行的锚，改了已有
-    产物的对应关系就断了，所以表单里干脆不放编号输入框，只随 data() 透传"""
+    产物的对应关系就断了，所以表单里干脆不放编号输入框，只随 data() 透传
+
+    提示词框里藏了一套维护人翻译工具（Alt+W / macOS ⌘+W 输口令唤出）：
+    提示词多是英文写的，同事看不懂，机翻一份中文对照给人读；对照这一份可以直接编辑，
+    改完点「改回英文」把中文上的修改回译进原文——不会写英文也能改提示词。
+    译文进 tasks.prompt_zh，提交链路永远只读原文，翻错也不影响生成。"""
+
+    TRAY_H = 38        # 翻译工具条占多高，唤出时把弹窗撑开，别挤压提示词框
 
     def __init__(self, parent=None, task=None):
         super().__init__(parent)
-        self.setWindowTitle("新建任务" if task is None else "编辑任务")
+        task = task or {}
+        self._task_id = task.get("id")               # 新建时为空，存不了译文
+        self.setWindowTitle("新建任务" if not task else "编辑任务")
         self.setFixedSize(540, 520)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 20, 24, 20)
 
         form = QFormLayout()
-        self._num = str((task or {}).get("num") or "")   # 只做透传，不给编辑
+        self._num = str(task.get("num") or "")   # 只做透传，不给编辑
         # 品名：可从产品中心下拉选择，也可手动输入新名称，通版素材可留空
         self.ed_product = QComboBox()
         self.ed_product.setEditable(True)
@@ -54,6 +67,27 @@ class TaskDialog(QDialog):
         form.addRow("脚 本", self.ed_script)
         form.addRow("提示词", self.ed_prompt)
         lay.addLayout(form)
+
+        # ---- 翻译工具条（默认隐藏，Alt+W 唤出）----
+        self._zh = str(task.get("prompt_zh") or "")      # 已存的中文对照
+        self._raw = self.ed_prompt.toPlainText()          # 切到对照时的原文缓存
+        # 对照对应的原文快照：一开始就把当前提示词当基准，才能区分
+        # “库里的旧对照还作数”和“改过了得重翻”
+        self._zh_src = self._raw
+        self._showing_zh = False
+        self._tray_unlocked = False
+        self._worker = None
+        self._op = ""
+        # 接口刚翻出来的那份中文：跟编辑框里的对照一比，就知道人改没改过
+        self._zh_base = self._zh
+        self._loading = False           # 程序自己改编辑框时挡住 textChanged
+        self.tray = self._build_tray()
+        lay.addWidget(self.tray)
+        self.ed_prompt.textChanged.connect(self._on_prompt_edited)
+        # 仅本弹窗激活时接的快捷键：不抢主窗口那个 Alt+W
+        sc = QShortcut(QKeySequence(MAINTAINER_SHORTCUT), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self._summon_translate)
 
         btns = QHBoxLayout()
         btns.addStretch(1)
@@ -101,6 +135,207 @@ class TaskDialog(QDialog):
             nav.setCurrentRow(1)
         self.done(QDialog.DialogCode.Accepted)   # 不走 accept()，避免重复弹建档提示
 
+    # ================= 翻译（只给人看的中文对照）=================
+    def _build_tray(self):
+        tray = QWidget()
+        row = QHBoxLayout(tray)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.b_trans = QPushButton("🌐 译成中文")
+        self.b_trans.setObjectName("GhostBtn")
+        self.b_trans.setToolTip("只把提示词里的英文翻成中文，中文、标点、换行原样保留；\n"
+                                "译文另存一个字段，提交给云端的仍是原文\n"
+                                "（在中文对照上改过再点它＝丢弃改动、按当前原文重翻）")
+        self.b_trans.clicked.connect(self._translate_all)
+        self.b_view = QPushButton("看对照")
+        self.b_view.setObjectName("GhostBtn")
+        self.b_view.setToolTip("在原文与中文对照之间切换；对照这一份可以直接编辑")
+        self.b_view.clicked.connect(self._toggle_view)
+        self.b_view.setEnabled(bool(self._zh))
+        self.b_back = QPushButton("↩ 改回英文")
+        self.b_back.setObjectName("GhostBtn")
+        self.b_back.setToolTip("在中文对照上直接改（例：把「爸爸」改成「姐姐」），再点这里：\n"
+                               "改过的中文整段回译成英文、覆盖回原文提示词，提交的就是这份英文。\n"
+                               "只在「看对照」状态下可用（改的是中文那一份）")
+        self.b_back.clicked.connect(self._write_back)
+        self.b_back.setEnabled(self._showing_zh)
+        self.lbl_tr = QLabel("已存对照" if self._zh else "")
+        self.lbl_tr.setObjectName("PageTip")
+        row.addWidget(self.b_trans)
+        row.addWidget(self.b_view)
+        row.addWidget(self.b_back)
+        row.addWidget(self.lbl_tr, 1)
+        tray.setVisible(False)
+        return tray
+
+    def _summon_translate(self):
+        """Alt+W（macOS ⌘+W）：第一次要口令，之后就是纯开关"""
+        if self._tray_unlocked:
+            self._show_tray(not self.tray.isVisible())
+            return
+        code, ok = QInputDialog.getText(self, "维护人验证", "请输入维护人口令：",
+                                        QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        if code != API_MAINTAINER_CODE:
+            QMessageBox.warning(self, "口令错误", "维护人口令不正确")
+            return
+        self._tray_unlocked = True
+        self._show_tray(True)
+        self.lbl_tr.setText("翻译只做对照，提交仍用原文")
+        self.ed_prompt.setFocus()
+
+    def _show_tray(self, on):
+        self.tray.setVisible(on)
+        self.setFixedSize(self.width(), 520 + (self.TRAY_H if on else 0))
+        if not on:
+            self._show_zh(False)          # 收起工具条时别把人留在中文对照上
+
+    def _current_prompt(self):
+        """当前原文：处于对照模式时编辑框里是译文，不能直接拿"""
+        return self._raw if self._showing_zh else self.ed_prompt.toPlainText()
+
+    def _set_text(self, text):
+        """程序改编辑框内容：挡住 textChanged，不然会被当成用户在手改"""
+        self._loading = True
+        try:
+            self.ed_prompt.setPlainText(text)
+        finally:
+            self._loading = False
+
+    def _zh_dirty(self):
+        """中文对照被人改过没改过（改过才需要回译写进原文）"""
+        return self._zh != self._zh_base
+
+    def _on_prompt_edited(self):
+        if self._loading:
+            return
+        if self._showing_zh:
+            # 编辑框里此刻是中文对照：改动记到对照上，原文一个字都不动
+            self._zh = self.ed_prompt.toPlainText()
+            self.b_back.setEnabled(True)
+            self.lbl_tr.setText("✍ 中文改过了，点「改回英文」写进原文" if self._zh_dirty()
+                                else "对照可以直接改，不影响原文")
+            return
+        if not self._zh:
+            return
+        if self._zh_src and self.ed_prompt.toPlainText() != self._zh_src:
+            self.lbl_tr.setText("⚠ 提示词改过了，对照是改之前翻的")
+
+    def _show_zh(self, on):
+        if on == self._showing_zh:
+            return
+        if on:
+            if not self._zh:
+                return
+            self._raw = self.ed_prompt.toPlainText()
+            self._set_text(self._zh)
+        else:
+            if self._showing_zh:
+                self._zh = self.ed_prompt.toPlainText()    # 离开前把中文改动留在对照上
+            self._set_text(self._raw)
+        self._showing_zh = on
+        # 对照模式不再只读：这套工具的要害就是“在中文上改、改完回译成英文”
+        self.b_view.setText("看原文" if on else "看对照")
+        self.b_back.setEnabled(on)
+        self.lbl_tr.setText("对照模式：改中文，再点「改回英文」" if on else
+                            ("✍ 中文改过了，点「改回英文」写进原文" if self._zh_dirty() else ""))
+
+    def _toggle_view(self):
+        if not self._showing_zh and self._zh_src and \
+                self.ed_prompt.toPlainText() != self._zh_src:
+            self.lbl_tr.setText("⚠ 展示的是改之前翻的对照，建议重新翻译")
+        self._show_zh(not self._showing_zh)
+
+    def _persist_zh(self):
+        """译文一到手就先落库：使用者常常是翻完看一眼就关窗，不该丢
+
+        走 set_prompt_zh 而不是 update_row：刷了 updated_at / prompt_changed_at
+        会把这条任务在「迭代执行」判定里算成“提示词又改了”，诱发重跑。"""
+        if self._task_id is None:
+            return
+        try:
+            task_store.set_prompt_zh(self._task_id, self._zh)
+        except Exception as e:                # 落库失败不能把阅读工具带崩
+            self.lbl_tr.setText(f"⚠ 对照保存失败：{e}")
+
+    def _run(self, fn, op):
+        """接口是同步阻塞的（超时 10s），一律放后台线程；期间锁住编辑框与按钮，
+        免得翻到一半人又改了字、结果落错地方。"""
+        if self._worker is not None:
+            return
+        self._op = op
+        for w in (self.ed_prompt, self.b_trans, self.b_back, self.b_view):
+            w.setEnabled(False)
+        self.lbl_tr.setText("翻译中…" if self._op == "all" else "回译中…")
+        self._worker = ToolWorker(fn, self)
+        self._worker.done.connect(self._on_tr_done)
+        self._worker.start()
+
+    def _on_tr_done(self, res):
+        self._worker = None
+        for w in (self.ed_prompt, self.b_trans):
+            w.setEnabled(True)
+        if isinstance(res, Exception):
+            self.b_view.setEnabled(bool(self._zh))
+            self.b_back.setEnabled(self._showing_zh)
+            QMessageBox.warning(self, "翻译失败", str(res) or type(res).__name__)
+            self.lbl_tr.setText("翻译失败")
+            return
+        if self._op == "all":
+            self._zh = str(res or "")
+            self._zh_base = self._zh
+            self._zh_src = self._current_prompt()
+            self._persist_zh()
+            self.b_view.setEnabled(True)
+            self._show_zh(True)
+            self.lbl_tr.setText("✓ 对照好了，改中文再点「改回英文」")
+        else:
+            self._apply_back(str(res or ""))
+        self.ed_prompt.setFocus()
+
+    def _apply_back(self, english):
+        """回译结果落回原文：对照留着，因为它就是这份新英文的依据"""
+        if self._showing_zh:
+            self._zh = self.ed_prompt.toPlainText()
+        new = english.strip() or self._raw      # 接口给空不能把提示词清空
+        self._raw = new
+        self._zh_base = self._zh
+        self._zh_src = new
+        self._showing_zh = False                # 切回原文，让人看清楚改成了什么
+        self._set_text(self._raw)
+        self.b_view.setEnabled(bool(self._zh))
+        self.b_view.setText("看对照")
+        self.b_back.setEnabled(False)
+        # prompt_zh 不在这一步落库：原文要等「保存」才写回，先写对照会让库里
+        # 旧英文配上新对照，万一直接关窗就对不上了（保存路径会一起写）
+        self.lbl_tr.setText("✓ 已按中文改回英文（提交用这份）")
+
+    def _translate_all(self):
+        raw = self._current_prompt()
+        if not raw.strip():
+            self.lbl_tr.setText("提示词是空的")
+            return
+        if not translate.has_latin(raw):
+            self.lbl_tr.setText("没看到英文，无需翻译")
+            return
+        self._run(lambda log, progress, stop: translate.translate_mixed(raw), "all")
+
+    def _write_back(self):
+        """把改过的中文对照回译成英文，覆盖回原文提示词"""
+        if not self._showing_zh:
+            self.lbl_tr.setText("先点「看对照」，在中文上改完再来")
+            return
+        zh = self.ed_prompt.toPlainText()
+        self._zh = zh
+        if not translate.has_cjk(zh):
+            self.lbl_tr.setText("对照里没有中文，回译不出英文")
+            return
+        if not self._zh_dirty():
+            self.lbl_tr.setText("中文没改动，原文不用动")
+            return
+        self._run(lambda log, progress, stop: translate.translate_back(zh), "back")
+
     def accept(self):
         """保存前检查：品名未在产品中心建档时，提示是否新建"""
         name = self.ed_product.currentText().strip()
@@ -121,11 +356,15 @@ class TaskDialog(QDialog):
         super().accept()
 
     def data(self):
+        # 提示词永远取原文：对照译文只给人看，直接盖到 prompt 上会把英文提词抹掉
         return {"num": self._num,
                 "product": self.ed_product.currentText().strip(),
                 "remark": self.ed_remark.text().strip(),
                 "script": self.ed_script.toPlainText().strip(),
-                "prompt": self.ed_prompt.toPlainText().strip()}
+                "prompt": self._current_prompt().strip(),
+                "prompt_zh": self._zh,
+                # 译文还对不对得上当前原文（对不上时列表页会清掉这一列）
+                "zh_valid": bool(self._zh) and self._zh_src == self._current_prompt()}
 
     @staticmethod
     def ask(parent, task=None):

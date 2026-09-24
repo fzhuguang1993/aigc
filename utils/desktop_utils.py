@@ -42,16 +42,31 @@ def open_path(path):
 def reveal_in_folder(path):
     """打开文件所在文件夹，并选中该文件（Linux 无选中概念，退化为打开所在目录）
 
-    Windows 必须把 `/select,` 与路径合成一个参数、路径自己带引号：
-    分两个参数传时，路径里有空格或中文就会被 explorer 拆成两个东西，
-    结果是只打开文件夹不选中文件（看上去就像“定位没生效”）。"""
+    Windows 的坑有两层，少处理一层都定位不了：
+    1) `/select,` 必须和路径拼成一个参数、路径自己带引号：分两个参数传时，
+       路径里有空格或中文就会被 explorer 拆成两段，结果是只开文件夹不选中。
+    2) 但拼成一个参数后用参数列表（list）交给 subprocess，Python 会把里面那对
+       引号再转义成 \\"（命令行变成 /select,\\"C:\\...\\"1.mp4\\"）。explorer 自己那套
+       解析不认这层反斜杠，整串当成无效路径 —— 表现就是谁也没选中，直接开到
+       【此电脑】。所以这条命令行必须自己拼成完整字符串递进去，别再过 list2cmdline。
+    """
     p = Path(str(path)).expanduser()
     try:
-        target = str(p.resolve())
+        target = os.path.normpath(str(p.resolve()))
     except OSError:
-        target = str(p.absolute())
+        target = os.path.normpath(str(p.absolute()))
     if sys.platform.startswith("win"):
-        subprocess.Popen(["explorer", f'/select,"{os.path.normpath(target)}"'])
+        if os.path.exists(target):
+            subprocess.Popen(f'explorer /select,"{target}"')
+            return
+        # 文件已经不在了：/select, 指着空路径同样会开到【此电脑】，
+        # 那就退一步只打开它该在的文件夹（连文件夹都没了就不折腾）
+        parent = Path(target).parent
+        try:
+            if parent.exists():
+                os.startfile(str(parent))
+        except OSError:
+            pass
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-R", target])
     else:

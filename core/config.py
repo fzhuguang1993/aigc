@@ -340,3 +340,27 @@ try:
     del _local
 except ImportError:
     pass
+
+# ============================================================
+# 15. 机器翻译（火山引擎 文本翻译 MT，任务弹窗「提示词中文对照」用）
+#     与提取接口同一套规矩：真实密钥只写本机 core/config_local.py（已 gitignore，
+#     打包时编译进 exe），仓库里只留 example 模板；不填也能跑，
+#     界面点翻译时会明确提示「未配置翻译密钥」，不静默吞掉。
+#     写法一：core/config_local.py 定义 TRANSLATE = {"ak": "...", "sk": "..."}
+#     写法二：config.json 加 "translate": {"ak": "...", "sk": "..."}（同事本机自助配置）
+# ============================================================
+
+def _load_translate():
+    if CONFIG_JSON.exists():
+        cfg = _json_data().get("translate") or {}
+        if isinstance(cfg, dict) and cfg:
+            return cfg
+    try:
+        from core.config_local import TRANSLATE
+        return dict(TRANSLATE)
+    except Exception:
+        return {}
+
+
+TRANSLATE = {"ak": "", "sk": "", "region": "cn-north-1", "project": "default",
+             **{k: v for k, v in _load_translate().items() if v}}

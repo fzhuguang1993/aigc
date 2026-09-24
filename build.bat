@@ -28,11 +28,19 @@ if not exist "core\config_local.py" (
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
     --hidden-import=openpyxl --hidden-import=core.config_local ^
+    --hidden-import=volcengine.base.Service ^
+    --hidden-import=volcengine.ApiInfo ^
+    --hidden-import=volcengine.Credentials ^
+    --hidden-import=volcengine.ServiceInfo ^
     desktop.py || goto :error
 
 %PY% -m PyInstaller --noconfirm --onefile --console --name "AIGC视频助手-命令行" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
     --hidden-import=openpyxl --hidden-import=core.config_local ^
+    --hidden-import=volcengine.base.Service ^
+    --hidden-import=volcengine.ApiInfo ^
+    --hidden-import=volcengine.Credentials ^
+    --hidden-import=volcengine.ServiceInfo ^
     main.py || goto :error
 
 echo.
