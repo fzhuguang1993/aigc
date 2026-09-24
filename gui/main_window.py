@@ -22,6 +22,7 @@ from gui.pages_products import ProductsPage
 from gui.pages_risk import RiskPage
 from gui.pages_tools import ToolsPage
 from gui.pages_guide import GuidePage
+from gui.pages_api import ApiManagerPage
 
 
 def resource_path(rel):
@@ -93,9 +94,16 @@ class MainWindow(QMainWindow):
         self.page_tools = ToolsPage()
         self.page_guide = GuidePage()
         self.page_settings = SettingsPage()
+        # 接口管理：默认不进导航（页面在栈里备着），设置页口令验证通过后
+        # reveal_api_page() 才把导航项补出来并直接跳入。导航行号与页面栈索引
+        # 始终一一对应（currentRowChanged→setCurrentIndex 是直连的），所以
+        # 它必须排在最后：前面 9 项不动，它固定落在行号/索引 9。
+        self.page_api = ApiManagerPage()
+        self._nav_api_row = None
         for p in (self.page_tasks, self.page_products, self.page_dashboard,
                   self.page_records, self.page_console, self.page_risk,
-                  self.page_tools, self.page_guide, self.page_settings):
+                  self.page_tools, self.page_guide, self.page_settings,
+                  self.page_api):
             self.pages.addWidget(p)
         body.addWidget(self.pages, 1)
 
@@ -163,6 +171,16 @@ class MainWindow(QMainWindow):
     def _recheck_done(self):
         self._checking = False
         self._update_side_status()
+
+    def reveal_api_page(self):
+        """口令验证通过后由设置页调用：把「🔌 接口管理」补进导航并跳过去
+
+        本次运行期内保持可见（再锁回去没意义：口令都给你了）；
+        重启后恢复默认隐藏。"""
+        if self._nav_api_row is None:
+            self.nav.addItem("🔌  接口管理")
+            self._nav_api_row = self.nav.count() - 1
+        self.nav.setCurrentRow(self._nav_api_row)
 
     def open_output_dir(self):
         """打开（并自动创建）输出文件夹"""

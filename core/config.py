@@ -112,7 +112,7 @@ def _normalized_accounts(accounts):
 
     `AccountState` 是裸取 `cfg["name"]/["base"]/["concurrency"]` 的，手写
     config.json 或内置项少一个键就会在 import 阶段 KeyError，整个软件起不来；
-    base 为空的条目本身就没法用，直接丢掉（与 gui.pages_settings.parse_lines 同口径）。"""
+    base 为空的条目本身就没法用，直接丢掉（与 gui.pages_api.parse_lines 同口径）。"""
     out = []
     for i, a in enumerate(accounts or []):
         if isinstance(a, str):                      # 允许只写一个地址

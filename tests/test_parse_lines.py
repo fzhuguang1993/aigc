@@ -3,10 +3,11 @@ tests/test_parse_lines.py —— 线路配置纯函数回归（粘贴导入解�
 
 粘贴入口接受三种来源（本软件复制的输出、纯地址数组、整份 config.json），
 解析失败必须返回 None 而不是抛异常——GUI 据此保持表格原样。
+纯函数随线路部署区一起住在「接口管理」页（gui/pages_api.py）。
 """
 import json
 
-from gui.pages_settings import _browser_url, dedupe_browser_urls, parse_lines
+from gui.pages_api import _browser_url, dedupe_browser_urls, parse_lines
 
 
 def test_roundtrip_of_copy_output():

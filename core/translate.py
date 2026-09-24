@@ -133,21 +133,12 @@ def configured():
     return bool(ak and sk and not ak.startswith("<"))
 
 
-def _client():
-    """火山 MT 客户端：只借 SDK 的 V4 签名，服务类自己搭。
+def _new_client(ak, sk):
+    """用指定密钥搭一个火山 MT 服务类客户端（_client 与 probe 共用）。
 
     官网文档那段 `from volcengine.mt.MtService import MtService` 在 1.0.228 里已经
     没得了（包内压根没有 mt 子模块），但 base.Service 是各服务共用的，自己拼
     ServiceInfo/ApiInfo 反而不依赖具体 SDK 版本。"""
-    global _CLIENT
-    if not configured():
-        raise TranslateError(
-            "还没配置翻译密钥：在本机 core/config_local.py 里填 "
-            'TRANSLATE = {"ak": "...", "sk": "..."}'
-            "（火山引擎控制台申请，需先开通「文本翻译」），"
-            '或在 config.json 写 "translate": {"ak": "…", "sk": "…"}')
-    if _CLIENT is not None:
-        return _CLIENT
     try:
         from volcengine.ApiInfo import ApiInfo
         from volcengine.Credentials import Credentials
@@ -161,11 +152,43 @@ def _client():
     apis = {ACTION: ApiInfo("POST", "/", {"Action": ACTION, "Version": VERSION}, {}, {})}
     cli = Service(info, apis)
     # SDK 的 Service.init() 会被环境变量 HOME 下的 ~/.volc/credentials 里的密钥抢位，
-    # 构完再显式写一次，保证用的一定是 config_local 里这一对
-    cli.set_ak(str(cfg["ak"]).strip())
-    cli.set_sk(str(cfg["sk"]).strip())
-    _CLIENT = cli
+    # 构完再显式写一次，保证用的一定是传进来这一对
+    cli.set_ak(str(ak).strip())
+    cli.set_sk(str(sk).strip())
     return cli
+
+
+def _client():
+    """火山 MT 客户端：只借 SDK 的 V4 签名，服务类自己搭（启动配置那份，建好缓存）"""
+    global _CLIENT
+    if not configured():
+        raise TranslateError(
+            "还没配置翻译密钥：在本机 core/config_local.py 里填 "
+            'TRANSLATE = {"ak": "...", "sk": "..."}'
+            "（火山引擎控制台申请，需先开通「文本翻译」），"
+            '或在 config.json 写 "translate": {"ak": "…", "sk": "…"}')
+    if _CLIENT is None:
+        cfg = TRANSLATE or {}
+        _CLIENT = _new_client(cfg["ak"], cfg["sk"])
+    return _CLIENT
+
+
+def probe(ak, sk, text="hello world"):
+    """拿指定密钥直连火山 MT 翻一句：接口管理页「🌐 测试翻译」用。
+
+    不碰全局客户端与结果缓存——密钥填对没有，当场见分晓，不用保存重启再试。"""
+    ak, sk = str(ak or "").strip(), str(sk or "").strip()
+    if not (ak and sk):
+        raise TranslateError("先把 AK / SK 都填上再测")
+    cli = _new_client(ak, sk)
+    project = str((TRANSLATE or {}).get("project") or "default")
+    body = {"SourceLanguage": "en", "TargetLanguage": DEFAULT_TARGET,
+            "ProjectName": project, "TextList": [text]}
+    try:
+        resp = json.loads(cli.json(ACTION, {}, json.dumps(body)))
+    except Exception as e:
+        raise TranslateError(_friendly(str(e)))
+    return _extract(resp, 1)[0]
 
 
 def _item_text(item):
