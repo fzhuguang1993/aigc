@@ -235,7 +235,7 @@ class TasksPage(QWidget):
         lay.setContentsMargins(24, 12, 24, 12)
         lay.setSpacing(6)
 
-        lay.addWidget(page_header("任务中心", "单击输出列播放视频 · 单击/空格弹出全文 · 任意键关闭 · "
+        lay.addWidget(page_header("任务中心", "输出列单击/空格播视频 · 文本列单击/空格弹全文 · 任意键关闭 · "
                                   "右键定位/复制/标可用不可用", icon="📋"))
 
         # ---------- 工具栏 ----------
@@ -1237,7 +1237,9 @@ class TasksPage(QWidget):
                     self.table.clearSelection()
         if obj is self.table and e.type() == QEvent.Type.KeyPress \
                 and e.key() == Qt.Key.Key_Space and self._hover_cell:
-            self._popup_preview(*self._hover_cell)
+            # 空格与单击同路由：文本列弹全文预览，输出列播视频（鼠标停哪敲哪，
+            # 不用绕到键盘去点鼠标）；其余列本来就不响应，保持一致
+            self._on_cell_click(*self._hover_cell)
             return True                     # 消费掉，避免表格另行处理空格
         # C2：关键按钮首次悬停时多讲一句（看过一次就摘掉过滤器，不再弹）
         if getattr(self, "_hint_widgets", None) and obj in self._hint_widgets \
