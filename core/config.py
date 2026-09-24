@@ -364,3 +364,33 @@ def _load_translate():
 
 TRANSLATE = {"ak": "", "sk": "", "region": "cn-north-1", "project": "default",
              **{k: v for k, v in _load_translate().items() if v}}
+
+# ============================================================
+# 16. 通用「段」读写：config.json 的一个顶层键 = 一个功能的配置
+#     SMB 上传、视频溯源 MySQL 等功能用它把界面填的连接信息落盘；
+#     后续新功能要进「配置包」，配置存进 config.json 的自己的段里、
+#     用这两个函数读写即可——配置迁移包（core/config_package.py）
+#     整体带着 config.json 走，不用再单独登记文件。
+#     写回是「读旧 dict → 只换自己那段 → 整份合并写」，不会伤及
+#     accounts/filename 等其它段；写完刷新启动缓存，面板存完即生效。
+# ============================================================
+
+def read_section(key, defaults=None):
+    """读 config.json 的某段，用内置默认值兜底（空段/缺段=全默认）"""
+    val = _json_data().get(key)
+    if not isinstance(val, dict):
+        val = {}
+    return {**(defaults or {}), **val}
+
+
+def write_section(key, value):
+    """把某段合并写回 config.json（原子写 + 刷新缓存）"""
+    data = dict(_json_data())
+    data[key] = value
+    CONFIG_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_JSON.with_name(CONFIG_JSON.name + ".tmp")
+    tmp.write_text(_json.dumps(data, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    tmp.replace(CONFIG_JSON)           # 同盘 rename：不留半截文件
+    global _JSON_CACHE
+    _JSON_CACHE = data                 # 启动缓存跟着换，别读旧值

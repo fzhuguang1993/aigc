@@ -10,7 +10,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 
 from gui.header import page_header
 
-HEADERS = ["账号", "线路状态", "接口地址", "并发上限", "本地进行中", "剩余槽位",
+# 注意：这里故意不放「接口地址」列——地址是访问凭证，普通使用者的界面
+# 上不该看得到；账号名足够定位是哪条线（维护人在口令锁后的设置页里改）
+HEADERS = ["账号", "线路状态", "并发上限", "本地进行中", "剩余槽位",
            "健康检查连败", "云端负载(实时)"]
 
 
@@ -40,10 +42,10 @@ class ConsolePage(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         hh = self.table.horizontalHeader()
-        for c, w in {0: 90, 1: 90, 3: 80, 4: 100, 5: 80, 6: 110, 7: 110}.items():
+        for c, w in {1: 90, 2: 80, 3: 100, 4: 80, 5: 110, 6: 110}.items():
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             self.table.setColumnWidth(c, w)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.table)
 
         self.lbl_sum = QLabel("")
@@ -75,18 +77,17 @@ class ConsolePage(QWidget):
             # 四档灯共用 gui.header.line_light：⚪ 未测 / 🟢 探活应答 / 🟡 服务在但
             # 探活路径未实现 / 🔴 连不上，不在本页另写一套判定
             status_txt, status_color = line_light(acc, checked)[1:]
-            vals = [acc.name, status_txt, acc.base,
+            vals = [acc.name, status_txt,
                     acc.concurrency, run, max(acc.concurrency - run, 0),
                     acc.fail_count, cloud_txt]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
-                if c != 2:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if c == 1:
                     item.setForeground(QColor(status_color))
-                if c == 5 and int(v) == 0:
+                if c == 4 and int(v) == 0:
                     item.setForeground(QColor("#F5A623"))
-                if c == 7:
+                if c == 6:
                     item.setToolTip(cloud_tip)
                     if cloud and cloud[1] != "cloud":
                         item.setForeground(QColor("#E5484D"))

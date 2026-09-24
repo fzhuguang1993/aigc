@@ -310,23 +310,25 @@ class SettingsPage(QWidget):
         tip.setStyleSheet("color:#6B7280;")
         lay.addWidget(tip)
 
-        # ---------- 配置迁移（加密包）：线路/接口凭证/命名规则/界面偏好一键搬家 ----------
+        # ---------- 配置迁移（加密包）：接口/命名/字段/SMB/溯源/产品风控图片一键搬家 ----------
         lay.addWidget(QLabel(
-            "配置迁移（加密包：线路地址、各接口 key、命名规则、界面偏好全部在内，"
-            "换新机器 / 交给同事时用）："))
+            "配置迁移（加密包：线路与各接口、SMB/溯源账密、命名规则、任务界面字段、"
+            "产品与规范卡（含产品图片）、风控政策全部在内，换新机器 / 交给同事时用）："))
         mrow = QHBoxLayout()
         b_pkg_exp = QPushButton("📤 导出配置包")
         b_pkg_exp.setObjectName("GhostBtn")
         b_pkg_exp.setToolTip(
-            "把本机全部配置加密成一个 .aigccfg 文件（默认存到桌面）；\n"
+            "把本机全部配置与产品/风控业务数据（含产品图片）加密成一个 .aigccfg 文件\n"
+            "（默认存到桌面）；包内容清单见上方说明。\n"
             "文件用软件内置口令加密，外人拿到看不到接口地址和 key；\n"
-            "里面含 key，只发给信得过的同事")
+            "里面含凭证和业务数据，只发给信得过的同事")
         b_pkg_exp.clicked.connect(self._export_pkg)
         b_pkg_imp = QPushButton("📥 一键导入配置")
         b_pkg_imp.setObjectName("GhostBtn")
         b_pkg_imp.setToolTip(
-            "选一个同事导出的 .aigccfg 配置包，软件自动解密覆盖本机配置\n"
-            "（覆盖前旧配置逐个备份成 *.bak-时间戳），导入后重启软件生效")
+            "选一个同事导出的 .aigccfg 配置包，软件自动解密逐条目覆盖本机配置\n"
+            "（导入前列清单让你确认；旧配置文件备份成 *.bak-时间戳；"
+            "产品/风控表整表替换，任务列表不动）；导入后重启软件生效")
         b_pkg_imp.clicked.connect(self._import_pkg)
         mrow.addWidget(b_pkg_exp)
         mrow.addWidget(b_pkg_imp)
@@ -648,18 +650,19 @@ class SettingsPage(QWidget):
         if not path.endswith(cp.SUFFIX):
             path += cp.SUFFIX
         try:
-            n = cp.export_package(path)
+            info = cp.export_package(path)
         except Exception as e:
             QMessageBox.warning(self, "导出失败", str(e))
             return
         QMessageBox.information(
             self, "已导出",
-            f"已把 {n} 个配置文件加密导出到：\n{path}\n\n"
+            "已把 {n} 个文件（{items}）加密导出到：\n{p}\n\n"
             "文件已用软件内置口令加密，只有装了本软件的机器能导入；\n"
-            "但里面含接口 key，请只发给信得过的同事。")
+            "但里面含接口凭证和业务数据，请只发给信得过的同事。".format(
+                n=info["files"], items="、".join(info["items"]), p=path))
 
     def _import_pkg(self):
-        """选包 → 解密（内置口令优先，不对再问一次）→ 确认 → 覆盖并备份"""
+        """选包 → 解密（内置口令优先，不对再问一次）→ 确认 → 逐条目覆盖并备份"""
         from core import config_package as cp
         path, _ = QFileDialog.getOpenFileName(
             self, "选择配置包", str(Path.home()),
@@ -667,10 +670,10 @@ class SettingsPage(QWidget):
         if not path:
             return
         try:
-            files = cp.read_package(path)          # 正常同事间互发：零输入
+            pkg = cp.read_package(path)          # 正常同事间互发：零输入
         except ValueError as e:
             if "口令" not in str(e):
-                # 根本不是包/内容坏了/包里有危险文件名：问口令也没用，直接报
+                # 根本不是包/内容坏了：问口令也没用，直接报
                 QMessageBox.warning(self, "导入失败", str(e))
                 return
             # 口令不是内置那个（老包/改过口令）：问一句，别把文件判死
@@ -679,22 +682,29 @@ class SettingsPage(QWidget):
             if not ok:
                 return
             try:
-                files = cp.read_package(path, text.strip())
+                pkg = cp.read_package(path, text.strip())
             except ValueError as e2:
                 QMessageBox.warning(self, "导入失败", str(e2))
                 return
-        names = "、".join(sorted(files))
+        known, unknown = cp.plan_import(pkg)
+        lines = [f"・{t}" for t, _ in known]
+        if unknown:
+            lines.append("（本机版本不认识、将跳过：" + "、".join(unknown) + "）")
+        if not known:
+            QMessageBox.warning(self, "导入失败", "配置包里没有任何本机可导入的内容")
+            return
         if QMessageBox.question(
                 self, "确认导入",
-                f"将覆盖本机以下配置：\n{names}\n\n"
-                "旧配置会逐个备份成 *.bak-时间戳，出事能手动滚回去。\n确定导入吗？",
+                "将覆盖本机以下内容：\n" + "\n".join(lines) + "\n\n"
+                "配置文件旧值会备份成 *.bak-时间戳；产品/风控表整表替换；"
+                "任务列表不受影响。\n确定导入吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         try:
-            n = cp.apply_package(files)
+            result = cp.apply_package(pkg)
         except OSError as e:
-            QMessageBox.warning(self, "导入失败", f"写盘失败：{e}")
+            QMessageBox.warning(self, "导入失败", f"写入失败：{e}")
             return
         # 界面立刻跟着新配置走：注意不能吃 config.ACCOUNTS（那是启动期缓存），
         # 要直接读刚落盘的 config.json；命名/接口等其它项在重启提示里已经说了
@@ -715,6 +725,8 @@ class SettingsPage(QWidget):
             self._refresh_naming()
         except Exception:
             pass            # 刷界面失败不要紧：盘上已生效，重启就好
+        done = "、".join(result["applied"])
         QMessageBox.information(self, "导入完成",
-                                f"已导入 {n} 个配置文件，旧配置已备份。\n"
-                                "重启软件后全部生效。")
+                                f"已导入：{done}。\n"
+                                "旧配置已备份，产品/风控页切过去即是新数据；\n"
+                                "接口线路等重启软件后全部生效。")

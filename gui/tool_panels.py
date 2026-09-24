@@ -630,14 +630,18 @@ class SmbPanel(BasePanel):
                                     "把成品视频批量上传到公司共享盘",
                                     icon="📤"))
         from video_text_tools.config import SMB_CONFIG
+        # 代码里的 SMB_CONFIG 只是出厂默认；真实值存 config.json 的 smb 段
+        # （设置页的加密配置包整体带着 config.json 走，改机免重填）
+        from core.config import read_section
+        cfg = read_section("smb", SMB_CONFIG)
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self.ed_host = QLineEdit(SMB_CONFIG.get("host", ""))
-        self.ed_share = QLineEdit(SMB_CONFIG.get("share_name", ""))
-        self.ed_user = QLineEdit(SMB_CONFIG.get("username", ""))
-        self.ed_pass = QLineEdit(SMB_CONFIG.get("password", ""))
+        self.ed_host = QLineEdit(cfg.get("host", ""))
+        self.ed_share = QLineEdit(cfg.get("share_name", ""))
+        self.ed_user = QLineEdit(cfg.get("username", ""))
+        self.ed_pass = QLineEdit(cfg.get("password", ""))
         self.ed_pass.setEchoMode(QLineEdit.Password)
-        self.ed_remote = QLineEdit(SMB_CONFIG.get("remote_path", ""))
+        self.ed_remote = QLineEdit(cfg.get("remote_path", ""))
         self.ed_remote.setPlaceholderText("共享内的子目录，如：溯源视频")
         form.addRow("服务器地址：", self.ed_host)
         form.addRow("共享名：", self.ed_share)
@@ -654,11 +658,22 @@ class SmbPanel(BasePanel):
         self.b_test.setObjectName("GhostBtn")
         self.b_test.clicked.connect(self._test)
         r.addWidget(self.b_test)
+        b_save = QPushButton("💾 保存连接配置")
+        b_save.setObjectName("GhostBtn")
+        b_save.setToolTip("把上面这几格存进 config.json（smb 段），下次打开还在；\n"
+                          "设置页「📤 导出配置包」会把它们一并加密搬走")
+        b_save.clicked.connect(self._save_cfg)
+        r.addWidget(b_save)
         r.addStretch(1)
         outer.addLayout(r)
 
         self.make_log_box(outer)
         self.make_run_row(outer, "▶ 上传")
+
+    def _save_cfg(self):
+        from core.config import write_section
+        write_section("smb", self._cfg())
+        self._append_log("💾 连接配置已保存（config.json 的 smb 段）")
 
     def _cfg(self):
         return {"host": self.ed_host.text().strip(),
@@ -708,12 +723,15 @@ class TracePanel(BasePanel):
                                     "从溯源码池取码，按「溯源码_日期_剪辑_运营」重命名并入库",
                                     icon="🔎"))
         from video_text_tools.config import DB_CFG
+        # 同上：DB_CFG 只是出厂默认，真实账密存 config.json 的 trace_mysql 段
+        from core.config import read_section
+        tcfg = read_section("trace_mysql", DB_CFG)
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self.ed_host = QLineEdit(DB_CFG.get("host", ""))
-        self.ed_db = QLineEdit(DB_CFG.get("database", ""))
-        self.ed_user = QLineEdit(DB_CFG.get("user", ""))
-        self.ed_pass = QLineEdit(DB_CFG.get("password", ""))
+        self.ed_host = QLineEdit(tcfg.get("host", ""))
+        self.ed_db = QLineEdit(tcfg.get("database", ""))
+        self.ed_user = QLineEdit(tcfg.get("user", ""))
+        self.ed_pass = QLineEdit(tcfg.get("password", ""))
         self.ed_pass.setEchoMode(QLineEdit.Password)
         self.ed_name = QLineEdit("")
         self.ed_name.setPlaceholderText("剪辑人姓名（用于文件名首拼）")
@@ -730,6 +748,16 @@ class TracePanel(BasePanel):
         form.addRow("剪辑人 ID：", self.spin_uid)
         outer.addLayout(form)
 
+        srow = QHBoxLayout()
+        b_save = QPushButton("💾 保存数据库配置")
+        b_save.setObjectName("GhostBtn")
+        b_save.setToolTip("把 MySQL 地址/库名/账号存进 config.json（trace_mysql 段），\n"
+                          "下次打开还在；设置页「📤 导出配置包」会一并加密搬走")
+        b_save.clicked.connect(self._save_cfg)
+        srow.addWidget(b_save)
+        srow.addStretch(1)
+        outer.addLayout(srow)
+
         self.files = FileListWidget("待溯源视频")
         outer.addWidget(self.files)
 
@@ -742,6 +770,14 @@ class TracePanel(BasePanel):
                 "database": self.ed_db.text().strip() or DB_CFG["database"],
                 "user": self.ed_user.text().strip() or DB_CFG["user"],
                 "password": self.ed_pass.text()}
+
+    def _save_cfg(self):
+        from core.config import write_section
+        cfg = self._db_cfg()
+        write_section("trace_mysql", {k: cfg.get(k, "") for k in
+                                      ("host", "port", "database", "user",
+                                       "password", "charset")})
+        self._append_log("💾 数据库配置已保存（config.json 的 trace_mysql 段）")
 
     def _task(self):
         paths = self.files.paths()
