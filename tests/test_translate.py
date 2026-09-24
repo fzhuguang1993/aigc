@@ -6,6 +6,8 @@ tests/test_translate.py —— 提示词翻译的纯逻辑回归（不碰网络�
 2. 行数、缩进、换行位置与原文严格对齐（界面「原文 / 中文对照」切换靠这个）；
 3. 接口抽风（返回空、条数对不上、语向不支持）时报的是人看得懂的话，
    而不是把提示词吞成空串——提交用的仍是原文，但对照错了会误导人。
+另有额度与持久缓存的回归：单机日限 10 万字节、超限拒发但缓存照用、
+重启（模块态清空）后同样的字不再重复送接口。
 """
 import json
 
@@ -176,3 +178,82 @@ def test_configured_rejects_placeholder_keys(monkeypatch):
     monkeypatch.setattr(T, "TRANSLATE", {})
     with pytest.raises(T.TranslateError):
         T._client()
+
+
+# ---------------- 持久缓存与日额度 ----------------
+
+@pytest.fixture
+def state_home(tmp_path, monkeypatch):
+    """把配置家指到空目录并重置模块态，接口换成计数假实现
+
+    每例一套：用例之间不共享 translate_state.json，
+    谁先翻过什么、用了多少额度都不会泄漏到下一个用例。"""
+    monkeypatch.setattr(T, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(T, "_STATE", None)
+    T._CACHE.clear()
+
+    calls = {"n": 0}
+
+    class Cli:
+        def json(self, action, qs, body):
+            calls["n"] += 1
+            texts = json.loads(body)["TextList"]
+            return json.dumps({"TranslationList":
+                               [{"Translation": f"《{t}》"} for t in texts]})
+
+    monkeypatch.setattr(T, "_client", lambda: Cli())
+    yield calls
+    T._CACHE.clear()
+    monkeypatch.setattr(T, "_STATE", None)
+
+
+def test_cache_persists_across_restart(state_home):
+    """翻一次就落盘：重启（内存缓存清空）后同样的字不再碰接口"""
+    assert T.translate_texts(["close up"]) == ["《close up》"]
+    assert state_home["n"] == 1
+    T._CACHE.clear()                      # 模拟重启：模块态全没，盘上还在
+    T._STATE = None
+    again = T.translate_texts(["close up"])
+    assert again == ["《close up》"]
+    assert state_home["n"] == 1, "命中持久缓存不该再发请求"
+
+
+def test_quota_blocks_new_requests_but_not_cache_hits(state_home, monkeypatch):
+    """额度用满：新字拒发并给「明日再用」的人话；已经翻过的照旧能看"""
+    assert T.translate_texts(["medium shot"]) == ["《medium shot》"]
+    monkeypatch.setattr(T, "DAILY_LIMIT", 1)      # 假装已经顶到上限
+    with pytest.raises(T.TranslateError, match="明日才能再次使用"):
+        T.translate_texts(["wide shot"])          # 没翻过的新字：拒发
+    assert T.translate_texts(["medium shot"]) == ["《medium shot》"], \
+        "纯命中缓存不耗额度，超限当天也该能看旧译文"
+
+
+def test_usage_counts_utf8_bytes_and_resets_on_new_day(state_home):
+    """额度按 utf-8 原文字节计（中文一行 6 字节）；日期翻篇自动归零"""
+    T.translate_texts(["中文"])                   # 送接口的原文照记 utf-8 字节
+    assert T.used_bytes() == len("中文".encode("utf-8")) == 6
+    T._STATE["usage"]["date"] = "2000-01-01"      # 昨天的账今天不作数
+    assert T.used_bytes() == 0 and T.quota_left()
+
+
+def test_state_file_shape_survives_garbage(tmp_path, monkeypatch):
+    """盘上文件坏了/是老格式：当冷启动继续翻，绝不在 import/首次用时炸软件"""
+    monkeypatch.setattr(T, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(T, "_STATE", None)
+    T._CACHE.clear()
+    (tmp_path / "translate_state.json").write_text("{坏一半的 json", encoding="utf-8")
+    assert T.used_bytes() == 0 and T._load_state() is not None
+
+
+def test_probe_does_not_touch_quota_or_cache(monkeypatch):
+    """维护人「测试翻译」不占使用者额度、不污染结果缓存"""
+    seen = {}
+
+    class Cli:
+        def json(self, action, qs, body):
+            seen["body"] = json.loads(body)
+            return json.dumps({"TranslationList": [{"Translation": "你好，世界"}]})
+
+    monkeypatch.setattr(T, "_new_client", lambda ak, sk: Cli())
+    assert T.probe("AK", "SK", "hello world") == "你好，世界"
+    assert T._STATE is None and ("auto", "zh", "hello world") not in T._CACHE

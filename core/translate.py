@@ -6,13 +6,19 @@
 #   · 全文「中文 → 英文」：在中文对照上改完，整段回译覆盖回原文（translate_back）
 # 翻译结果只给人看，提交链路永远用原文（见 store/task_store.set_prompt_zh）。
 #
+# 额度与缓存：单机每天最多送 DAILY_LIMIT 字节原文（火山按原文量计费口径），
+# 用完当场拒发、弹窗提示明日再用；翻过的片段落盘到配置家
+# translate_state.json，重启后同样文字不再翻、不再耗额度。
+#
 # 依赖与密钥全部延迟导入：没装 volcengine / 没配 AK/SK 时本模块照常 import，
 # 只有真去点翻译才抛 TranslateError，界面据此给「装什么、配什么」的可执行提示。
 # ============================================================
 import json
 import re
+import time
 
 from core.config import TRANSLATE
+from core.paths import CONFIG_DIR
 
 # 火山「文本翻译」官方限制：一次请求 TextList 不超 16 条、总长不超 5000 字符，
 # 单条不超 10000。取保守值，超长的行再按空格拆片，免得一整段长提示词被接口拦掉。
@@ -109,20 +115,88 @@ def _chunks(body, limit=MAX_CHARS):
 
 _CLIENT = None
 # (源语种, 目标语种, 原文) -> 译文：一段提示词里重复短语很多（“close up”“medium shot”…），
-# 不缓存就会为同一个词反复挨着限流（接口 -429 是真实存在的）
+# 不缓存就会为同一个词反复挨着限流（接口 -429 是真实存在的）。
+# 缓存同时落盘到 CONFIG_DIR/translate_state.json：翻一次就一次的钱，
+# 重开软件不该为同样的字再跑一趟——日额度是按机器算的，重启躲不开。
 _CACHE = {}
-CACHE_MAX = 512
+CACHE_MAX = 2000           # 内存/盘上条目上限：超了丢最旧的（dict 保插入顺序）
+DAILY_LIMIT = 100_000      # 单机每天送接口的原文字节数（utf-8 口径）
+QUOTA_MSG = "今日翻译用量已达 10 万字节上限，使用受限，明日才能再次使用"
+
+_STATE = None              # {"usage": {"date": …, "bytes": …}}；缓存本体在 _CACHE
 
 
-def _cache_get(key):
-    return _CACHE.get(key, "")
+def _state_path():
+    return CONFIG_DIR / "translate_state.json"
 
 
-def _cache_put(key, value):
-    if value:
-        if len(_CACHE) >= CACHE_MAX:
-            _CACHE.clear()          # 只做防限流，不值得上 LRU，满了直接重开
-        _CACHE[key] = value
+def _ck_key(source, target, text):
+    """缓存键的 JSON 化写法：元组存成 JSON 数组，免得提示词里真出现分隔符"""
+    return json.dumps([source, target, text], ensure_ascii=False)
+
+
+def _load_state():
+    """懒加载持久缓存与当日用量（第一次用时才碰盘，不在 import 期）"""
+    global _STATE
+    if _STATE is not None:
+        return _STATE
+    try:
+        data = json.loads(_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        data = {}          # 没文件/坏了＝冷启动，无所谓
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    try:
+        saved = int(usage.get("bytes") or 0)
+    except (TypeError, ValueError):
+        saved = 0
+    _STATE = {"usage": {"date": str(usage.get("date") or ""), "bytes": saved}}
+    for k, v in (data.get("cache") or {}).items():
+        try:
+            key = tuple(json.loads(k))
+        except Exception:
+            continue       # 坏键丢键不炸，缓存丢了只是多翻一次
+        if len(key) == 3 and isinstance(v, str):
+            _CACHE.setdefault(key, v)   # 盘上的旧条目不当新条目复活（不挤新鲜位）
+    return _STATE
+
+
+def _save_state():
+    """回写缓存+用量：写失败只丢缓存，不影响这次翻译给人看"""
+    try:
+        items = list(_CACHE.items())[-CACHE_MAX:]
+        data = {"cache": {_ck_key(*k): v for k, v in items},
+                "usage": _load_state()["usage"]}
+        p = _state_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _today_usage():
+    """取当日用量 dict；日期翻篇就地归零（今天第一次翻自动重置昨天）"""
+    u = _load_state()["usage"]
+    if u["date"] != time.strftime("%Y-%m-%d"):
+        u["date"], u["bytes"] = time.strftime("%Y-%m-%d"), 0
+    return u
+
+
+def used_bytes():
+    """今天已送接口的原文字节数（给界面/测试看额度还剩多少用）"""
+    return _today_usage()["bytes"]
+
+
+def quota_left():
+    """额度是否还有：纯命中缓存的翻译不受额度限制（字已经付过钱）"""
+    return used_bytes() < DAILY_LIMIT
+
+
+def _add_bytes(n):
+    """记一笔用量：只要真送进了接口就算用掉（接口报错也可能计费，宁严勿松）"""
+    _today_usage()["bytes"] += int(n)
+    _save_state()
 
 
 def configured():
@@ -176,7 +250,8 @@ def _client():
 def probe(ak, sk, text="hello world"):
     """拿指定密钥直连火山 MT 翻一句：接口管理页「🌐 测试翻译」用。
 
-    不碰全局客户端与结果缓存——密钥填对没有，当场见分晓，不用保存重启再试。"""
+    不碰全局客户端、结果缓存与日额度——密钥填对没有，当场见分晓，
+    不用保存重启再试；维护人自测也不该占使用者的当日额度。"""
     ak, sk = str(ak or "").strip(), str(sk or "").strip()
     if not (ak and sk):
         raise TranslateError("先把 AK / SK 都填上再测")
@@ -233,11 +308,30 @@ def _batches(texts):
         yield cur
 
 
+def _cache_get(key):
+    return _CACHE.get(key, "")
+
+
+def _cache_put(key, value):
+    if value:
+        _CACHE[key] = value
+        if len(_CACHE) > CACHE_MAX:
+            # 满了丢最旧的（dict 保插入顺序），不像旧版 clear 全扔——
+            # 现在缓存还落盘，全扔等于把付过钱的译文也丢回去重翻
+            for k in list(_CACHE)[:len(_CACHE) - CACHE_MAX]:
+                _CACHE.pop(k, None)
+
+
 def translate_texts(texts, source="auto", target=DEFAULT_TARGET):
-    """批量翻译（自动分批 + 结果缓存）。失败抛 TranslateError，调用方直接展消息"""
+    """批量翻译（自动分批 + 持久缓存 + 单机日额度）。
+    失败抛 TranslateError，调用方直接展消息。
+
+    当日送出字节数已达 DAILY_LIMIT 就拒发新请求（消息给界面弹窗）；
+    纯命中缓存的翻译不走额度——同样的字不再重复耗接口。"""
     texts = [str(t) for t in texts]
     if not texts:
         return []
+    _load_state()          # 先拾回盘上缓存再查缺失，否则重启后第一次必重翻
     cli = _client()
     project = str((TRANSLATE or {}).get("project") or "default")
     todo = []
@@ -248,15 +342,22 @@ def translate_texts(texts, source="auto", target=DEFAULT_TARGET):
             seen.add(key)
             todo.append(t)
     for batch in _batches(todo):
+        if not quota_left():
+            raise TranslateError(QUOTA_MSG)
         body = {"TargetLanguage": target, "ProjectName": project, "TextList": batch}
         if source and source != "auto":       # 文档：不传该字段 = 自动检测
             body["SourceLanguage"] = source
+        batch_bytes = sum(len(t.encode("utf-8")) for t in batch)
         try:
             resp = json.loads(cli.json(ACTION, {}, json.dumps(body)))
         except Exception as e:                 # SDK 把网关/限流/参数错都包成异常
+            _add_bytes(batch_bytes)            # 发出去就计费：失败也记额度
             raise TranslateError(_friendly(str(e)))
+        _add_bytes(batch_bytes)
         for src, got in zip(batch, _extract(resp, len(batch))):
             _cache_put((source, target, src), got)
+    if todo:
+        _save_state()                          # 本轮新翻的译文落盘
     return [_cache_get((source, target, t)) for t in texts]
 
 
