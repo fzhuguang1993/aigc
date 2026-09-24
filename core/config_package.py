@@ -43,9 +43,11 @@ PASSPHRASE = "whosyourdaddy"
 
 MAGIC = b"AIGCCFG2"
 MAGIC_V1 = b"AIGCCFG1"          # 旧格式只读兼容
+LINES_MAGIC = b"AIGCLINES"      # 线路小包专用头：拿错文件当场报，不会误覆盖
 SALT_LEN = 16
 KDF_ROUNDS = 210_000
 SUFFIX = ".aigccfg"
+LINES_SUFFIX = ".aigcline"
 VERSION = 2
 
 # 产品素材里进包的图片类型（视频/音频素材动辄几百 MB，不随配置包搬）
@@ -62,9 +64,10 @@ def _key(passphrase: str, salt: bytes) -> bytes:
     return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
 
 
-def encrypt_bytes(data: bytes, passphrase: str = PASSPHRASE) -> bytes:
+def encrypt_bytes(data: bytes, passphrase: str = PASSPHRASE,
+                  magic: bytes = MAGIC) -> bytes:
     salt = os.urandom(SALT_LEN)
-    return MAGIC + salt + Fernet(_key(passphrase, salt)).encrypt(data)
+    return magic + salt + Fernet(_key(passphrase, salt)).encrypt(data)
 
 
 def _decrypt_envelope(blob: bytes, magic: bytes, passphrase: str) -> bytes:
@@ -416,3 +419,83 @@ def _is_text(item_id: str, name: str) -> bool:
 
 def import_package(src: str, passphrase: str = PASSPHRASE) -> dict:
     return apply_package(read_package(src, passphrase))
+
+
+# ============================================================
+# 线路单独进出口（.aigcline 小包）：接口地址天天变，别拿整包当快递
+#   只搬 accounts 段：导入不碰命名规则/字段/SMB/产品等其它任何配置；
+#   与整包同一套口令加密，靠文件头区分——两个入口拿错文件都会当场拒收。
+# ============================================================
+
+def export_lines(dest: str, config_dir=None) -> dict:
+    """把 config.json 的线路列表加密成单个小文件 → {"count", "names"}"""
+    cfg_p = Path(config_dir or CONFIG_DIR) / "config.json"
+    try:
+        data = json.loads(cfg_p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError("本机还没有 config.json，没有可导出的线路")
+    except Exception:
+        raise ValueError("本机 config.json 读坏了，先修好再导出")
+    accounts = data.get("accounts") or []
+    if not accounts:
+        raise ValueError("本机没有配置任何线路，没有可导出的")
+    payload = {"app": "aigc", "kind": "lines",
+               "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "accounts": accounts}
+    Path(dest).write_bytes(encrypt_bytes(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"), magic=LINES_MAGIC))
+    return {"count": len(accounts),
+            "names": [str(a.get("name") or f"线路{i + 1}")
+                      for i, a in enumerate(accounts)]}
+
+
+def read_lines(src: str, passphrase: str = PASSPHRASE) -> dict:
+    """解密线路包 → {"accounts": [清洗过的行], "exported_at"}；错则抛 ValueError"""
+    blob = Path(src).read_bytes()
+    if not blob.startswith(LINES_MAGIC):
+        if blob.startswith(MAGIC) or blob.startswith(MAGIC_V1):
+            raise ValueError("这是整套配置包，请用「📥 一键导入配置」，不是线路包")
+        raise ValueError("不是 AIGC 线路包（文件头不对）")
+    try:
+        payload = json.loads(_decrypt_envelope(blob, LINES_MAGIC, passphrase)
+                             .decode("utf-8"))
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("口令不对或文件已损坏，无法解密")
+    if payload.get("kind") != "lines" or not isinstance(payload.get("accounts"), list):
+        raise ValueError("线路包内容不对（不是线路清单）")
+    rows = []
+    for i, a in enumerate(payload["accounts"]):
+        if not isinstance(a, dict) or not str(a.get("base") or "").strip():
+            continue                      # 没地址的行没意义：丢掉，别带病导入
+        try:
+            conc = int(a.get("concurrency", 1))
+        except (TypeError, ValueError):
+            conc = 1
+        rows.append({"name": str(a.get("name") or f"线路{i + 1}"),
+                     "base": str(a["base"]).strip(),
+                     "concurrency": max(1, min(conc, 20))})
+    if not rows:
+        raise ValueError("线路包里没有一条有效线路")
+    return {"accounts": rows,
+            "exported_at": str(payload.get("exported_at") or "")}
+
+
+def apply_lines(accounts, config_dir=None) -> int:
+    """只替换 config.json 的 accounts 段，其余配置一个字不动；旧文件自动备份"""
+    cfg_p = Path(config_dir or CONFIG_DIR) / "config.json"
+    data = {}
+    if cfg_p.is_file():
+        try:
+            data = json.loads(cfg_p.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}                     # 读坏了也接着写；_write_text 会先把残件备份走
+    data["accounts"] = accounts
+    _write_text(cfg_p, json.dumps(data, ensure_ascii=False, indent=2))
+    try:                                  # 启动缓存吞掉，下次读盘上是新线路
+        from core import config as _c
+        _c._JSON_CACHE = None
+    except Exception:
+        pass
+    return len(accounts)

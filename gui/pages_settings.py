@@ -305,8 +305,8 @@ class SettingsPage(QWidget):
         self.api_box.setVisible(False)
         lay.addWidget(self.api_box, 1)
         # 锁着的时候给一句人话：告诉使用者线路从哪来，但不暴露解锁入口
-        tip = QLabel("线路与各接口地址由维护人管理：需要换线路时找维护人要一份配置包，\n"
-                     "用下方「📥 一键导入配置」导入即可，不用手敲任何地址。")
+        tip = QLabel("线路与各接口地址由维护人管理：换线路时找维护人要一份线路包（或配置包），\n"
+                     "用下方「📥 导入线路」或「📥 一键导入配置」导入即可，不用手敲任何地址。")
         tip.setStyleSheet("color:#6B7280;")
         lay.addWidget(tip)
 
@@ -334,6 +334,26 @@ class SettingsPage(QWidget):
         mrow.addWidget(b_pkg_imp)
         mrow.addStretch(1)
         lay.addLayout(mrow)
+        # 线路天天变：单独进出口的小包，只碰线路，其它配置不动
+        lrow = QHBoxLayout()
+        b_line_exp = QPushButton("🔗 导出线路")
+        b_line_exp.setObjectName("GhostBtn")
+        b_line_exp.setToolTip(
+            "只导接口线路（名称+地址+并发），加密成一个 .aigcline 小文件\n"
+            "（默认存桌面，文件名带日期如 线路_0924.aigcline）。\n"
+            "线路地址天天换时用这个，不用动整套配置；文件名自带日期，发群里好认新旧")
+        b_line_exp.clicked.connect(self._export_lines)
+        b_line_imp = QPushButton("📥 导入线路")
+        b_line_imp.setObjectName("GhostBtn")
+        b_line_imp.setToolTip(
+            "选一个同事发来的 .aigcline 线路包，只替换本机线路，\n"
+            "其它配置（命名/字段/SMB/产品…）一个字不动；重启后生效\n"
+            "（正在跑的任务不受影响）")
+        b_line_imp.clicked.connect(self._import_lines)
+        lrow.addWidget(b_line_exp)
+        lrow.addWidget(b_line_imp)
+        lrow.addStretch(1)
+        lay.addLayout(lrow)
 
         # ---------- 保存：常驻底部，不跟着线路区一起藏 ----------
         # 锁着的时候也能存姓名/命名规则；线路表在隐藏状态下仍持着启动值，
@@ -710,12 +730,7 @@ class SettingsPage(QWidget):
         # 要直接读刚落盘的 config.json；命名/接口等其它项在重启提示里已经说了
         try:
             data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
-            self.acc_table.setRowCount(0)
-            for a in (data.get("accounts") or []):
-                self._add_row(a.get("name", ""), a.get("base", ""),
-                              a.get("concurrency", 1))
-            if self.acc_table.rowCount() == 0:
-                self._add_row()
+            self._reload_lines_ui()
             self.name_edit.setText(str(data.get("user_name") or ""))
             sc = data.get("script_check") or {}
             self.ck_ai.setChecked(bool(sc.get("enabled")))
@@ -730,3 +745,91 @@ class SettingsPage(QWidget):
                                 f"已导入：{done}。\n"
                                 "旧配置已备份，产品/风控页切过去即是新数据；\n"
                                 "接口线路等重启软件后全部生效。")
+
+    # ---------- 线路小包：地址日更的轻量进出口 ----------
+    def _reload_lines_ui(self):
+        """按盘上的 config.json 重刷线路表
+
+        不能吃启动缓存 ACCOUNTS（导入刚写完盘它还是旧值），也不能往表里追加
+        （会跟启动时加的那批叠成重复行）——清空重建，整包导入和线路导入共用。"""
+        try:
+            data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+            self.acc_table.setRowCount(0)
+            for a in (data.get("accounts") or []):
+                self._add_row(a.get("name", ""), a.get("base", ""),
+                              a.get("concurrency", 1))
+            if self.acc_table.rowCount() == 0:
+                self._add_row()
+        except Exception:
+            pass            # 刷界面失败不要紧：盘上已生效，重启就好
+
+    def _export_lines(self):
+        """只把线路列表加密成 .aigcline 小文件（默认桌面，文件名带日期）"""
+        from core import config_package as cp
+        here = (QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DesktopLocation) or str(Path.home()))
+        default = str(Path(here) / f"线路_{time.strftime('%m%d')}{cp.LINES_SUFFIX}")
+        path, _ = QFileDialog.getSaveFileName(self, "导出线路包（加密）", default,
+                                              "AIGC 线路包 (*" + cp.LINES_SUFFIX + ")")
+        if not path:
+            return
+        if not path.endswith(cp.LINES_SUFFIX):
+            path += cp.LINES_SUFFIX
+        try:
+            info = cp.export_lines(path)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+            return
+        QMessageBox.information(
+            self, "已导出",
+            f"已把 {info['count']} 条线路加密导出到：\n{path}\n\n"
+            "只有装了本软件的机器能打开；同事拿到后「📥 导入线路」即可。\n"
+            "提醒：接口地址本身就是访问凭证，只发给内部同事。")
+
+    def _import_lines(self):
+        """选线路包 → 解密 → 确认（只列名字不露地址）→ 只替换 accounts 段"""
+        from core import config_package as cp
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择线路包", str(Path.home()),
+            "AIGC 线路包 (*" + cp.LINES_SUFFIX + ");;所有文件 (*)")
+        if not path:
+            return
+        try:
+            pkg = cp.read_lines(path)          # 内置口令：同事间互发零输入
+        except ValueError as e:
+            if "口令" not in str(e):
+                # 拿错文件/坏文件：问口令也没用，直接报
+                QMessageBox.warning(self, "导入失败", str(e))
+                return
+            text, ok = QInputDialog.getText(
+                self, "需要口令", f"{e}\n\n如果这个包用了自定义口令，请在下面输入：")
+            if not ok:
+                return
+            try:
+                pkg = cp.read_lines(path, text.strip())
+            except ValueError as e2:
+                QMessageBox.warning(self, "导入失败", str(e2))
+                return
+        rows = pkg["accounts"]
+        names = "、".join(r["name"] for r in rows[:8])
+        if len(rows) > 8:
+            names += f" …等 {len(rows)} 条"
+        if QMessageBox.question(
+                self, "导入线路",
+                f"线路包里有 {len(rows)} 条：{names}\n"
+                f"导出时间：{pkg['exported_at'] or '未知'}\n\n"
+                f"将替换本机当前 {self.acc_table.rowCount()} 条线路；"
+                "其它配置一律不动。\n确定导入吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            n = cp.apply_lines(rows)
+        except OSError as e:
+            QMessageBox.warning(self, "导入失败", f"写入失败：{e}")
+            return
+        self._reload_lines_ui()
+        QMessageBox.information(
+            self, "导入完成",
+            f"已导入 {n} 条线路，旧 config.json 已备份。\n"
+            "重启软件后调度器按新线路跑；正在进行的任务不受影响。")

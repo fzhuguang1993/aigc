@@ -159,6 +159,63 @@ class TestVersioning:
         assert len(result["applied"]) == 3
 
 
+class TestLines:
+    """线路小包（.aigcline）：地址日更的轻量进出口，只碰 accounts 段"""
+
+    def test_roundtrip_only_lines(self, cfg_dir, tmp_path):
+        pkg = tmp_path / "l.aigcline"
+        info = cp.export_lines(str(pkg))
+        assert info["count"] == 1 and info["names"] == ["acc1"]
+        # 把本机线路改坏、姓名改掉，再拿包里的好数据救场
+        p = cfg_dir / "config.json"
+        data = json.loads(p.read_text("utf-8"))
+        data["accounts"] = [{"name": "坏线", "base": "http://9.9.9.9"}]
+        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        got = cp.read_lines(str(pkg))
+        assert cp.apply_lines(got["accounts"]) == 1
+        after = json.loads(p.read_text("utf-8"))
+        assert after["accounts"][0]["base"] == "http://1.2.3.4:7860/api/v1"
+        assert after["user_name"] == "雷亮"          # 其它字段原样保留
+        assert after["smb"] == {"host": "smb-host"}
+        assert any("config.json.bak-" in x.name for x in cfg_dir.iterdir())
+
+    def test_no_plaintext_and_wrong_entry(self, cfg_dir, tmp_path):
+        pkg = tmp_path / "l.aigcline"
+        cp.export_lines(str(pkg))
+        assert b"http://1.2.3.4" not in pkg.read_bytes()
+        big = tmp_path / "full.aigccfg"
+        cp.export_package(str(big))
+        with pytest.raises(ValueError, match="整套配置包"):   # 线路入口喂整包
+            cp.read_lines(str(big))
+        with pytest.raises(ValueError, match="文件头"):       # 整包入口喂线路包
+            cp.read_package(str(pkg))
+
+    def test_dirty_rows_dropped(self, cfg_dir, tmp_path):
+        blob = cp.encrypt_bytes(json.dumps({
+            "app": "aigc", "kind": "lines", "accounts": [
+                {"name": "好", "base": "http://a/"},
+                {"name": "空地址", "base": "  "},
+                {"name": "歪并发", "base": "http://b", "concurrency": "x"},
+            ]}).encode("utf-8"), magic=cp.LINES_MAGIC)
+        src = tmp_path / "dirty.aigcline"
+        src.write_bytes(blob)
+        rows = cp.read_lines(str(src))["accounts"]
+        assert [r["name"] for r in rows] == ["好", "歪并发"]
+        assert rows[1]["concurrency"] == 1          # 坏数字兜默认值
+
+    def test_wrong_passphrase(self, cfg_dir, tmp_path):
+        pkg = tmp_path / "l.aigcline"
+        cp.export_lines(str(pkg))
+        with pytest.raises(ValueError, match="口令"):
+            cp.read_lines(str(pkg), "not-the-password")
+
+    def test_export_without_accounts(self, cfg_dir, tmp_path):
+        (cfg_dir / "config.json").write_text('{"user_name": "没人配线路"}',
+                                             encoding="utf-8")
+        with pytest.raises(ValueError, match="没有.*线路"):
+            cp.export_lines(str(tmp_path / "x.aigcline"))
+
+
 class TestGuards:
     def test_wrong_passphrase(self, cfg_dir, tmp_path):
         pkg = tmp_path / "out.aigccfg"
