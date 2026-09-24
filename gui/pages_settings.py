@@ -4,9 +4,10 @@ gui/pages_settings.py —— 设置（编辑 config.json，保存后需重启软
 """
 import json
 import os
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtCore import Qt, QThread, Signal, QUrl, QStandardPaths
 from PySide6.QtGui import QShortcut, QKeySequence, QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
@@ -296,6 +297,29 @@ class SettingsPage(QWidget):
         crow.addWidget(self.ed_ai_model)
         lay.addLayout(crow)
 
+        # ---------- 配置迁移（加密包）：线路/接口凭证/命名规则/界面偏好一键搬家 ----------
+        lay.addWidget(QLabel(
+            "配置迁移（加密包：线路地址、各接口 key、命名规则、界面偏好全部在内，"
+            "换新机器 / 交给同事时用）："))
+        mrow = QHBoxLayout()
+        b_pkg_exp = QPushButton("📤 导出配置包")
+        b_pkg_exp.setObjectName("GhostBtn")
+        b_pkg_exp.setToolTip(
+            "把本机全部配置加密成一个 .aigccfg 文件（默认存到桌面）；\n"
+            "文件用软件内置口令加密，外人拿到看不到接口地址和 key；\n"
+            "里面含 key，只发给信得过的同事")
+        b_pkg_exp.clicked.connect(self._export_pkg)
+        b_pkg_imp = QPushButton("📥 一键导入配置")
+        b_pkg_imp.setObjectName("GhostBtn")
+        b_pkg_imp.setToolTip(
+            "选一个同事导出的 .aigccfg 配置包，软件自动解密覆盖本机配置\n"
+            "（覆盖前旧配置逐个备份成 *.bak-时间戳），导入后重启软件生效")
+        b_pkg_imp.clicked.connect(self._import_pkg)
+        mrow.addWidget(b_pkg_exp)
+        mrow.addWidget(b_pkg_imp)
+        mrow.addStretch(1)
+        lay.addLayout(mrow)
+
         # 维护人入口：Alt+W（Mac ⌘+W）唤出口令框，验证通过才显示「输出目录」；
         # 仅当停在设置页时激活（show/hideEvent 开关），避免别处误触。
         self._sc_dirs = QShortcut(QKeySequence(MAINTAINER_SHORTCUT), self)
@@ -584,3 +608,88 @@ class SettingsPage(QWidget):
         if self._dirs_unlocked:            # 保存后收回隐藏，下次再改需重新按口令
             self._relock_dirs()
         QMessageBox.information(self, "已保存", "设置已保存，重启软件后生效")
+
+    # ================= 配置迁移（加密包） =================
+    def _export_pkg(self):
+        """全部配置加密成一个 .aigccfg 文件（口令内置，见 core/config_package.py）"""
+        from core import config_package as cp
+        here = (QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DesktopLocation) or str(Path.home()))
+        default = str(Path(here) / f"AIGC配置_{time.strftime('%m%d')}{cp.SUFFIX}")
+        path, _ = QFileDialog.getSaveFileName(self, "导出配置包（加密）", default,
+                                              "AIGC 配置包 (*" + cp.SUFFIX + ")")
+        if not path:
+            return
+        if not path.endswith(cp.SUFFIX):
+            path += cp.SUFFIX
+        try:
+            n = cp.export_package(path)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+            return
+        QMessageBox.information(
+            self, "已导出",
+            f"已把 {n} 个配置文件加密导出到：\n{path}\n\n"
+            "文件已用软件内置口令加密，只有装了本软件的机器能导入；\n"
+            "但里面含接口 key，请只发给信得过的同事。")
+
+    def _import_pkg(self):
+        """选包 → 解密（内置口令优先，不对再问一次）→ 确认 → 覆盖并备份"""
+        from core import config_package as cp
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择配置包", str(Path.home()),
+            "AIGC 配置包 (*" + cp.SUFFIX + ");;所有文件 (*)")
+        if not path:
+            return
+        try:
+            files = cp.read_package(path)          # 正常同事间互发：零输入
+        except ValueError as e:
+            if "口令" not in str(e):
+                # 根本不是包/内容坏了/包里有危险文件名：问口令也没用，直接报
+                QMessageBox.warning(self, "导入失败", str(e))
+                return
+            # 口令不是内置那个（老包/改过口令）：问一句，别把文件判死
+            text, ok = QInputDialog.getText(
+                self, "需要口令", f"{e}\n\n如果这个包用了自定义口令，请在下面输入：")
+            if not ok:
+                return
+            try:
+                files = cp.read_package(path, text.strip())
+            except ValueError as e2:
+                QMessageBox.warning(self, "导入失败", str(e2))
+                return
+        names = "、".join(sorted(files))
+        if QMessageBox.question(
+                self, "确认导入",
+                f"将覆盖本机以下配置：\n{names}\n\n"
+                "旧配置会逐个备份成 *.bak-时间戳，出事能手动滚回去。\n确定导入吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            n = cp.apply_package(files)
+        except OSError as e:
+            QMessageBox.warning(self, "导入失败", f"写盘失败：{e}")
+            return
+        # 界面立刻跟着新配置走：注意不能吃 config.ACCOUNTS（那是启动期缓存），
+        # 要直接读刚落盘的 config.json；命名/接口等其它项在重启提示里已经说了
+        try:
+            data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+            self.acc_table.setRowCount(0)
+            for a in (data.get("accounts") or []):
+                self._add_row(a.get("name", ""), a.get("base", ""),
+                              a.get("concurrency", 1))
+            if self.acc_table.rowCount() == 0:
+                self._add_row()
+            self.name_edit.setText(str(data.get("user_name") or ""))
+            sc = data.get("script_check") or {}
+            self.ck_ai.setChecked(bool(sc.get("enabled")))
+            self.ed_ai_url.setText(str(sc.get("url", "")))
+            self.ed_ai_key.setText(str(sc.get("api_key", "")))
+            self.ed_ai_model.setText(str(sc.get("model", "")))
+            self._refresh_naming()
+        except Exception:
+            pass            # 刷界面失败不要紧：盘上已生效，重启就好
+        QMessageBox.information(self, "导入完成",
+                                f"已导入 {n} 个配置文件，旧配置已备份。\n"
+                                "重启软件后全部生效。")
