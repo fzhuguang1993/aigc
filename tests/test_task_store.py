@@ -132,19 +132,19 @@ def test_range_stats_none_covers_all_history():
     assert st["days"] is None
 
 
-# ---------------- 日汇报（今日 vs 昨日、分产品、时长分桶）----------------
+# ---------------- 日汇报（今日 vs 昨日同时段、分产品、时长分桶）----------------
 
-def _add_task_with_run(product, duration, status, day):
+def _add_task_with_run(product, duration, status, day, hm="10:00"):
     """建一条带时长的任务并追一行当日执行记录（runs 只存执行耗时，
-    视频时长从 tasks.duration join 得到）"""
+    视频时长从 tasks.duration join 得到）；hm 控制开钟点，验同时段截断用"""
     from store import db
-    tid = ts.add_task("1", product, f"提示词_{product}_{day}_{status}_{duration}")
+    tid = ts.add_task("1", product, f"提示词_{product}_{day}_{status}_{duration}_{hm}")
     ts.update_row(tid, **{"时长": duration})
     db.execute(
         "INSERT INTO runs(task_id,num,product,account,job_id,status,started_at)"
         " VALUES(?,?,?,?,?,?,?)",
-        (tid, "1", product, "acc1", f"j-{product}-{day}-{status}-{duration}",
-         status, f"{day} 10:00:00"))
+        (tid, "1", product, "acc1", f"j-{product}-{day}-{status}-{duration}-{hm}",
+         status, f"{day} {hm}:00"))
     return tid
 
 
@@ -162,12 +162,44 @@ def test_daily_report_stats_buckets_and_mom():
     _add_task_with_run("A", 12, "completed", yest)
     _add_task_with_run("B", 20, "failed", yest)
 
-    st = ts.daily_report_stats()
+    st = ts.daily_report_stats(now_hm="23:59")      # 钉死截止点：昨全天都算，用例不看时钟
     assert st["date"] == today
     assert st["total"] == 4 and st["ok"] == 3          # 含时长未知的 C
     assert st["y_total"] == 2 and st["y_ok"] == 1
-    assert st["long"] == 1 and st["short"] == 2        # C(0s) 不进任何时长桶
-    assert st["y_long"] == 2 and st["y_short"] == 0
+    # 时长桶只计成功：A(5s 失败) 不进桶，C(0s) 不进任何桶 → long=1, short=1
+    assert st["long"] == 1 and st["short"] == 1
+    assert st["y_long"] == 1 and st["y_short"] == 0    # 昨日 B(20s 失败) 也不进桶
     prods = {p: (r, o) for p, r, o in st["products"]}
     assert prods["A"] == (2, 1) and prods["B"] == (1, 1) and prods["C"] == (1, 1)
     assert st["products"][0][0] == "A", "按运行次数降序，A(2次) 排最前"
+
+
+def test_daily_report_mom_compares_same_time_window():
+    """环比基线只看昨日同时段：14:00 截止，昨天 22:00 那截还没轮到算"""
+    from datetime import date, timedelta
+    today = date.today().isoformat()
+    yest = (date.today() - timedelta(days=1)).isoformat()
+    _add_task_with_run("A", 12, "completed", yest, hm="09:00")   # 截止点前：算
+    _add_task_with_run("B", 20, "completed", yest, hm="22:00")   # 截止点后：不算
+    _add_task_with_run("A", 15, "completed", today, hm="13:30")
+
+    st = ts.daily_report_stats(now_hm="14:00")
+    assert st["total"] == 1 and st["ok"] == 1
+    assert st["y_total"] == 1 and st["y_ok"] == 1, "昨日只算 09:00 那一条"
+    assert st["y_long"] == 1 and st["y_short"] == 0
+    # 同样的数据放到全天口径里，昨日就该是 2 条：截断真的在生效
+    whole = ts.daily_report_stats(now_hm="23:59")
+    assert whole["y_total"] == 2 and whole["y_long"] == 2
+
+
+def test_daily_report_counts_available_marks():
+    """汇报里的「标记可用」＝成品上累计的可用标记，不可用/未标的不算"""
+    from store import db
+    db.execute("DELETE FROM file_marks")
+    ts.set_file_mark("/tmp/aigc_t/ok1.mp4", ts.MARK_OK)
+    ts.set_file_mark("/tmp/aigc_t/ok2.mp4", ts.MARK_OK)
+    ts.set_file_mark("/tmp/aigc_t/bad.mp4", ts.MARK_BAD)
+    try:
+        assert ts.daily_report_stats()["avail"] == 2
+    finally:
+        db.execute("DELETE FROM file_marks")

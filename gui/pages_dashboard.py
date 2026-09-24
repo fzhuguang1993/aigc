@@ -26,7 +26,7 @@ def _delta_text(cur, prev, up_is_good=True):
 
 
 def _mom(cur, prev):
-    """环比昨日：箭头+百分比；昨日为 0 时给文字，避免除零/无穷。"""
+    """环比昨日同时段：箭头+百分比；昨日为 0 时给文字，避免除零/无穷。"""
     if prev == 0 and cur == 0:
         return "持平"
     if prev == 0:
@@ -61,8 +61,9 @@ class DashboardPage(QWidget):
         head.addWidget(self.cb_range)
         self.b_copy = QPushButton("📋 复制进度汇报")
         self.b_copy.setObjectName("GhostBtn")
-        self.b_copy.setToolTip("把「今日截至目前 vs 昨日」的执行统计复制成文字汇报，"
-                               "含总量/环比、分产品、视频时长（≥10s/<10s）分桶；直接粘贴到群里")
+        self.b_copy.setToolTip("把「今日截至目前 vs 昨日同时段」的执行统计复制成文字汇报，\n"
+                               "含总量/环比、分产品、视频时长（≥10s/<10s，只计成功）、\n"
+                               "审片标记可用数；直接粘贴到群里")
         self.b_copy.clicked.connect(self._copy_report)
         head.addWidget(self.b_copy)
         lay.addLayout(head)
@@ -216,7 +217,7 @@ class DashboardPage(QWidget):
             "",
             "【总体】",
             f"　总运行 {total} 次 ｜ 成功 {okc} 次 ｜ 成功率 {rate}",
-            f"　环比昨日：运行 {_mom(total, st['y_total'])}，成功 {_mom(okc, st['y_ok'])}",
+            f"　环比昨日同时段：运行 {_mom(total, st['y_total'])}，成功 {_mom(okc, st['y_ok'])}",
             "",
             "【分产品】",
         ]
@@ -227,9 +228,12 @@ class DashboardPage(QWidget):
             lines.append("　今日暂无执行记录")
         lines += [
             "",
-            "【视频时长】",
-            f"　10 秒以上：{st['long']} 条，占比 {lp} ｜ 环比昨日 {_mom(st['long'], st['y_long'])}",
-            f"　10 秒以下：{st['short']} 条，占比 {sp} ｜ 环比昨日 {_mom(st['short'], st['y_short'])}",
+            "【视频时长】（只计成功）",
+            f"　10 秒以上：{st['long']} 条，占比 {lp} ｜ 环比昨日同时段 {_mom(st['long'], st['y_long'])}",
+            f"　10 秒以下：{st['short']} 条，占比 {sp} ｜ 环比昨日同时段 {_mom(st['short'], st['y_short'])}",
+            "",
+            "【审片标记】",
+            f"　目前标记可用：{st['avail']} 条（累计）",
         ]
         text = "\n".join(lines)
         QGuiApplication.clipboard().setText(text)

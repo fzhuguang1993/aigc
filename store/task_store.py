@@ -599,18 +599,27 @@ def report_stats(days=1):
             "products": prods.most_common(), "days": days}
 
 
-def daily_report_stats():
-    """日汇报（今日截至目前 vs 昨日）：总量/成功 + 分产品 + 视频时长分桶。
+def daily_report_stats(now_hm=None):
+    """日汇报（今日截至目前 vs 昨日同时段）：总量/成功 + 分产品 + 视频时长分桶 + 审片标记。
 
-    时长桶用任务的 tasks.duration（视频秒数）；runs.duration 是执行耗时，不能用。
-    时长未知（<=0）只计总量、不落进两个时长桶。占比分母＝长+短（有明确时长的）。
+    环比按「昨日同时段」：只统计昨天开钟点不晚于现在这一刻的执行。
+    不然 14:01 生成的汇报拿今日半天数据去比昨天一整天，必然误报“运行 ▼73%”——
+    人家只是还没跑到下午。测试/回放可显式传 now_hm="HH:MM" 钉死截止点。
+
+    时长桶只计成功（status=completed）：失败的跑次根本没有成品，
+    拿它们的任务时长进桶会虚增条数。时长用任务的 tasks.duration（视频秒数）；
+    runs.duration 是执行耗时，不能用。时长未知（<=0）只计总量、不落进两个时长桶。
+    占比分母＝长+短（有明确时长且成功的那些）。
     """
     from collections import defaultdict
-    from datetime import date, timedelta
+    from datetime import date, datetime, timedelta
     today = date.today().isoformat()
     yest = (date.today() - timedelta(days=1)).isoformat()
+    if now_hm is None:
+        now_hm = datetime.now().strftime("%H:%M")
     rows = db.query(
-        "SELECT substr(r.started_at,1,10) d, r.product product, r.status status,"
+        "SELECT substr(r.started_at,1,10) d, substr(r.started_at,12,5) hm,"
+        " r.product product, r.status status,"
         " COALESCE(t.duration, 0) vdur"
         " FROM runs r LEFT JOIN tasks t ON t.id = r.task_id"
         " WHERE substr(r.started_at,1,10) IN (?, ?)", (today, yest))
@@ -623,6 +632,8 @@ def daily_report_stats():
         a = agg.get(r["d"])
         if a is None:
             continue
+        if r["d"] == yest and str(r["hm"] or "") > now_hm:
+            continue        # 昨日同时段口径：现在还没跑到的钟点，昨天那截不算
         a["total"] += 1
         ok = r["status"] == "completed"
         if ok:
@@ -631,10 +642,11 @@ def daily_report_stats():
             vdur = int(r["vdur"] or 0)
         except (TypeError, ValueError):
             vdur = 0
-        if vdur >= 10:
-            a["long"] += 1
-        elif vdur > 0:
-            a["short"] += 1
+        if ok:                          # 失败的没成品可看，不进时长桶
+            if vdur >= 10:
+                a["long"] += 1
+            elif vdur > 0:
+                a["short"] += 1
         p = (r["product"] or "").strip() or "未填品名"
         slot = a["products"][p]
         slot[0] += 1
@@ -645,6 +657,10 @@ def daily_report_stats():
     # 分产品：按 运行次数降序 → 成功数降序 → 品名，次数多的排前
     products = sorted(((p, n[0], n[1]) for p, n in cur["products"].items()),
                       key=lambda x: (-x[1], -x[2], x[0]))
+    # 审片「可用」是落在成品文件上的累计标记（不随日汇报归零）：
+    # 今天能交差多少条，看的是这个数而不是成功数
+    avail = db.query("SELECT COUNT(*) c FROM file_marks WHERE mark=?",
+                     (MARK_OK,))[0]["c"]
     return {
         "date": today,
         "total": cur["total"], "ok": cur["ok"],
@@ -652,6 +668,7 @@ def daily_report_stats():
         "long": cur["long"], "short": cur["short"],
         "y_long": prev["long"], "y_short": prev["short"],
         "products": products,
+        "avail": int(avail or 0),
     }
 
 
