@@ -729,6 +729,12 @@ class TracePanel(BasePanel):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self.ed_host = QLineEdit(tcfg.get("host", ""))
+        self.spin_port = QSpinBox()
+        self.spin_port.setRange(1, 65535)
+        try:
+            self.spin_port.setValue(int(tcfg.get("port", DB_CFG.get("port", 3306))))
+        except (TypeError, ValueError):
+            self.spin_port.setValue(int(DB_CFG.get("port", 3306)))
         self.ed_db = QLineEdit(tcfg.get("database", ""))
         self.ed_user = QLineEdit(tcfg.get("user", ""))
         self.ed_pass = QLineEdit(tcfg.get("password", ""))
@@ -739,7 +745,12 @@ class TracePanel(BasePanel):
         self.ed_op.setPlaceholderText("运营姓名，留空则与剪辑人相同")
         self.spin_uid = QSpinBox()
         self.spin_uid.setRange(1, 999999)
-        form.addRow("MySQL 地址：", self.ed_host)
+        hrow = QHBoxLayout()
+        hrow.setContentsMargins(0, 0, 0, 0)
+        hrow.addWidget(self.ed_host, 1)
+        hrow.addWidget(QLabel("端口"))
+        hrow.addWidget(self.spin_port)
+        form.addRow("MySQL 地址：", hrow)
         form.addRow("数据库：", self.ed_db)
         form.addRow("账号：", self.ed_user)
         form.addRow("密码：", self.ed_pass)
@@ -751,12 +762,26 @@ class TracePanel(BasePanel):
         srow = QHBoxLayout()
         b_save = QPushButton("💾 保存数据库配置")
         b_save.setObjectName("GhostBtn")
-        b_save.setToolTip("把 MySQL 地址/库名/账号存进 config.json（trace_mysql 段），\n"
+        b_save.setToolTip("把 MySQL 地址/端口/库名/账号存进 config.json（trace_mysql 段），\n"
                           "下次打开还在；设置页「📤 导出配置包」会一并加密搬走")
         b_save.clicked.connect(self._save_cfg)
         srow.addWidget(b_save)
+        self.b_test = QPushButton("🔌 测试连接")
+        self.b_test.setObjectName("GhostBtn")
+        self.b_test.setToolTip("用上方参数试连 MySQL；连不上不允许开始溯源（取码/入库靠它）")
+        self.b_test.clicked.connect(self._test_conn)
+        srow.addWidget(self.b_test)
         srow.addStretch(1)
+        self.lbl_conn = QLabel("⚪ 未测试")
+        self.lbl_conn.setObjectName("PageTip")
+        srow.addWidget(self.lbl_conn)
         outer.addLayout(srow)
+
+        # 连接参数一改就作废“已测通”状态，逼用户重新验证
+        self._tested = False
+        for _w in (self.ed_host, self.ed_db, self.ed_user, self.ed_pass):
+            _w.textChanged.connect(self._conn_dirty)
+        self.spin_port.valueChanged.connect(self._conn_dirty)
 
         self.files = FileListWidget("待溯源视频")
         outer.addWidget(self.files)
@@ -767,6 +792,7 @@ class TracePanel(BasePanel):
     def _db_cfg(self):
         from video_text_tools.config import DB_CFG
         return {**DB_CFG, "host": self.ed_host.text().strip() or DB_CFG["host"],
+                "port": self.spin_port.value(),
                 "database": self.ed_db.text().strip() or DB_CFG["database"],
                 "user": self.ed_user.text().strip() or DB_CFG["user"],
                 "password": self.ed_pass.text()}
@@ -779,6 +805,53 @@ class TracePanel(BasePanel):
                                        "password", "charset")})
         self._append_log("💾 数据库配置已保存（config.json 的 trace_mysql 段）")
 
+    def _conn_dirty(self, *_):
+        # 地址/端口/库/账号/密码任一变动：旧的“已测通”不再可信
+        if getattr(self, "_tested", False):
+            self._tested = False
+            self.lbl_conn.setText("⚪ 参数已改，需重新测试")
+
+    def _test_conn(self):
+        """用当前表单参数试连 MySQL：成功才允许开始溯源"""
+        cfg = self._db_cfg()
+        if not cfg.get("host"):
+            QMessageBox.information(self, "提示", "请先填 MySQL 地址")
+            return
+        try:
+            import pymysql
+        except ImportError:
+            QMessageBox.warning(self, "缺少依赖",
+                                "溯源功能需要 pymysql：\n\n    pip install pymysql")
+            return
+        self.b_test.setEnabled(False)
+        self.lbl_conn.setText("🟡 正在连接…")
+        try:
+            conn = pymysql.connect(
+                host=cfg["host"], port=int(cfg["port"]), user=cfg["user"],
+                password=cfg["password"], database=cfg["database"],
+                charset=cfg.get("charset", "utf8mb4"), connect_timeout=6)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            finally:
+                conn.close()
+            self._tested = True
+            self.lbl_conn.setText("🟢 连接成功")
+            self._append_log("🔌 数据库连接测试成功，可以开始溯源")
+            QMessageBox.information(
+                self, "连接成功",
+                f"已连上 {cfg['host']}:{cfg['port']}/{cfg['database']}")
+        except Exception as e:
+            self._tested = False
+            self.lbl_conn.setText("🔴 连接失败")
+            self._append_log(f"🔌 数据库连接失败：{e}")
+            QMessageBox.warning(
+                self, "连接失败",
+                "连不上数据库，请先核对地址/端口/账号/库名：\n\n" + str(e))
+        finally:
+            self.b_test.setEnabled(True)
+
     def _task(self):
         paths = self.files.paths()
         name = self.ed_name.text().strip()
@@ -787,6 +860,12 @@ class TracePanel(BasePanel):
             return None
         if not name:
             QMessageBox.information(self, "提示", "请填写剪辑人姓名")
+            return None
+        if not getattr(self, "_tested", False):
+            QMessageBox.information(
+                self, "请先测试连接",
+                "溯源需要连内网 MySQL 取码/入库。\n"
+                "请先点「🔌 测试连接」验证数据库可达，再开始溯源。")
             return None
         try:
             import pymysql  # noqa: F401  仅探测依赖
@@ -1143,6 +1222,13 @@ def _safe_factory(builder):
     return factory
 
 
+def _build_recording_panel(parent=None):
+    """屏幕录制面板在 dialogs_recorder 里；延迟导入断掉循环引用
+    （dialogs_recorder 要从本模块拿 BasePanel）"""
+    from gui.dialogs_recorder import RecordingPanel
+    return RecordingPanel(parent)
+
+
 PANEL_FACTORIES = {
     "视频水印": _safe_factory(WatermarkPanel),
     "批量改名": _safe_factory(RenamePanel),
@@ -1151,4 +1237,5 @@ PANEL_FACTORIES = {
     "SMB 上传": _safe_factory(SmbPanel),
     "视频溯源": _safe_factory(TracePanel),
     "素材提取": _safe_factory(MaterialPanel),
+    "屏幕录制": _safe_factory(_build_recording_panel),
 }

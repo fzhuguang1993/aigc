@@ -1,0 +1,17 @@
+{
+  "upstreams": [
+    {"name": "acc1", "base": "http://<服务地址>:7860/api/v1", "api_key": "", "concurrency": 3},
+    {"name": "acc2", "base": "http://<服务地址2>:7860/api/v1", "api_key": "", "concurrency": 3}
+  ],
+  "material_api": {
+    "base": "https://<聚客提取接口地址>/home/api",
+    "uid": "<你的 UID>",
+    "key": "<你的 Key>"
+  },
+  "translate": {
+    "ak": "<火山 AccessKeyID>",
+    "sk": "<火山 SecretAccessKey>",
+    "region": "cn-north-1",
+    "project": "default"
+  }
+}

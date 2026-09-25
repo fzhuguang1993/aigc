@@ -3,7 +3,9 @@ gui/header.py —— 统一页头与 KPI 卡片（飞书风格配色）
 飞书色板：主蓝 #3370FF / 绿 #00B96B / 红 #F54A45 / 橙 #FF8D19 / 紫 #7F3FBF
 正文 #1F2329 / 辅文 #646A73 / 弱文 #8F959E
 """
-from PySide6.QtCore import Qt
+import math
+
+from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel
 
@@ -12,13 +14,23 @@ FS_TEXT = "#1F2329"
 FS_SUB = "#646A73"
 FS_WEAK = "#8F959E"
 
+# 线路状态语义色（商务低饱和版）：墨绿 / 赭石 / 干枯玫瑰红，
+# 替代刺眼的高饱和红绿灯（#1FA45C/#F5A623/#E5484D 看着老气）。
+FS_GREEN = "#2F9E77"
+FS_AMBER = "#C88A2E"
+FS_RED = "#C14B4B"
+
 # 线路状态灯三档，不是“绿/红”两档：探活接口未实现时（服务有话回但路径不对，
 # 典型是 GET {base}/health 返回 HTML 404）画红灯会把人吓去删线路，画绿灯又是
 # 谎称“测过了”。语义与 registry.manager.classify_probe 一一对应。
 LIGHT_PENDING = ("⚪", "⚪ 待检测", FS_WEAK)      # 首轮探活还没回来
-LIGHT_OK = ("🟢", "🟢 正常", "#1FA45C")          # 探活接口正常应答
-LIGHT_ALIVE = ("🟡", "🟡 在线（探活路径未实现）", "#F5A623")
-LIGHT_DOWN = ("🔴", "🔴 故障", "#E5484D")        # 连不上 / 5xx
+LIGHT_OK = ("🟢", "🟢 正常", FS_GREEN)          # 探活接口正常应答
+LIGHT_ALIVE = ("🟡", "🟡 在线（探活路径未实现）", FS_AMBER)
+LIGHT_DOWN = ("🔴", "🔴 故障", FS_RED)        # 连不上 / 5xx
+
+# 灯色与四档语义一一对应，供 LightDot 动画取色（与 emoji 三件套同源，不另写判定）
+LIGHT_KIND_COLOR = {"pending": FS_WEAK, "ok": FS_GREEN,
+                    "alive": FS_AMBER, "down": FS_RED}
 
 
 def line_light(acc, checked=True):
@@ -30,6 +42,81 @@ def line_light(acc, checked=True):
     if getattr(acc, "probe_state", None) == "alive":
         return LIGHT_ALIVE
     return LIGHT_OK
+
+
+def light_kind(acc, checked=True):
+    """把 line_light 的四档压成动画用的 kind 键（pending/ok/alive/down），
+    与 emoji 三件套同一判定，避免两套状态各说各话。"""
+    emoji = line_light(acc, checked)[0]
+    return {"⚪": "pending", "🟢": "ok", "🟡": "alive", "🔴": "down"}.get(emoji, "pending")
+
+
+class LightDot(QWidget):
+    """线路状态指示灯（动画版）：绿灯缓慢呼吸、黄灯略快闪缩、
+    红灯常亮、灰灯常亮空心圈。
+
+    为什么自绘而不用 emoji：emoji 是静态字符，无法呼吸/闪。这里用 QTimer
+    推相位、QPainter 画圆点；方块视图每张卡片持有一个持久实例，刷新只调
+    set_kind 不重建，免得 2 秒定时刷新把呼吸节奏打断。"""
+    D = 12                          # 圆点基准直径
+
+    def __init__(self, kind="pending", parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.D + 6, self.D + 6)
+        self._kind = kind
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(50)       # 20fps 足够顺滑
+
+    def set_kind(self, kind):
+        if kind != self._kind:
+            self._kind = kind
+            if kind not in ("ok", "alive"):
+                self._phase = 0.0
+            self.update()
+
+    def _tick(self):
+        # 只有呼吸/闪缩需要推进相位；常亮/空心停在不透明态，省 CPU
+        if self._kind == "ok":
+            self._phase += 0.045            # 缓慢呼吸：约 2.3s 一个循环
+        elif self._kind == "alive":
+            self._phase += 0.16             # 略快闪缩：约 0.65s 一个循环
+        else:
+            return
+        if self._phase > math.tau:
+            self._phase -= math.tau
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(LIGHT_KIND_COLOR.get(self._kind, FS_WEAK))
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        if self._kind == "pending":
+            pen = QPen(color)
+            pen.setWidthF(1.4)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            r = self.D / 2.0 - 1
+            p.drawEllipse(QPointF(cx, cy), r, r)
+            p.end()
+            return
+        if self._kind == "down":
+            alpha, r = 255, self.D / 2.0            # 常亮实心
+        elif self._kind == "ok":
+            t = (math.sin(self._phase) + 1) / 2.0   # 0~1
+            alpha = int(120 + 135 * t)              # 缓慢呼吸：亮度起伏
+            r = self.D / 2.0 * (0.82 + 0.18 * t)
+        else:  # alive：略快闪缩，幅度更大
+            t = (math.sin(self._phase) + 1) / 2.0
+            alpha = int(80 + 175 * t)
+            r = self.D / 2.0 * (0.55 + 0.45 * t)
+        color.setAlpha(alpha)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QPointF(cx, cy), r, r)
+        p.end()
 
 
 class _AccentBar(QWidget):
@@ -71,13 +158,18 @@ def page_header(title, subtitle="", icon=""):
 
 
 class Card(QWidget):
-    """白色圆角卡片容器（可叠加 hover 描边）"""
-    def __init__(self, parent=None, margins=(16, 14, 16, 14)):
+    """白色圆角卡片容器（可叠加 hover 描边）；新刻度：边距 18/16、行距 8，
+    与数据中台的卡内呼吸感对齐（KpiCard 等自带 margins 的不受影响）"""
+    def __init__(self, parent=None, margins=(18, 16, 18, 16)):
         super().__init__(parent)
         self.setObjectName("Card")
+        # ⚠ PySide6 只对「裸 QWidget 实例」自动开 WA_StyledBackground；
+        # Python 子类不开——QSS 里 QWidget#Card 的白底/描边会被整层跳过
+        # （历史上 KpiCard 看似白底其实是滚动区视口的白底兜着）
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.v = QVBoxLayout(self)
         self.v.setContentsMargins(*margins)
-        self.v.setSpacing(6)
+        self.v.setSpacing(8)
 
     def add(self, w, stretch=0):
         self.v.addWidget(w, stretch)

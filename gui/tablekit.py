@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
                                QTableWidgetItem)
 
 from gui.formatting import secs
+from gui.window_frame import apply_rounded
 
 
 class SecsItem(QTableWidgetItem):
@@ -75,6 +76,7 @@ class FieldManagerDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+        apply_rounded(self, show_min=False, show_max=False)
 
     def accept(self):
         self.order = [self.lst.item(i).data(Qt.ItemDataRole.UserRole)

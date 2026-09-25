@@ -7,7 +7,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QPlainTextEdit, QMessageBox, QLineEdit, QDateEdit,
-                               QCheckBox, QAbstractItemView)
+                               QCheckBox, QAbstractItemView, QDialog)
 
 from store import task_store
 from gui import log_sink
@@ -261,3 +261,22 @@ class RecordsPage(QWidget):
         else:
             self._checked_rows.pop(rid, None)
         self.lbl_count.setText(f"已勾选 {len(self._checked_rows)}")
+
+
+from gui.window_frame import apply_rounded
+
+
+class RecordsDialog(QDialog):
+    """以模态弹窗承载「执行记录」页：数据中台不再单列左侧导航，
+    改由页头按钮弹出。直接复用 RecordsPage 的全部逻辑（筛选/排序/导出），
+    RecordsPage 首次 showEvent 会自动加载，这里无需额外刷新。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🕘 执行记录")
+        self.resize(1120, 720)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.page = RecordsPage()
+        lay.addWidget(self.page)
+        apply_rounded(self, show_min=False, show_max=False)

@@ -199,8 +199,23 @@ def _add_bytes(n):
     _save_state()
 
 
+def _gateway_base():
+    """网关根地址：非空即商用网关模式，翻译走网关、不碰本机火山密钥与日额度。
+
+    延迟导入，避免没配网关时的无谓依赖；拿不到就当直连模式（返回空串）。"""
+    try:
+        from core.config import GATEWAY_BASE
+        return str(GATEWAY_BASE or "").strip()
+    except Exception:
+        return ""
+
+
 def configured():
-    """密钥是否可用（占位模板值不算配置）"""
+    """翻译是否可用：网关模式恒真（密钥在服务端）；否则看本机火山密钥。
+
+    占位模板值不算配置。"""
+    if _gateway_base():
+        return True
     cfg = TRANSLATE or {}
     ak = str(cfg.get("ak") or "").strip()
     sk = str(cfg.get("sk") or "").strip()
@@ -331,6 +346,9 @@ def translate_texts(texts, source="auto", target=DEFAULT_TARGET):
     texts = [str(t) for t in texts]
     if not texts:
         return []
+    gw = _gateway_base()
+    if gw:
+        return _translate_via_gateway(gw, texts, source, target)
     _load_state()          # 先拾回盘上缓存再查缺失，否则重启后第一次必重翻
     cli = _client()
     project = str((TRANSLATE or {}).get("project") or "default")
@@ -358,6 +376,32 @@ def translate_texts(texts, source="auto", target=DEFAULT_TARGET):
             _cache_put((source, target, src), got)
     if todo:
         _save_state()                          # 本轮新翻的译文落盘
+    return [_cache_get((source, target, t)) for t in texts]
+
+
+def _translate_via_gateway(gw, texts, source, target):
+    """网关翻译分支：复用持久缓存（同样的字不重复走网关），但不管本机日额度。
+
+    额度/限流在服务端按机器结算；客户端只负责不重复问同样的问题。
+    api_client.translate 已带鉴权头；失败统一翻译成 TranslateError 给人看。"""
+    from core import api_client
+    _load_state()
+    todo = []
+    seen = set()
+    for t in texts:
+        key = (source, target, t)
+        if key not in _CACHE and key not in seen:
+            seen.add(key)
+            todo.append(t)
+    for batch in _batches(todo):
+        try:
+            got = api_client.translate(gw, batch, source=source, target=target)
+        except Exception as e:
+            raise TranslateError(_friendly(str(e)))
+        for idx, src in enumerate(batch):
+            _cache_put((source, target, src), got[idx] if idx < len(got) else "")
+    if todo:
+        _save_state()
     return [_cache_get((source, target, t)) for t in texts]
 
 

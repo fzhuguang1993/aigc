@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from core.config import EXPORT_DIR as EXPORT_DIR_STR
-from store import db
+from store import db, org_store
 
 COL_ID = "编号"; COL_PRODUCT = "品名"; COL_PROMPT = "提示词"
 COL_SCRIPT = "脚本"; COL_STORYBOARD = "分镜数"; COL_TAG = "标签"
@@ -75,11 +75,66 @@ def _span_seconds(start, end):
     return max(0, int(gap.total_seconds()))
 
 
+# ---------------- 数据权限过滤（组织结构：分部门分角色看数） ----------------
+# 所有查询函数内部自取当前会话可见范围（org_store.visible_accounts），
+# 不在 GUI 层传参——防的是“某个角落忘传漏网”。None＝不限制（admin /
+# 组织未启用的单机模式 / console 等不走登录的进程），行为与旧版完全一致。
+
+def _acct_cond(col, allow=None, keep_blank=False):
+    """拼在 WHERE 尾部的 AND 片段，返 (sql_suffix, args)。
+
+    allow=[] → " AND 0"（一条都不给看）；keep_blank＝空账号行放行：
+    还没定线路的 tasks 是公共工作台，员工新建任务时 account 还是空的，
+    把没跑过的任务一刀切掉，员工就干不了活了。"""
+    if allow is None:
+        return "", ()
+    if not allow:
+        if keep_blank:
+            return f" AND COALESCE({col},'')=''", ()
+        return " AND 0", ()
+    ph = ",".join("?" * len(allow))
+    cond = f"{col} IN ({ph})"
+    if keep_blank:
+        cond = f"(COALESCE({col},'')='' OR {cond})"
+    return f" AND {cond}", tuple(allow)
+
+
 # ---------------- 任务 CRUD ----------------
 
+def ui_signature():
+    """任务中心显示数据的轻量变化指纹（供 2 秒定时刷新做脏检测）
+
+    三条聚合查询 + 本连接写计数，成本是在小表上扫一遍（几 ms 内），
+    换来的是「数据没变就不重建表格」，滚动位置/勾选态不被打断。
+    任何会改变任务列表显示的写入都会体现在这里：
+    - 任务增删改 → tasks 的行数/最大ID/updated_at
+    - 执行落库与回填 → runs 的行数/最大ID/finished_at/用时合计
+    - 审片标记 → file_marks 的行数/marked_at
+    - 同秒内连续写、或不改时间戳的更新（重命名同步路径、中文对照写回）
+      → 本连接 total_changes 兜底（GUI 内的写操作都走同一个连接）
+    """
+    t = db.query("SELECT COUNT(*) c, COALESCE(MAX(id),0) i,"
+                 " COALESCE(MAX(updated_at),'') u FROM tasks")[0]
+    r = db.query("SELECT COUNT(*) c, COALESCE(MAX(id),0) i,"
+                 " COALESCE(MAX(finished_at),'') f,"
+                 " COALESCE(SUM(COALESCE(gen_sec,0)+COALESCE(queued_sec,0)"
+                 "+COALESCE(duration,0)),0) s FROM runs")[0]
+    m = db.query("SELECT COUNT(*) c, COALESCE(MAX(marked_at),'') a"
+                 " FROM file_marks")[0]
+    return (db.write_revision(),
+            t["c"], t["i"], t["u"], r["c"], r["i"], r["f"], r["s"],
+            m["c"], m["a"])
+
+
 def list_tasks_df():
-    """返回带中文列名的 DataFrame（供表格显示/导出），_id 列为数据库主键"""
-    rows = db.query("SELECT * FROM tasks ORDER BY id")
+    """返回带中文列名的 DataFrame（供表格显示/导出），_id 列为数据库主键
+
+    权限口径：按 tasks.account（最后所选线路）行级过滤，没定线路的空账号
+    任务全员可见（不然员工新建的任务一进列表就消失）。"""
+    cond, cargs = _acct_cond("account", org_store.visible_accounts(),
+                             keep_blank=True)
+    rows = db.query("SELECT * FROM tasks WHERE 1=1" + cond + " ORDER BY id",
+                    cargs)
     cols = ["id"] + list(_CN2DB.values())
     df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     for cn, en in _CN2DB.items():
@@ -131,10 +186,17 @@ def get_task(task_id):
 
 
 def filter_choices():
-    """筛选下拉的候选值（任务多了光靠搜索拦不住）。"""
+    """筛选下拉的候选值（任务多了光靠搜索拦不住）。
+
+    候选值跟列表同权限口径：别人线路上才有的品名/脚本，不该出现在
+    我的筛选下拉里（等于泄露“别人在做什么品”）。"""
+    cond, cargs = _acct_cond("account", org_store.visible_accounts(),
+                             keep_blank=True)
+
     def _distinct(col):
         vals = {(r[col] or "").strip() for r in
-                db.query(f"SELECT DISTINCT {col} FROM tasks")}
+                db.query(f"SELECT DISTINCT {col} FROM tasks WHERE 1=1" + cond,
+                         cargs)}
         vals.discard("")
         return sorted(vals)
     return {"products": _distinct("product"), "scripts": _distinct("script"),
@@ -225,7 +287,9 @@ def restore_tasks(rows):
 
 
 def task_count():
-    rows = db.query("SELECT COUNT(*) AS c FROM tasks")
+    cond, cargs = _acct_cond("account", org_store.visible_accounts(),
+                             keep_blank=True)
+    rows = db.query("SELECT COUNT(*) AS c FROM tasks WHERE 1=1" + cond, cargs)
     return rows[0]["c"] if rows else 0
 
 
@@ -324,7 +388,9 @@ def attach_run_result(job_id, output=None, error=None):
 
 
 def list_runs(limit=1000):
-    return db.query("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))
+    cond, cargs = _acct_cond("account", org_store.visible_accounts())
+    return db.query("SELECT * FROM runs WHERE 1=1" + cond
+                    + " ORDER BY id DESC LIMIT ?", (*cargs, limit))
 
 
 # ---------------- 审片标记（可用 / 不可用） ----------------
@@ -507,24 +573,40 @@ _RANGE = ("SELECT COUNT(*) total, SUM(status='completed') ok,"
           # 平均生成时长只算 `gen_sec`；没拆分的老记录回退用总用时（偶尔偏大一点，
           # 也不要把它们从平均值里隐掉——那样看上去反而像“只跑了新的几条”）
           " AVG(CASE WHEN status='completed' THEN COALESCE(NULLIF(gen_sec,0), duration) END) dur,"
-          " AVG(CASE WHEN status='completed' THEN NULLIF(queued_sec,0) END) qdur"
+          # 用时结构拆分口径：只算「可拆分」（queued/gen 都>0）的记录——排队与生成
+          # 两列同分母，加起来才等于总用时；没拆分的老记录不混进来充数
+          " AVG(CASE WHEN status='completed' AND queued_sec > 0 AND gen_sec > 0"
+          "     THEN queued_sec END) que,"
+          " AVG(CASE WHEN status='completed' AND queued_sec > 0 AND gen_sec > 0"
+          "     THEN gen_sec END) gen"
           " FROM runs WHERE substr(started_at,1,10)")
 
 
 def _sum_row(rows):
     r = rows[0] if rows else {}
     out = {k: int(r.get(k) or 0) for k in ("total", "ok", "fail", "cancel")}
-    out["avg_dur"] = round(float(r.get("dur") or 0), 1)     # 成功执行平均生成用时（秒）
-    out["avg_queued"] = round(float(r.get("qdur") or 0), 1)  # 平均排队（秒），老记录多未采
+    # KPI「平均生成时长」口径：非零 gen_sec，没拆分的老记录回退总用时
+    #（把它们从平均值里隐掉，看上去反而像“只统计了最近那几条”）
+    out["avg_dur"] = round(float(r.get("dur") or 0), 1)
+    # 拆分口径（“用时结构”图与 tooltip 排队均值用）：可拆分记录同分母
+    out["avg_queued"] = round(float(r.get("que") or 0), 1)
+    out["avg_gen"] = round(float(r.get("gen") or 0), 1)
     return out
 
 
+# 视频时长分桶（看板环形图与点击下钻共用，两处口径必须一致）
+_DUR_BUCKETS = [("≤5 秒", 1, 5), ("6~10 秒", 6, 10),
+                ("11~15 秒", 11, 15), (">15 秒", 16, 10 ** 9)]
+
+
 def range_stats(days=7):
-    """BI 看板数据：近 N 天汇总 + 环比上 N 天 + 逐日明细（缺失日补 0）+ 线路分布
+    """BI 看板数据：近 N 天汇总 + 环比上 N 天 + 逐日明细（缺失日补 0）
+    + 线路分布 + 产品分布 + 视频时长分桶
 
     days=None 代表「全部」：从第一条记录累计至今（永不清零）。
-    没有上一个等长周期可比，prev 全 0，看板据此隐掉环比。"""
-    from datetime import date, timedelta
+    没有上一个等长周期可比，prev 全 0，看板据此隐掉环比。
+    另返回 hourly＝当日逐时执行节奏（固定只看今天，不随时间范围变）。"""
+    from datetime import date, datetime, timedelta
     today = date.today().isoformat()
     t0 = "0000-01-01"
     if days is None:
@@ -532,19 +614,26 @@ def range_stats(days=7):
     else:
         cur_start = (date.today() - timedelta(days=days - 1)).isoformat()
         prev_start = (date.today() - timedelta(days=2 * days - 1)).isoformat()
+    # 看板整体按当前会话可见线路过滤（含逐日/线路/产品/时长/逐时各聚合）
+    cond, cargs = _acct_cond("account", org_store.visible_accounts())
+    rcond, rcargs = _acct_cond("r.account", org_store.visible_accounts())
 
-    cur = _sum_row(db.query(_RANGE + " >= ? AND substr(started_at,1,10) <= ?",
-                            (cur_start, today)))
-    prev = (_sum_row(db.query(_RANGE + " >= ? AND substr(started_at,1,10) < ?",
-                             (prev_start, cur_start))) if prev_start
-            else {"total": 0, "ok": 0, "fail": 0, "cancel": 0, "avg_dur": 0})
-    running = db.query("SELECT COUNT(*) c FROM runs WHERE status='running'")[0]["c"]
+    cur = _sum_row(db.query(_RANGE + " >= ? AND substr(started_at,1,10) <= ?"
+                            + cond, (cur_start, today) + cargs))
+    prev = (_sum_row(db.query(_RANGE + " >= ? AND substr(started_at,1,10) < ?"
+                             + cond, (prev_start, cur_start) + cargs))
+            if prev_start
+            else {"total": 0, "ok": 0, "fail": 0, "cancel": 0,
+                  "avg_dur": 0, "avg_queued": 0, "avg_gen": 0})
+    running = db.query("SELECT COUNT(*) c FROM runs"
+                       " WHERE status='running'" + cond, cargs)[0]["c"]
 
     daily_rows = db.query(
         "SELECT substr(started_at,1,10) d, COUNT(*) total,"
         " SUM(status='completed') ok, SUM(status IN ('failed','error')) fail,"
         " SUM(status='cancelled') cancel"
-        " FROM runs WHERE substr(started_at,1,10) >= ? GROUP BY d", (cur_start,))
+        " FROM runs WHERE substr(started_at,1,10) >= ?" + cond
+        + " GROUP BY d", (cur_start,) + cargs)
     by_day = {r["d"]: r for r in daily_rows}
     daily = []
     if days is None:
@@ -567,12 +656,258 @@ def range_stats(days=7):
     accounts = db.query(
         "SELECT account, COUNT(*) total, SUM(status='completed') ok"
         " FROM runs WHERE substr(started_at,1,10) >= ?"
-        " GROUP BY account ORDER BY total DESC", (cur_start,))
+        + cond + " GROUP BY account ORDER BY total DESC", (cur_start,) + cargs)
+
+    # 产品执行分布：按跑次计数（同一天同一产品跑 3 次算 3），空品名归「未填品名」
+    prod_rows = db.query(
+        "SELECT TRIM(COALESCE(product,'')) p, COUNT(*) total, SUM(status='completed') ok"
+        " FROM runs WHERE substr(started_at,1,10) >= ?"
+        + cond + " GROUP BY TRIM(COALESCE(product,'')) ORDER BY total DESC",
+        (cur_start,) + cargs)
+    pag = {}
+    for r in prod_rows:
+        name = (r["p"] or "").strip() or "未填品名"
+        slot = pag.setdefault(name, [0, 0])
+        slot[0] += int(r["total"] or 0)
+        slot[1] += int(r["ok"] or 0)
+    products = sorted(((p, n[0], n[1]) for p, n in pag.items()),
+                      key=lambda x: (-x[1], -x[2], x[0]))
+
+    # 视频时长占比：只计成功且时长已知的跑次（失败的没成品，老记录可能没存时长）；
+    # 桶边界与日汇报的≥10s口径对得上：≤5 / 6~10 / 11~15 / >15
+    dur_rows = db.query(
+        "SELECT COALESCE(t.duration, 0) d"
+        " FROM runs r LEFT JOIN tasks t ON t.id = r.task_id"
+        " WHERE r.status='completed' AND substr(r.started_at,1,10) >= ?"
+        + rcond, (cur_start,) + rcargs)
+    durations = [{"label": lab,
+                  "value": sum(1 for x in dur_rows
+                               if lo <= int(x["d"] or 0) <= hi)}
+                 for lab, lo, hi in _DUR_BUCKETS]
+
+    # 当日执行节奏（逐时）：折线图固定看今天；钟点只补到当前小时，
+    # 还没跑到的钟点补一排 0 没意义还拉平曲线
+    h_rows = {r["h"]: r for r in db.query(
+        "SELECT substr(started_at,12,2) h, COUNT(*) total,"
+        " SUM(status='completed') ok FROM runs"
+        " WHERE substr(started_at,1,10) = ?" + cond + " GROUP BY h",
+        (today,) + cargs)}
+    hourly = []
+    for i in range(int(datetime.now().strftime("%H")) + 1):
+        h = f"{i:02d}"
+        r = h_rows.get(h, {})
+        hourly.append({"h": h, "total": int(r.get("total") or 0),
+                       "ok": int(r.get("ok") or 0)})
 
     cur["rate"] = round(cur["ok"] / cur["total"] * 100, 1) if cur["total"] else 0.0
     prev["rate"] = round(prev["ok"] / prev["total"] * 100, 1) if prev["total"] else 0.0
     return {"cur": cur, "prev": prev, "running": int(running or 0),
-            "daily": daily, "accounts": accounts, "days": days}
+            "daily": daily, "accounts": accounts, "days": days,
+            "products": products, "durations": durations, "hourly": hourly}
+
+
+def extra_stats(days=7):
+    """「其他图表」页签的补充聚合：失败原因 TOP5 / 星期×小时密度 / 逐日用时结构。
+
+    days=None ＝全部历史。成功率趋势和产品排行用 range_stats 的 daily/products
+    就能算，不在这重查。
+    - errors：只统计 failed/error；空原因归「(未记录原因)」（早期失败没存 error），
+      下钻时拿原文全匹配，展示层自行截短；
+    - heatmap：7×24 矩阵，行 0=周一…6=周日（SQLite %w 的 0=周日，(wd+6)%7 换算）；
+    - dur_daily：逐日平均排队/生成（只计可拆分的成功记录；total=两者之和）。
+    """
+    from datetime import date, timedelta
+    cur_start = "0000-01-01" if days is None else \
+        (date.today() - timedelta(days=days - 1)).isoformat()
+    cond, cargs = _acct_cond("account", org_store.visible_accounts())
+
+    err_rows = db.query(
+        "SELECT COALESCE(NULLIF(TRIM(error),''),'(未记录原因)') e, COUNT(*) c"
+        " FROM runs WHERE status IN ('failed','error')"
+        " AND substr(started_at,1,10) >= ?" + cond
+        + " GROUP BY e ORDER BY c DESC LIMIT 5", (cur_start,) + cargs)
+    errors = [{"reason": str(r["e"] or ""), "count": int(r["c"] or 0)}
+              for r in err_rows]
+
+    heat = [[0] * 24 for _ in range(7)]
+    for r in db.query(
+            "SELECT CAST(strftime('%w', started_at) AS INTEGER) wd,"
+            " CAST(substr(started_at,12,2) AS INTEGER) h, COUNT(*) c"
+            " FROM runs WHERE substr(started_at,1,10) >= ?" + cond
+            + " GROUP BY wd, h", (cur_start,) + cargs):
+        heat[(int(r["wd"] or 0) + 6) % 7][int(r["h"] or 0)] = int(r["c"] or 0)
+
+    dur_daily = []
+    for r in db.query(
+            "SELECT substr(started_at,1,10) d, COUNT(*) n,"
+            " AVG(queued_sec) que, AVG(gen_sec) gen"
+            " FROM runs WHERE status='completed'"
+            " AND queued_sec > 0 AND gen_sec > 0"
+            " AND substr(started_at,1,10) >= ?" + cond
+            + " GROUP BY d ORDER BY d", (cur_start,) + cargs):
+        que = round(float(r["que"] or 0), 1)
+        gen = round(float(r["gen"] or 0), 1)
+        dur_daily.append({"d": r["d"], "n": int(r["n"] or 0),
+                          "que": que, "gen": gen, "total": que + gen})
+    return {"errors": errors, "heatmap": heat, "dur_daily": dur_daily}
+
+
+# 自定义视图（数据中台自助新建页签）的维度表达式：key → (分组列 SQL, 排序)
+# ASC＝按组值升序（时间序列维度），DESC＝按指标值降序（排行维度）
+_CUSTOM_DIMS = {
+    "day": ("substr(r.started_at,1,10)", "ASC"),
+    "product": ("TRIM(COALESCE(r.product,''))", "DESC"),
+    "account": ("COALESCE(r.account,'')", "DESC"),
+    "status": ("r.status", "DESC"),
+    # 时长桶边界与 _DUR_BUCKETS/日汇报一致；没时长/失败跑次归「未知」
+    "dur": ("CASE WHEN COALESCE(t.duration,0) BETWEEN 1 AND 5 THEN '≤5 秒'"
+            " WHEN COALESCE(t.duration,0) BETWEEN 6 AND 10 THEN '6~10 秒'"
+            " WHEN COALESCE(t.duration,0) BETWEEN 11 AND 15 THEN '11~15 秒'"
+            " WHEN COALESCE(t.duration,0) > 15 THEN '>15 秒'"
+            " ELSE '未知' END", "ASC"),
+    "hour": ("substr(r.started_at,12,2)", "ASC"),
+    # 行 0=周一…6=周日（与 heatmap 同换算），展示层翻成中文星期
+    "wd": ("((CAST(strftime('%w', r.started_at) AS INTEGER) + 6) % 7)", "ASC"),
+}
+
+# 指标表达式：生成用时与 KPI 同回退口径，排队与「可拆分」同分母
+_CUSTOM_METRICS = {
+    "total": "COUNT(*)",
+    "ok": "SUM(r.status='completed')",
+    "fail": "SUM(r.status IN ('failed','error'))",
+    "rate": "100.0 * SUM(r.status='completed') / COUNT(*)",
+    "avg_gen": ("AVG(CASE WHEN r.status='completed'"
+                " THEN COALESCE(NULLIF(r.gen_sec,0), r.duration) END)"),
+    "avg_queued": ("AVG(CASE WHEN r.status='completed' AND r.queued_sec > 0"
+                   " AND r.gen_sec > 0 THEN r.queued_sec END)"),
+}
+
+
+def custom_agg(dim, metric, days=7):
+    """自定义视图聚合：按维度分组算指标，喂「新建页签」的三种形态。
+
+    返回 [{"k": 组值原文, "v": 指标值(float), "n": 该组总跑次}]；
+    标签汉化（状态/星期、空线路补位）由展示层做，这里保持原文，
+    下钻时组值能直接丢给 runs_drill。days=None＝全部历史。
+    """
+    from datetime import date, timedelta
+    dexpr, order = _CUSTOM_DIMS.get(dim, _CUSTOM_DIMS["product"])
+    mexpr = _CUSTOM_METRICS.get(metric)
+    if not mexpr:
+        return []
+    cur_start = "0000-01-01" if days is None else \
+        (date.today() - timedelta(days=days - 1)).isoformat()
+    cond, cargs = _acct_cond("r.account", org_store.visible_accounts())
+    rows = db.query(
+        f"SELECT {dexpr} k, {mexpr} v, COUNT(*) n"
+        " FROM runs r LEFT JOIN tasks t ON t.id = r.task_id"
+        " WHERE substr(r.started_at,1,10) >= ?" + cond
+        + f" GROUP BY k ORDER BY {'k ASC' if order == 'ASC' else 'v DESC'}",
+        (cur_start,) + cargs)
+    return [{"k": "" if r["k"] is None else str(r["k"]),
+             "v": round(float(r["v"] or 0), 1), "n": int(r["n"] or 0)}
+            for r in rows]
+
+
+# 环形图图例里的中文状态→runs.status（失败含 error，与聚合口径一致）
+_DRILL_STATUS = {"成功": ("completed",), "失败": ("failed", "error"),
+                 "错误": ("error",), "取消": ("cancelled",),
+                 "运行中": ("running",)}
+
+
+def runs_drill(kind, key, days=7, limit=300):
+    """看板图表点击下钻：按（维度, 点击目标）取执行级明细行。
+
+    kind：day 某一天 / hour 今日某小时 / status 某状态 / product 某产品 /
+          product_in 一组产品（饼图「其他」那一块）/ dur 某时长桶 / account 某线路 /
+          error 某失败原因（extra_stats 同口径）/ wdhour (星期,小时) 热力格 /
+          all 不限分段（时间窗内全部执行，看图空白处点击/悬停按空格用）.
+    days=None ＝全部历史；day/hour 自身就是精确钟点定位，不再叠时间窗。
+    视频时长取任务的 tasks.duration（runs.duration 是执行耗时，不是一回事）；
+    返回按开始时间倒序，最多 limit 条；limit=None／0 ＝不出 LIMIT 全量返。
+    """
+    from datetime import date, timedelta
+    where, args = [], []
+    if kind == "day":
+        where.append("substr(r.started_at,1,10) = ?")
+        args.append(key)
+    elif kind == "hour":
+        where.append("substr(r.started_at,1,10) = ?"
+                     " AND substr(r.started_at,12,2) = ?")
+        args += [date.today().isoformat(), str(key)]
+    else:
+        if days is not None:
+            cur_start = (date.today() - timedelta(days=days - 1)).isoformat()
+            where.append("substr(r.started_at,1,10) >= ?")
+            args.append(cur_start)
+        if kind == "all":
+            pass                            # 全量：只要时间窗条件，不加分段过滤
+        elif kind == "status":
+            sts = _DRILL_STATUS.get(key, (key,))
+            where.append(f"r.status IN ({','.join('?' * len(sts))})")
+            args += list(sts)
+        elif kind == "product":
+            if key == "未填品名":
+                where.append("TRIM(COALESCE(r.product,'')) = ''")
+            else:
+                where.append("TRIM(COALESCE(r.product,'')) = ?")
+                args.append(key)
+        elif kind == "product_in":
+            names = [n for n in (key or []) if n and n != "未填品名"]
+            conds = []
+            if names:
+                conds.append(f"TRIM(COALESCE(r.product,''))"
+                             f" IN ({','.join('?' * len(names))})")
+                args += names
+            if "未填品名" in (key or []):
+                conds.append("TRIM(COALESCE(r.product,'')) = ''")
+            where.append("(" + " OR ".join(conds) + ")" if conds else "1=0")
+        elif kind == "dur":
+            where.append("r.status = 'completed'")     # 失败的没成品，不进时长桶
+            for lab, lo, hi in _DUR_BUCKETS:
+                if lab == key:
+                    where.append("COALESCE(t.duration, 0) BETWEEN ? AND ?")
+                    args += [lo, hi]
+                    break
+        elif kind == "account":
+            where.append("COALESCE(r.account,'') = ?")
+            args.append(key or "")
+        elif kind == "error":
+            # 失败原因 TOP 条：extra_stats 同口径（空原因归「(未记录原因)」）
+            where.append("r.status IN ('failed','error')")
+            if key == "(未记录原因)":
+                where.append("COALESCE(TRIM(r.error),'') = ''")
+            elif key:
+                where.append("TRIM(r.error) = ?")
+                args.append(key)
+        elif kind == "wdhour":
+            # 热力图单元格：(星期 0=周一..6=周日, 小时)；%w 的 0=周日，(wd+6)%7 换算
+            wd, h = key
+            where.append("(CAST(strftime('%w', r.started_at) AS INTEGER) + 6) % 7 = ?"
+                         " AND CAST(substr(r.started_at,12,2) AS INTEGER) = ?")
+            args += [int(wd), int(h)]
+        else:
+            return []
+    # 下钻同步权限：member 点「某一天」只能看到自己线路那天的明细；
+    # 无可见线路直接空表（admin / 未启用组织不加条件）
+    allow = org_store.visible_accounts()
+    if allow is not None:
+        if not allow:
+            return []
+        where.append(f"r.account IN ({','.join('?' * len(allow))})")
+        args += list(allow)
+    sql = ("SELECT r.id, r.started_at, r.finished_at, r.num, r.product, r.account,"
+           " r.status, r.duration, r.gen_sec, r.queued_sec, r.output, r.error,"
+           " COALESCE(t.duration, 0) AS vdur"
+           " FROM runs r LEFT JOIN tasks t ON t.id = r.task_id")
+    if where:                               # all+days=None 时一个条件都没有，
+        sql += " WHERE " + " AND ".join(where)   # 裸 WHERE 会直接语法错
+    sql += " ORDER BY r.started_at DESC, r.id DESC"
+    args = tuple(args)
+    if limit:
+        sql += " LIMIT ?"
+        args += (int(limit),)
+    return db.query(sql, args)
 
 
 def report_stats(days=1):
@@ -584,11 +919,12 @@ def report_stats(days=1):
     end = date.today().isoformat()
     start = "0000-01-01" if days is None else \
         (date.today() - timedelta(days=days - 1)).isoformat()
+    cond, cargs = _acct_cond("account", org_store.visible_accounts())
     rows = db.query(
         "SELECT COALESCE(NULLIF(num, ''), 'task:' || task_id) k,"
         " product, status FROM runs"
-        " WHERE substr(started_at,1,10) >= ? AND substr(started_at,1,10) <= ?",
-        (start, end))
+        " WHERE substr(started_at,1,10) >= ? AND substr(started_at,1,10) <= ?"
+        + cond, (start, end) + cargs)
     total = len(rows)
     ok = sum(1 for r in rows if r["status"] == "completed")
     per_task = Counter(r["k"] for r in rows)
@@ -617,12 +953,14 @@ def daily_report_stats(now_hm=None):
     yest = (date.today() - timedelta(days=1)).isoformat()
     if now_hm is None:
         now_hm = datetime.now().strftime("%H:%M")
+    cond, cargs = _acct_cond("r.account", org_store.visible_accounts())
     rows = db.query(
         "SELECT substr(r.started_at,1,10) d, substr(r.started_at,12,5) hm,"
         " r.product product, r.status status,"
         " COALESCE(t.duration, 0) vdur"
         " FROM runs r LEFT JOIN tasks t ON t.id = r.task_id"
-        " WHERE substr(r.started_at,1,10) IN (?, ?)", (today, yest))
+        " WHERE substr(r.started_at,1,10) IN (?, ?)"
+        + cond, (today, yest) + cargs)
 
     def _blank():
         return {"total": 0, "ok": 0, "long": 0, "short": 0,

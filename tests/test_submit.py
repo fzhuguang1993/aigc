@@ -347,3 +347,15 @@ class TestBatchDistributionNote:
     def test_empty_batch_has_no_note(self):
         assert sub.format_batch_distribution([], 7) == ""
         assert sub.format_batch_distribution([None, None], 7) == ""
+
+
+def test_license_error_recognizes_gateway_auth_rejections():
+    """网关 401/403（带 reason 标记）= 授权问题：不换线不重试，直接引导激活"""
+    assert sub._license_error(ApiError(
+        'HTTP 403: {"detail":{"reason":"expired","message":"授权已到期"}}', 403))
+    assert sub._license_error(ApiError(
+        'HTTP 401: {"detail":{"reason":"machine_mismatch"}}', 401))
+    # 同状态码的上游/其它 4xx：没标记就不误判成授权问题
+    assert not sub._license_error(ApiError("HTTP 403: forbidden", 403))
+    assert not sub._license_error(ApiError(REAL_422, 422))
+    assert not sub._license_error(ApiError("HTTP 502: 上游线路异常", 502))

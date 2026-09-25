@@ -55,6 +55,26 @@ CREATE TABLE IF NOT EXISTS file_marks(
   mark TEXT DEFAULT '',               -- bad=不可用 ok=可用 ''=没标
   marked_at TEXT DEFAULT ''
 );
+-- 组织结构（分部门分角色看数）：成员/部门/线路归属三张表。
+-- 数据归属走“线路→成员”映射：runs/tasks 的 account 列就是线路名，
+-- 历史数据零改动即可按权限切分；密码存 pbkdf2 盐哈希，不存明文。
+CREATE TABLE IF NOT EXISTS org_members(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  pass_hash TEXT DEFAULT '',
+  role TEXT DEFAULT 'member',          -- admin=看全部+管组织 manager=看本部门 member=看自己线路
+  dept TEXT DEFAULT '',
+  active INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT '', last_login TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS org_depts(
+  name TEXT PRIMARY KEY, created_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS org_line_owners(
+  account TEXT PRIMARY KEY,            -- 线路名（与 runs.account 同值域）
+  owner TEXT DEFAULT '',               -- 归属成员名；空=未绑定（只 admin 可见）
+  updated_at TEXT DEFAULT ''
+);
 """
 
 # 老库升级：列不存在时 ALTER 补上（重复执行安全）
@@ -99,6 +119,14 @@ def init():
             except sqlite3.OperationalError:
                 pass    # 列已存在
         _CONN.commit()
+
+
+def write_revision():
+    """本连接的写入累计行数（sqlite3 内存计数，零查询成本）。
+
+    UI 定时刷新用它感知「同秒内的多次写入」：时间戳类签名只能分辨到秒，
+    同一秒里接连两次写入会被误判成「没变过」，界面就不刷新了。"""
+    return _CONN.total_changes
 
 
 def query(sql, args=()):

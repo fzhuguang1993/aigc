@@ -4,21 +4,24 @@ gui/dialogs_tags.py —— 「设置 → 🏷 内容标签」词库管理对话�
 维护一份规范的标签清单（增删、排序、恢复默认）：任务表只能从这里挑标签，
 批量归档时目录名也用它。写盘走 core.tags（config.json 的 tags 段），保存即生效。
 """
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QListWidget,
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
                                QLineEdit, QPushButton, QLabel, QMessageBox,
-                               QDialogButtonBox, QListWidgetItem)
+                               QListWidgetItem)
 
 from core import tags as tag_lib
+from gui.window_frame import apply_rounded
 
 
-class TagManagerDialog(QDialog):
+class TagEditor(QWidget):
+    """内容标签词库编辑器（可内嵌：设置页的展开编辑栏；也可装进对话框）。
+    点「保存词库」写盘并发 saved 信号。"""
+    saved = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("内容标签词库")
-        self.resize(360, 420)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
         tip = QLabel("给任务打内容标签用的一组词，也是批量归档时的子文件夹名。\n"
@@ -28,6 +31,7 @@ class TagManagerDialog(QDialog):
         lay.addWidget(tip)
 
         self.lst = QListWidget()
+        self.lst.setMinimumHeight(160)
         self.lst.setDragDropMode(QListWidget.DragDropMode.InternalMove)   # 拖动排序
         self.lst.setDefaultDropAction(Qt.DropAction.MoveAction)
         for t in tag_lib.load():
@@ -57,13 +61,9 @@ class TagManagerDialog(QDialog):
         brow.addStretch(1)
         lay.addLayout(brow)
 
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Save).setText("💾 保存词库")
-        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
+        b_save = QPushButton("💾 保存词库")
+        b_save.clicked.connect(self._save)
+        lay.addWidget(b_save)
 
     # ---------- 列表编辑 ----------
     def _names(self):
@@ -105,10 +105,24 @@ class TagManagerDialog(QDialog):
             self.lst.addItem(QListWidgetItem(t))
 
     # ---------- 保存 ----------
-    def accept(self):
+    def _save(self):
         names = self._names()
         if not [n for n in names if n.strip()]:
             QMessageBox.warning(self, "词库不能为空", "至少保留一个标签，否则任务没法打标签")
             return
         tag_lib.set_all(names)      # 去重清洗后写盘并立即生效
-        super().accept()
+        self.saved.emit()
+
+
+class TagManagerDialog(QDialog):
+    """把 TagEditor 装进对话框（保留旧的弹窗入口）。"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("内容标签词库")
+        self.resize(360, 420)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        ed = TagEditor(self)
+        ed.saved.connect(self.accept)
+        lay.addWidget(ed)
+        apply_rounded(self, show_min=False, show_max=False)

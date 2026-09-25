@@ -25,7 +25,7 @@ def _icon_path():
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("AIGC视频助手")
+    app.setApplicationName("AIGC工厂")
     from gui.theme import apply_theme
     apply_theme(app)
     icon = _icon_path()
@@ -40,9 +40,19 @@ def main():
             sys.exit(0)
         importlib.reload(config)
 
-    from store import db, risk_store
+    # 商用网关模式：激活校验通过才进主窗口（开发直连模式自动放行）
+    from gui.dialogs_license import ensure_valid
+    if not ensure_valid():
+        sys.exit(0)
+
+    from store import db
     db.init()
-    risk_store.init_default()    # 风控表为空时种入广告法极限词通用政策
+
+    # 组织结构启用后必须先登录（org 表要等 db.init() 建好才能查）；
+    # 关闭/取消登录框＝退出应用，登录态不落盘——每次启动都要登录
+    from gui.dialogs_login import require_login
+    if not require_login():
+        sys.exit(0)
 
     from registry.manager import health_monitor_worker
     from workers.poll import start_poll_threads

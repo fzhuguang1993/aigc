@@ -25,6 +25,16 @@ if not exist "core\config_local.py" (
 
 %PY% -m pip install -r requirements.txt pyinstaller || goto :error
 
+REM ffmpeg.exe is baked into the exe (screen recorder + watermark tools need
+REM it at runtime). Maintainer drops it into assets\ locally; not in git.
+set FFMPEG_DATA=
+if exist "assets\ffmpeg.exe" set FFMPEG_DATA=--add-data "assets\ffmpeg.exe;assets"
+if not defined FFMPEG_DATA (
+    echo [WARN] assets\ffmpeg.exe NOT found - the packaged exe will have no
+    echo [WARN] built-in ffmpeg. Screen recording / watermark then need ffmpeg
+    echo [WARN] on the user's PATH. Drop ffmpeg.exe into assets\ and rebuild.
+)
+
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
     --hidden-import=openpyxl --hidden-import=core.config_local ^
@@ -32,7 +42,7 @@ if not exist "core\config_local.py" (
     --hidden-import=volcengine.ApiInfo ^
     --hidden-import=volcengine.Credentials ^
     --hidden-import=volcengine.ServiceInfo ^
-    desktop.py || goto :error
+    %FFMPEG_DATA% desktop.py || goto :error
 
 %PY% -m PyInstaller --noconfirm --onefile --console --name "AIGC视频助手-命令行" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
@@ -41,7 +51,7 @@ if not exist "core\config_local.py" (
     --hidden-import=volcengine.ApiInfo ^
     --hidden-import=volcengine.Credentials ^
     --hidden-import=volcengine.ServiceInfo ^
-    main.py || goto :error
+    %FFMPEG_DATA% main.py || goto :error
 
 echo.
 echo ============================================================

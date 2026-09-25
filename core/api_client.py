@@ -19,8 +19,22 @@ class ApiError(Exception):
         self.status_code = status_code
 
 
+def _auth_headers():
+    """网关鉴权头（四件套）。开发直连模式 license 返回空 dict，一个头都不多加。"""
+    try:
+        from core import license
+        return license.request_headers()
+    except Exception:
+        return {}
+
+
 def _request(method, url, timeout=30, **kwargs):
-    """所有请求的统一出口：发请求 → 校验状态码 → 返回 Response。"""
+    """所有请求的统一出口：发请求 → 校验状态码 → 返回 Response。
+
+    网关模式下自动并入鉴权头（不覆盖调用方显式传的同号头）。"""
+    headers = {**_auth_headers(), **(kwargs.pop("headers", None) or {})}
+    if headers:
+        kwargs["headers"] = headers
     try:
         r = requests.request(method, url, timeout=timeout, **kwargs)
     except requests.RequestException as e:
@@ -97,7 +111,8 @@ def list_jobs(base, limit=100):
 def download_to(url, save_path, chunk_mb=1, timeout=600):
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     try:
-        with requests.get(url, stream=True, timeout=timeout) as r:
+        with requests.get(url, stream=True, timeout=timeout,
+                          headers=_auth_headers() or None) as r:
             if r.status_code >= 400:
                 raise ApiError(f"HTTP {r.status_code}: 下载失败", r.status_code)
             with open(save_path, "wb") as f:
@@ -112,3 +127,25 @@ def extract_script(base, prompt):
     """从提示词提取口播文案，返回文案字符串（可能为空串）。失败抛 ApiError。"""
     return _request("POST", f"{base}/scripts/extract", timeout=60,
                     json={"prompt": prompt}).json().get("script", "")
+
+
+# ============================================================
+# 网关专用出口（base 已含 /api/v1，鉴权头由 _request 统一注入）
+# ============================================================
+def gateway_lines(base):
+    """拉服务端线路池（只读）：返回 {"items": [{name,healthy,load,...}]}，无地址。"""
+    return _request("GET", f"{base}/lines", timeout=15).json()
+
+
+def translate(base, texts, source="auto", target="zh"):
+    """网关翻译出口：{texts,source,target} → 译文列表（与入参同序）。"""
+    data = _request("POST", f"{base}/translate", timeout=(10, 60),
+                    json={"texts": list(texts), "source": source,
+                          "target": target}).json()
+    return data.get("translations") or []
+
+
+def material_parse(base, qtype, share_url):
+    """网关素材提取出口（聚客透传）：GET type/url → 原形 {code,msg,data}。"""
+    return _request("GET", f"{base}/material/parse", timeout=(10, 60),
+                    params={"type": qtype, "url": share_url}).json()

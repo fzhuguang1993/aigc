@@ -34,15 +34,11 @@ def cfg_dir(tmp_path, monkeypatch):
 
     from store import db
     db.execute("DELETE FROM products")
-    db.execute("DELETE FROM risk_rules")
-    db.execute("INSERT INTO products(id,type,name,images,videos,spec) "
-               "VALUES(1,'product','诺特兰德',?,?,'规范卡内容X')",
+    db.execute("INSERT INTO products(id,type,name,images,videos) "
+               "VALUES(1,'product','诺特兰德',?,?)",
                (str(pic), str(mat / "products" / "诺特兰德" / "big.mp4")))
-    db.execute("INSERT INTO risk_rules(id,scope,title,banned) "
-               "VALUES(9,'platform','极限词','最,第一')")
     yield cfg
     db.execute("DELETE FROM products")
-    db.execute("DELETE FROM risk_rules")
 
 
 def _import_into(pkg_path, dest_cfg, tmp_path, monkeypatch):
@@ -57,7 +53,6 @@ class TestRoundtrip:
         pkg = tmp_path / "out.aigccfg"
         info = cp.export_package(str(pkg))
         assert any("产品" in t for t in info["items"])
-        assert any("风控" in t for t in info["items"])
         assert info["files"] >= 6
 
     def test_full_roundtrip(self, cfg_dir, tmp_path, monkeypatch):
@@ -67,16 +62,15 @@ class TestRoundtrip:
         dest.mkdir(parents=True)
         _import_into(pkg, dest, tmp_path / "mb", monkeypatch)
         result = cp.import_package(str(pkg))
-        assert len(result["applied"]) == 5 and not result["skipped"]
+        assert len(result["applied"]) == 4 and not result["skipped"]
         # 文本三件
         assert json.loads((dest / "config.json").read_text("utf-8"))["user_name"] == "雷亮"
         assert (dest / "api_text" / "image.txt").exists()
         assert not (dest / "api_text" / "note.md").exists()   # 白名单外不落盘
-        # 产品/风控进了「新机器」的库
+        # 产品进了「新机器」的库
         from store import db
         rows = db.query("SELECT * FROM products")
-        assert len(rows) == 1 and rows[0]["spec"] == "规范卡内容X"
-        assert db.query("SELECT title FROM risk_rules")[0]["title"] == "极限词"
+        assert len(rows) == 1
         # 图片文件搬过去了、路径重写成本机绝对路径；视频没进包、字符串原样留着
         new_pic = tmp_path / "mb" / "mat_b" / "products" / "诺特兰德" / "a.jpg"
         assert new_pic.exists() and new_pic.read_bytes() == b"\xff\xd8\xff\xe0-FAKE-JPEG"
@@ -88,8 +82,7 @@ class TestRoundtrip:
         pkg = tmp_path / "out.aigccfg"
         cp.export_package(str(pkg))
         blob = pkg.read_bytes()
-        for needle in (b"http://1.2.3.4", b"SECRET-KEY", b"whosyourdaddy",
-                       b"\xe8\xa7\x84\xe8\x8c\x83\xe5\x8d\xa1"):   # "规范卡" UTF-8
+        for needle in (b"http://1.2.3.4", b"SECRET-KEY", b"whosyourdaddy"):
             assert needle not in blob, "密文里不该能扫出明文"
 
     def test_each_package_unique(self, cfg_dir, tmp_path):
@@ -122,7 +115,7 @@ class TestVersioning:
         _import_into(pkg, dest, tmp_path / "mc", monkeypatch)
         result = cp.apply_package(data)
         assert "未来功能配置" in result["skipped"]
-        assert len(result["applied"]) == 5          # 本机登记的 5 条全部照常导入
+        assert len(result["applied"]) == 4          # 本机登记的 4 条全部照常导入
         assert (dest / "config.json").exists()
 
     def test_missing_item_keeps_local(self, cfg_dir, tmp_path, monkeypatch):
@@ -136,8 +129,8 @@ class TestVersioning:
         from store import db
         assert db.query("SELECT COUNT(*) c FROM products")[0]["c"] == 1
         result = cp.apply_package(data)
-        assert not any("规范卡" in t for t in result["applied"])
-        assert len(result["applied"]) == 4
+        assert not any("产品" in t for t in result["applied"])
+        assert len(result["applied"]) == 3
         assert db.query("SELECT COUNT(*) c FROM products")[0]["c"] == 1
 
     def test_v1_package_still_importable(self, cfg_dir, tmp_path, monkeypatch):

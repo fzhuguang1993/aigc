@@ -8,21 +8,25 @@ gui/dialogs_naming.py —— 「设置 → 🏷 命名规则」的自定义对�
 `{num}_{product}.mp4` 这种模板容易漏花括号、写错字段名；点两下 + 拖一拖
 不会错，且预览就在下面，所见即所得。
 """
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QListWidget, QListWidgetItem,
-                               QComboBox, QDialogButtonBox, QMessageBox,
+                               QComboBox, QMessageBox,
                                QAbstractItemView)
 
 from core import naming
+from gui.window_frame import apply_rounded
 
 
-class NamingRuleDialog(QDialog):
+class NamingEditor(QWidget):
+    """成品命名规则编辑器（可内嵌：设置页的展开编辑栏；也可装进对话框）。
+    点「保存并生效」写盘并发 saved 信号，不做取消/关闭语义（由宿主决定）。"""
+    saved = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("🏷 成品命名规则")
-        self.resize(660, 520)
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
 
         tip = QLabel("勾选想要的字段并排好顺序，下载成品时就按这个顺序拼文件名。\n"
@@ -38,6 +42,7 @@ class NamingRuleDialog(QDialog):
         left = QVBoxLayout()
         left.addWidget(QLabel("可用字段"))
         self.avail = QListWidget()
+        self.avail.setMinimumHeight(180)
         self.avail.setToolTip("双击或点「添加」把它放进右边的顺序里")
         self.avail.itemDoubleClicked.connect(self._add_clicked)
         left.addWidget(self.avail, 1)
@@ -60,6 +65,7 @@ class NamingRuleDialog(QDialog):
         right = QVBoxLayout()
         right.addWidget(QLabel("命名顺序（拖动可调整先后）"))
         self.order = QListWidget()
+        self.order.setMinimumHeight(180)
         self.order.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.order.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.order.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -106,16 +112,16 @@ class NamingRuleDialog(QDialog):
         self.lbl_note.setWordWrap(True)
         lay.addWidget(self.lbl_note)
 
-        bb = QDialogButtonBox()
-        b_reset = bb.addButton("↩ 恢复默认", QDialogButtonBox.ButtonRole.ResetRole)
-        b_ok = bb.addButton("💾 保存并生效", QDialogButtonBox.ButtonRole.AcceptRole)
-        b_no = bb.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
-        # 「保存」留默认蓝色主按钮，其它两个降成灰边，免得三个蓝块分不清点哪个
-        for b in (b_reset, b_no):
-            b.setObjectName("GhostBtn")
+        bb = QHBoxLayout()
+        b_reset = QPushButton("↩ 恢复默认")
+        b_reset.setObjectName("GhostBtn")
         b_reset.clicked.connect(self._reset)
+        b_ok = QPushButton("💾 保存并生效")
         b_ok.clicked.connect(self._save)
-        lay.addWidget(bb)
+        bb.addWidget(b_reset)
+        bb.addStretch(1)
+        bb.addWidget(b_ok)
+        lay.addLayout(bb)
 
         tokens, sep = naming.rules()
         self._fill(tokens, sep)
@@ -221,4 +227,17 @@ class NamingRuleDialog(QDialog):
             QMessageBox.warning(self, "还差一步", "右边的命名顺序不能是空的")
             return
         naming.save_rules(tokens, self._sep())
-        self.accept()
+        self.saved.emit()
+
+
+class NamingRuleDialog(QDialog):
+    """把 NamingEditor 装进对话框（保留旧的弹窗入口）。"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🏷 成品命名规则")
+        self.resize(660, 520)
+        lay = QVBoxLayout(self)
+        ed = NamingEditor(self)
+        ed.saved.connect(self.accept)
+        lay.addWidget(ed)
+        apply_rounded(self, show_min=False, show_max=False)

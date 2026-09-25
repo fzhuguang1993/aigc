@@ -5,19 +5,91 @@ import html
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QTimer, Signal, QKeyCombination
+from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QRect, QTimer, Signal, QKeyCombination
 from PySide6.QtGui import (QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor,
                            QRegion, QPainterPath, QTransform, QKeySequence)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
                                QPushButton, QLabel, QWidget, QMessageBox,
-                               QComboBox, QSizeGrip, QSizePolicy, QLineEdit, QInputDialog)
+                               QComboBox, QSizeGrip, QSizePolicy, QLineEdit,
+                               QInputDialog, QLayout)
 
 from core import translate
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
 from store import app_state
 from utils.desktop_utils import open_path, reveal_in_folder
+
+
+class FlowLayout(QLayout):
+    """流式布局：控件从左往右排，一行放不下自动换行（胶囊标签组用）。
+
+    只放 widget 项；支持 heightForWidth，父布局能问到正确高度，
+    筛选面板展开动画靠这个算 sizeHint。"""
+
+    def __init__(self, parent=None, hgap=6, vgap=6):
+        super().__init__(parent)
+        self._items = []
+        self.hgap, self.vgap = hgap, vgap
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        m = self.contentsMargins()
+        rect = QRect(m.left(), m.top(),
+                     max(width - m.left() - m.right(), 0), 0)
+        return self._do(rect, test=True) + m.top() + m.bottom()
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do(self.contentsRect(), test=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        s = QSize()
+        for it in self._items:
+            w = it.widget()
+            if w is not None:
+                s = s.expandedTo(w.minimumSizeHint())
+        m = self.contentsMargins()
+        return s.boundedTo(QSize(1 << 20, 1 << 20)).expandedTo(
+            QSize(s.width() + m.left() + m.right(),
+                  s.height() + m.top() + m.bottom()))
+
+    def _do(self, rect, test):
+        """排一遍所有项；test=True 只算高度不动控件。返回内容底部相对 rect.top 的高度"""
+        x, y, row_h = rect.x(), rect.y(), 0
+        for it in self._items:
+            w = it.widget()
+            if w is None:
+                continue
+            sz = w.sizeHint()
+            if row_h and x + sz.width() > rect.right() + 1:
+                x, y = rect.x(), y + row_h + self.vgap
+                row_h = 0
+            if not test:
+                w.setGeometry(x, y, sz.width(), sz.height())
+            x += sz.width() + self.hgap
+            row_h = max(row_h, sz.height())
+        return y + row_h - rect.y()
 
 
 def _fmt_ms(ms):
@@ -48,7 +120,7 @@ _SHELL_QSS = """
 #PlayerShell { background:#15171C; border:1px solid #2A2E37; border-radius:10px; }
 #PlayerShell QLabel { color:#C9CFDA; background:transparent; font-size:12px; }
 #PlayerShell QLabel#FileName { color:#F2F5FA; font-size:12px; font-weight:600; }
-#PlayerShell QLabel#StatusTip { color:#8A93A3; font-size:11px; }
+#PlayerShell QLabel#StatusTip { color:#8F959E; font-size:11px; }
 #PlayerShell QPushButton, #PlayerShell QToolButton {
     background:#252A33; color:#DCE1EA; border:0; border-radius:6px; padding:4px 9px; }
 #PlayerShell QPushButton:hover, #PlayerShell QToolButton:hover { background:#323A47; }
@@ -451,7 +523,7 @@ class VideoPlayerDialog(QDialog):
 
     def _say(self, msg, warn=False):
         self.lbl_tip.setText(msg)
-        self.lbl_tip.setStyleSheet(f"color:{'#F5A623' if warn else '#8A93A3'};")
+        self.lbl_tip.setStyleSheet(f"color:{'#FF8D19' if warn else '#8F959E'};")
         self.lbl_tip.setVisible(bool(msg))
 
     # ---------------- 窗口：全屏 / 横竖屏自适应 / 无边框拖动 ----------------

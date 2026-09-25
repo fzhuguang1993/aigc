@@ -1,6 +1,7 @@
 # video_text_tools/config.py
 """工具包全部配置常量（移植到其他项目时只需改这里，或运行时覆盖）"""
 import os
+import sys
 
 # ================================================================
 # 视频文件支持格式
@@ -16,10 +17,16 @@ FFMPEG_DEFAULT_FPS = 30
 FFMPEG_WATERMARK_SCALE = 200
 
 # ffmpeg / ffprobe 附加搜索目录（按优先级），找不到时回退到 PATH
-FFMPEG_SEARCH_DIRS = [
+_SEARCH = [
     os.path.dirname(os.path.abspath(__file__)),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin'),
 ]
+# PyInstaller onefile 解包目录（打包时 --add-data 内置的 assets\ffmpeg.exe）
+if getattr(sys, 'frozen', False):
+    _SEARCH.append(os.path.join(getattr(sys, '_MEIPASS', ''), 'assets'))
+# 开发模式：项目根 assets\（维护人自备 ffmpeg.exe 放这里，不入库）
+_SEARCH.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets'))
+FFMPEG_SEARCH_DIRS = _SEARCH
 
 # ================================================================
 # SMB 共享配置（不用 SMB 上传可忽略）

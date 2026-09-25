@@ -139,6 +139,19 @@ def _is_placeholder(entry):
     return not base or base.startswith("<") or "服务地址" in base
 
 
+def _load_gateway_base():
+    """网关根地址：core/config_local.py 的 GATEWAY_BASE（打包进 exe，不进仓库）。
+    配了就补 /api/v1 尾巴；没配返回空串 = 开发/内网直连模式。"""
+    try:
+        from core.config_local import GATEWAY_BASE as _G
+    except (ImportError, AttributeError):
+        return ""
+    g = str(_G or "").strip().rstrip("/")
+    if g and not g.endswith("/api/v1"):
+        g += "/api/v1"
+    return g
+
+
 def defaults_accounts():
     """打包内置的默认线路（维护机的 core/config_local.py 编进 exe）。
     有内置值时，首次配置只问姓名，不再让同事填地址。"""
@@ -149,7 +162,15 @@ def defaults_accounts():
         # ACCOUNTS（只配了提取接口凭证）——两种都退回“让使用者自己填地址”，
         # 不能在这里抛异常把整个软件卡在 import 阶段。
         return []
-    return _normalized_accounts([a for a in list(_A) if not _is_placeholder(a)])
+    accounts = _normalized_accounts([a for a in list(_A) if not _is_placeholder(a)])
+    if not accounts:
+        # 商用网关包：内置没配直连线路、但配了 GATEWAY_BASE → 回退单条“云端网关”，
+        # 首配向导只需问姓名（与 gui.pages_api / setup_wizard 同口径）。
+        g = _load_gateway_base()
+        if g:
+            accounts = _normalized_accounts(
+                [{"name": "云端网关", "base": g, "concurrency": 1}])
+    return accounts
 
 
 def _load_local_config():
@@ -169,27 +190,24 @@ _accounts, USER_NAME = _load_local_config()
 ACCOUNTS = _normalized_accounts(_accounts)
 
 # ============================================================
-# 6.1 口播脚本 AI 检测接口（可选，规范卡配套功能用）
-#     不配置也能用：本地规则检测（禁用词/价格口径/必含话术）。
-#     配置后「AI 智能检测」会把 脚本+规范卡+风控政策 发给大模型做语义级审查。
-#     写法一：config.json 加 "script_check": {"enabled": true, "url": "...", "api_key": "...", "model": "..."}
-#     写法二：core/config_local.py 定义 SCRIPT_CHECK = {...}
+# 6.2 商用网关模式（打包内置：core/config_local.py 写 GATEWAY_BASE）
+#     配了就切到「激活 + 网关」形态：本地线路表整体作废，只剩一条指向网关的线；
+#     上游地址/密钥从此不出服务器，选线/排队/探活全部由网关完成。
+#     不配 = 开发/内网直连模式，一切维持旧行为（维护机自用、本地测试）。
 # ============================================================
+APP_VERSION = "2.0.0"
 
-def _load_script_check():
-    if CONFIG_JSON.exists():
-        cfg = _json_data().get("script_check") or {}
-        if cfg:
-            return cfg
+
+GATEWAY_BASE = _load_gateway_base()
+GATEWAY_MODE = bool(GATEWAY_BASE)
+
+if GATEWAY_MODE:
     try:
-        from core.config_local import SCRIPT_CHECK
-        return dict(SCRIPT_CHECK)
-    except Exception:
-        return {}
-
-
-SCRIPT_CHECK = {"enabled": False, "url": "", "api_key": "", "model": "",
-                **_load_script_check()}
+        from core.config_local import GATEWAY_CONCURRENCY as _GC
+    except (ImportError, AttributeError):
+        _GC = 999          # 客户端不再拦在途闸门：排队调度由网关统一负责
+    ACCOUNTS = _normalized_accounts(
+        [{"name": "云端网关", "base": GATEWAY_BASE, "concurrency": int(_GC)}])
 
 # ============================================================
 # 7. 脚本行为

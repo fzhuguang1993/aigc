@@ -1,0 +1,23 @@
+# /etc/systemd/system/aigc-gate.service
+# 商用网关（激活服务 + 转发网关）服务化：开机自启、崩溃自动拉起
+# 安装：把 server/ 代码与 venv 放到 /opt/aigc-gate，填好 server_config.json
+#       与 upstreams.json 后：systemctl daemon-reload && systemctl enable --now aigc-gate
+[Unit]
+Description=AIGC License & Gateway Server
+After=network.target
+
+[Service]
+Type=simple
+User=aigc
+WorkingDirectory=/opt/aigc-gate
+Environment=PYTHONIOENCODING=utf-8
+# 密钥/口令等敏感项优先用环境变量注入（AIGC_GATE_SECRET 等），
+# 也可留在 server_config.json（权限务必 600）
+# EnvironmentFile=/opt/aigc-gate/.env
+ExecStart=/opt/aigc-gate/venv/bin/python -m uvicorn server.app:app \
+    --host 127.0.0.1 --port 8388 --workers 1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

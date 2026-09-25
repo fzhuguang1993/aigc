@@ -96,6 +96,16 @@ def _builtin_defaults():
         out.append({"name": str(a.get("name") or f"acc{i + 1}"),
                     "base": _normalize_base(base),
                     "concurrency": max(conc, 1)})
+    if not out:
+        # 商用网关包（与 core.config.defaults_accounts 同口径，不能 import config）：
+        # 内置没配直连线路、但配了 GATEWAY_BASE → 回退单条“云端网关”，首配只问姓名。
+        try:
+            from core.config_local import GATEWAY_BASE as _G
+        except (ImportError, AttributeError):
+            _G = ""
+        g = str(_G or "").strip().rstrip("/")
+        if g:
+            out = [{"name": "云端网关", "base": _normalize_base(g), "concurrency": 1}]
     return out
 
 

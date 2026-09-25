@@ -6,12 +6,16 @@ gui/pages_tools.py —— 工具中心
   2. 在下方 TOOLS 里加一条卡片信息（factory 传 None 显示为「规划中」）。
 功能逻辑一律放 video_text_tools 包（纯功能、无 UI），本层只做界面。
 """
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QPoint, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                               QScrollArea, QSizePolicy, QDialog, QGridLayout)
+                               QScrollArea, QSizePolicy, QDialog, QGridLayout,
+                               QGraphicsDropShadowEffect, QMenu)
 
 from gui.header import page_header
 from gui.tool_panels import PANEL_FACTORIES
+from gui.window_frame import apply_rounded
+from store import app_state
 
 # 工具登记表：名称 / 图标 / 简介 / factory 名（None = 规划中）
 TOOLS = [
@@ -22,23 +26,70 @@ TOOLS = [
     ("SMB 上传", "📤", "成品视频批量上传到公司共享盘（需配置服务器账号）", "SMB 上传"),
     ("视频溯源", "🔎", "溯源码池取码、按规则重命名并入库（需内网 MySQL）", "视频溯源"),
     ("素材提取", "🧲", "粘贴唞喑/筷手分享链接：提取去水印视频、图集、文案", "素材提取"),
+    ("屏幕录制", "🎥", "全屏/框选区域/指定窗口录制，选帧率码率保存 MP4", "屏幕录制"),
     ("素材瘦身", "🗜", "把参考图批量压缩到接口要求的大小，避免上传失败", None),
     ("文案查重", "🔍", "提示词相似度检查，防止一批任务生成的视频互相雷同", None),
 ]
 
 CARD_W, CARD_H, GRID_GAP = 250, 150, 14
 
+# ---------- 固定在左侧（卡片右键可 pin，持久化进 ui_state.json） ----------
+PINNED_KEY = "pinned_tools"
+
+
+def load_pinned():
+    """已固定工具名列表；下架/失效的名字读时顺手丢掉（脏数据不留）。
+    登记表的 factory 名恰好等于工具显示名，两边共用同一个键"""
+    valid = {f for _n, _i, _d, f in TOOLS if f and f in PANEL_FACTORIES}
+    return [n for n in (app_state.get(PINNED_KEY) or []) if n in valid]
+
+
+def set_pinned(name, on):
+    cur = [n for n in app_state.get(PINNED_KEY) or [] if n != name]
+    if on:
+        cur.append(name)
+    app_state.set_value(PINNED_KEY, cur)
+
 
 class ToolCard(QWidget):
-    """单个工具卡片：可用时点击打开工具窗口"""
+    """单个工具卡片：可用时点击打开工具窗口。
+
+    hover 不再靠 enter/leave 里贴/撕一段内联样式（那样只换个边框、
+    还没阴影，看着像 winxp）：改用常驻 QGraphicsDropShadowEffect，鼠标进入
+    时用 QPropertyAnimation 把阴影“养大”（模糊半径/下偏量/蓝色透明度
+    同时变），配合 QSS #ToolCard:hover 的蓝色描边，呈现卡片“浮起来”的动画。
+
+    ⚠ 卡内所有子控件对鼠标透明（WA_TransparentForMouseEvents）：否则鼠标
+    移到图标/文字上时卡片会收到 Leave（子控件是独立的 hover 目标），动效
+    忽灭忽现就是“抖动”的根因；点击也落在子控件上收不到，只有卡片空白处
+    能点开——整卡必须是一个交互单元。"""
+    _REST = (16, QPoint(0, 2), QColor(15, 23, 42, 26))       # 静止：轻阴影
+    _HOVER = (30, QPoint(0, 8), QColor(51, 112, 255, 55))    # 悬停：浮起蓝影
 
     def __init__(self, name, icon, desc, factory, on_open, parent=None):
         super().__init__(parent)
         self.setObjectName("ToolCard")
+        # ⚠ PySide6 的 Python 子类不会自动开 WA_StyledBackground，
+        # 不设就是透明卡——白底/描边全被跳过（只在裸 QWidget 实例上才自动）
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.tool_name = name
         self.factory = factory
         self._on_open = on_open
         self.setFixedSize(250, 150)
+        # 驱动 QSS：只有可用（有 factory）的卡片悬停才变蓝描边，规划中卡片不变
+        self.setProperty("canopen", "1" if factory else "0")
+        # WA_Hover：让样式表的 :hover 伪态在普通 QWidget 上生效（否则不自换边框）
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._shadow = QGraphicsDropShadowEffect(self)
+        r = self._REST
+        self._shadow.setBlurRadius(r[0])
+        self._shadow.setOffset(r[1])
+        self._shadow.setColor(r[2])
+        self.setGraphicsEffect(self._shadow)
+        self._anim = QPropertyAnimation(self._shadow, b"blurRadius", self)
+        self._anim.setDuration(170)
+        self._anim2 = QPropertyAnimation(self._shadow, b"offset", self)
+        self._anim2.setDuration(170)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 12)
         lay.setSpacing(6)
@@ -47,6 +98,7 @@ class ToolCard(QWidget):
         badge.setFixedSize(34, 34)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         badge.setStyleSheet("background:#EAF1FF; border-radius:9px; font-size:17px;")
+        self._badge = badge
         t = QLabel(name)
         t.setStyleSheet("font-size:14px; font-weight:700; color:#1F2329; background:transparent;")
         h.addWidget(badge)
@@ -63,6 +115,9 @@ class ToolCard(QWidget):
             "font-size:12px; color:#00A870; background:transparent;" if factory else
             "font-size:12px; color:#8F959E; background:transparent;")
         lay.addWidget(state)
+        # 整卡一个交互单元：子控件不吃鼠标（见类注释的抖动/点不开根因）
+        for w in (badge, t, d, state):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         if factory:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -72,18 +127,58 @@ class ToolCard(QWidget):
             self._on_open(self)
         super().mouseReleaseEvent(e)
 
+    def contextMenuEvent(self, e):
+        """右键：固定到左侧导航 / 从左侧取消（仅可用工具）"""
+        if not self.factory:
+            return
+        pinned = self.tool_name in load_pinned()
+        m = QMenu(self)
+        m.addAction("📌 从左侧导航取消" if pinned else "📌 固定在左侧导航",
+                    self._toggle_pin)
+        m.exec(e.globalPos())
+
+    def _toggle_pin(self):
+        set_pinned(self.tool_name, self.tool_name not in load_pinned())
+        w = self.window()
+        if hasattr(w, "_rebuild_nav"):        # 主窗口即时把导航项补出来/收回去
+            w._rebuild_nav()
+
+    def _animate_shadow(self, target):
+        """把当前阴影的模糊半径/下偏量补间到目标值（颜色直接切换，过渡足够自然）"""
+        blur, off, col = target
+        self._shadow.setColor(col)
+        self._anim.stop()
+        self._anim.setStartValue(self._shadow.blurRadius())
+        self._anim.setEndValue(blur)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.start()
+        self._anim2.stop()
+        self._anim2.setStartValue(self._shadow.offset())
+        self._anim2.setEndValue(off)
+        self._anim2.start()
+
+    def _set_badge_hover(self, on):
+        """悬停时图标徽章跟着加深一档：动效铺满整卡，不只边框和阴影"""
+        self._badge.setStyleSheet(
+            f"background:{'#D6E4FF' if on else '#EAF1FF'}; border-radius:9px; font-size:17px;")
+
     def enterEvent(self, e):
         if self.factory:
-            self.setStyleSheet("#ToolCard { border:1px solid #3370FF; border-radius:12px; }")
+            self._animate_shadow(self._HOVER)
+            self._set_badge_hover(True)
         super().enterEvent(e)
 
     def leaveEvent(self, e):
-        self.setStyleSheet("")
+        self._animate_shadow(self._REST)
+        self._set_badge_hover(False)
         super().leaveEvent(e)
 
 
 class ToolDialog(QDialog):
-    """工具窗口：承载具体面板，非模态显示"""
+    """工具窗口：承载具体面板，非模态显示。
+
+    与全家桶其它弹窗同一套无边框圆角外壳（apply_rounded 自动插标题栏），
+    不再是带原生方角标题栏的默认 QDialog。"""
 
     def __init__(self, name, factory, parent=None):
         super().__init__(parent)
@@ -93,6 +188,7 @@ class ToolDialog(QDialog):
         lay.setContentsMargins(4, 8, 4, 4)
         self.panel = factory(self)
         lay.addWidget(self.panel)
+        apply_rounded(self, title=f"🧰 {name}")
 
 
 class ToolsPage(QWidget):
@@ -111,7 +207,7 @@ class ToolsPage(QWidget):
         # 网格排版：按窗口宽度自动换行（以前是一整排 QHBoxLayout，卡片多了一行不换行）
         self._grid = QGridLayout(holder)
         self._grid.setSpacing(GRID_GAP)
-        self._grid.setContentsMargins(4, 8, 4, 8)
+        self._grid.setContentsMargins(10, 14, 10, 14)
         self._cards = []
         self._cols = 0
         for name, icon, desc, fac_name in TOOLS:
@@ -124,7 +220,8 @@ class ToolsPage(QWidget):
         lay.addWidget(area, 1)
         QTimer.singleShot(0, self._relayout)      # 首次显示按实际宽度排一次
 
-        tip = QLabel("有想要的实用小工具？告诉维护人，排期上架～")
+        tip = QLabel("有想要的实用小工具？告诉维护人，排期上架～　·　右键卡片可固定在左侧导航，"
+                     "还可在「设置-工具快捷键」配一键呼出")
         tip.setObjectName("PageTip")
         lay.addWidget(tip)
 
@@ -147,11 +244,17 @@ class ToolsPage(QWidget):
         QTimer.singleShot(0, self._relayout)   # 防抖：拖拽窗口时合并重排
 
     def _open(self, card):
-        """点击卡片：已有窗口则前置，否则新建"""
-        name = card.tool_name
+        self.open_tool(card.tool_name)
+
+    def open_tool(self, name):
+        """按工具名打开窗口（卡片点击 / 左侧固定项 / 快捷键共用同一入口）：
+        已有窗口则前置，否则新建；父挂主窗口，不随页面切换被藏掉"""
+        factory = PANEL_FACTORIES.get(name)
+        if factory is None:
+            return
         dlg = self._dialogs.get(name)
         if dlg is None or not dlg.isVisible():
-            dlg = ToolDialog(name, card.factory, self)
+            dlg = ToolDialog(name, factory, self.window() or self)
             self._dialogs[name] = dlg
         dlg.show()
         dlg.raise_()

@@ -36,9 +36,17 @@ def _clean_state():
     from core import naming
 
     def _reset():
+        from store import org_store
         db.execute("DELETE FROM tasks")
         db.execute("DELETE FROM runs")
         db.execute("DELETE FROM file_marks")
+        # 组织表与会话也归零：org 用例哪怕中途崩，也不能把成员泄给后续用例
+        # （残留成员会让 org_enabled() 变 True，改变所有被过滤查询的口径）
+        db.execute("DELETE FROM org_members")
+        db.execute("DELETE FROM org_depts")
+        db.execute("DELETE FROM org_line_owners")
+        org_store.logout()
+        org_store._FAILS.clear()
         REG.tasks.clear()
         # 命名规则是模块级缓存：一个用例 set_rules 过就会泄给下一个，
         # 表现为“同一个文件名单独跑能过、整批跑不过”。每轮压回内置默认。

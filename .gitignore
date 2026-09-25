@@ -67,3 +67,12 @@ test/outputs/
 # ========== 备份归档（整项目压缩包，不入库） ==========
 *.rar
 *.7z
+
+# ========== 体积巨大的外部二进制（维护人自备，打包时内置） ==========
+assets/ffmpeg.exe
+assets/ffplay.exe
+assets/ffprobe.exe
+
+# ========== 服务端真实运行配置（含密钥，只入库 example 模板） ==========
+server/server_config.json
+server/upstreams.json

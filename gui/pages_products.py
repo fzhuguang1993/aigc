@@ -1,13 +1,13 @@
 """
 gui/pages_products.py —— 产品中心（树状素材库）
 左侧树：分组 → 品名/KOL → 素材类型 → 文件，双击文件即可预览。
-右侧详情：紧凑分组展示，支持添加/移除登记。
+右侧详情：三类素材以相册式手风琴分区展示（默认展开参考图，展开一个自动收起其余）。
 提交任务时按品名自动取参考图；KOL 按名称取形象图。
 """
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, Signal
-from PySide6.QtGui import QPixmap, QColor
+from PySide6.QtGui import QPixmap, QColor, QIcon
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTreeWidget, QTreeWidgetItem, QSplitter, QInputDialog,
                                QLineEdit, QMessageBox, QFileDialog, QMenu, QListWidget,
@@ -17,12 +17,18 @@ from store import product_store as ps
 from utils.desktop_utils import open_path, reveal_in_folder
 from gui.header import page_header, Card
 from gui.widgets import VideoPlayerDialog, ImagePreviewDialog
-from gui.dialogs_spec import SpecCardDialog
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 VID_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 AUD_EXT = {".mp3", ".wav", ".aac", ".m4a", ".flac"}
 _KINDS = [("image", "🖼", "参考图片"), ("video", "🎬", "参考视频"), ("audio", "🔊", "音频")]
+# 相册分区（手风琴）：收起时只留一行缩略宫格，展开时向下撑成更大宫格；同时只展开一个
+ALBUM_COLLAPSED_H = 108
+ALBUM_EXPANDED_H = 288
+ALBUM_HEAD_QSS = (
+    "QPushButton{background:transparent;border:none;font-size:13px;"
+    "font-weight:700;color:#1F2329;text-align:left;padding:2px 0;}"
+    "QPushButton:hover{color:#3370FF;}")
 _KIND_FIELD = {"image": "images", "video": "videos", "audio": "audios"}
 _KIND_FILTER = {"image": "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp)",
                 "video": "视频文件 (*.mp4 *.mov *.avi *.mkv *.webm)",
@@ -46,6 +52,30 @@ def _kind_by_ext(path):
 
 def _drop_paths(e):
     return [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+
+
+def _media_tile(kind):
+    """视频/音频相册格子的占位缩略：圆角色块 + 字形，
+    不解码首帧（不依赖 ffmpeg/网络，offscreen 也不会崩）"""
+    from PySide6.QtGui import QPainter, QFont
+    from PySide6.QtCore import QRect
+    colors = {"video": "#3370FF", "audio": "#7F3FBF"}
+    glyphs = {"video": "\U0001F3AC", "audio": "\U0001F50A"}
+    pm = QPixmap(96, 72)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(colors.get(kind, "#8F959E")))
+    p.drawRoundedRect(0, 0, 96, 72, 8, 8)
+    p.setPen(QColor("white"))
+    f = QFont()
+    f.setPointSize(26)
+    p.setFont(f)
+    p.drawText(QRect(0, 0, 96, 72), Qt.AlignmentFlag.AlignCenter,
+               glyphs.get(kind, ""))
+    p.end()
+    return pm
 
 
 class DragTree(QTreeWidget):
@@ -105,7 +135,7 @@ class ProductsPage(QWidget):
         lay.setSpacing(8)
 
         lay.addWidget(page_header("产品中心",
-                                  "树状管理素材 · 双击预览 · 支持从资源管理器拖拽文件入库 · 规范卡约束口播口径",
+                                  "树状管理素材 · 双击预览 · 支持从资源管理器拖拽文件入库",
                                   icon="🧩"))
 
         bar = QHBoxLayout()
@@ -141,7 +171,9 @@ class ProductsPage(QWidget):
         split.addWidget(self.tree)
 
         # ---------- 右：紧凑详情 ----------
-        detail = Card(margins=(18, 14, 18, 14))
+        # 顶部内边距压到与左侧素材树首行齐平（两侧均在同一 QSplitter 里，
+        # 外框顶部本就对齐；详情卡片默认上边距偏大会把首行文字顶下去，看着不齐）
+        detail = Card(margins=(18, 8, 18, 14))
         split.addWidget(detail)
         self.detail = detail
 
@@ -151,12 +183,6 @@ class ProductsPage(QWidget):
         self.lbl_type = QLabel("")
         head.addWidget(self.lbl_name)
         head.addWidget(self.lbl_type)
-        self.b_spec = QPushButton("📐 规范卡")
-        self.b_spec.setObjectName("GhostBtn")
-        self.b_spec.setToolTip("定义这个品的套餐/价格口径/活动口径/禁用词；任务中心可据此检测口播脚本")
-        self.b_spec.setEnabled(False)
-        self.b_spec.clicked.connect(self._open_spec)
-        head.addWidget(self.b_spec)
         head.addStretch(1)
         detail.v.addLayout(head)
 
@@ -171,39 +197,43 @@ class ProductsPage(QWidget):
         detail.v.addLayout(row)
         self.note_row = row
 
-        # 三类素材分区（纵向堆叠，图片用缩略图横排，视频/音频用紧凑列表）
+        # 三类素材：相册化手风琴分区（▸ 收起成一行缩略宫格，▾ 展开成更大宫格，同时只展开一个）
         self.sections = {}
+        self.album = {}
         for kind, icon, label in _KINDS:
             sec = QVBoxLayout()
             sec.setSpacing(4)
-            sh = QHBoxLayout()
-            ttl = QLabel(f"{icon} {label}")
-            ttl.setStyleSheet("font-size:13px; font-weight:700; color:#1F2329; background:transparent;")
+            hs = QHBoxLayout()
+            hs.setContentsMargins(0, 0, 0, 0)
+            head = QPushButton()
+            head.setObjectName("AlbumHead")
+            head.setStyleSheet(ALBUM_HEAD_QSS)
+            head.setCursor(Qt.CursorShape.PointingHandCursor)
+            head.clicked.connect(lambda _=False, k=kind: self._toggle_album(k))
+            hs.addWidget(head, 1)
             b_add = QPushButton("＋ 添加")
             b_add.setObjectName("GhostBtn")
             b_add.clicked.connect(lambda _=False, k=kind: self._add_files(k))
-            sh.addWidget(ttl)
-            sh.addStretch(1)
-            sh.addWidget(b_add)
-            sec.addLayout(sh)
-            if kind == "image":
-                w = DropList(kind)
-                w.setViewMode(QListWidget.ViewMode.IconMode)
-                w.setIconSize(QSize(84, 60))
-                w.setGridSize(QSize(100, 88))
-                w.setResizeMode(QListWidget.ResizeMode.Adjust)
-                w.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-                w.setFixedHeight(112)
-                w.setWordWrap(True)
-            else:
-                w = DropList(kind)
-                w.setFixedHeight(84)
-            w.setToolTip("可直接把文件拖到这里登记")
+            hs.addWidget(b_add)
+            sec.addLayout(hs)
+            w = DropList(kind)
+            w.setViewMode(QListWidget.ViewMode.IconMode)
+            w.setIconSize(QSize(96, 72))
+            w.setGridSize(QSize(118, 108))
+            w.setResizeMode(QListWidget.ResizeMode.Adjust)
+            w.setMovement(QListWidget.Movement.Static)
+            w.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            w.setWordWrap(True)
+            w.setToolTip("可直接把文件拖到这里登记 · 点上方标题栏向下展开/收起")
             w.files_dropped.connect(lambda paths, k=kind: self._on_drop(paths, ("kind", self._pid, k)))
             w.itemDoubleClicked.connect(lambda it: self._preview_item(it))
             sec.addWidget(w)
             detail.v.addLayout(sec)
             self.sections[kind] = w
+            self.album[kind] = {"head": head, "open": (kind == "image"), "n": 0,
+                                "icon": icon, "label": label}
+            self._apply_album_height(kind)
+            self._album_head_text(kind, 0)
         detail.v.addStretch(1)
         self._pid = None
         self._media = None      # 预览窗口引用防 GC
@@ -252,7 +282,7 @@ class ProductsPage(QWidget):
                         kn.addChild(fn)
                 node.setExpanded(("item", p["id"]) in exp)
             # 首次构建无展开记录：产品少时默认展开方便浏览；
-            # 有过记录则完全尊重用户状态（否则规范卡关回来后树会“收缩且展不开”）
+            # 有过记录则完全尊重用户状态（否则重建后树会“收缩且展不开”）
             if not exp:
                 root.setExpanded(len(items) <= 6)
             else:
@@ -326,13 +356,16 @@ class ProductsPage(QWidget):
 
     def _show_detail(self, p, focus=None):
         self._pid = p["id"] if p else None
-        self.b_spec.setEnabled(p is not None)
         if not p:
             self.lbl_name.setText("← 从左侧选择一个产品或 KOL")
             self.lbl_type.setText("")
             self.ed_note.blockSignals(True); self.ed_note.clear(); self.ed_note.blockSignals(False)
             for kind, _, _ in _KINDS:
                 self.sections[kind].clear()
+                self.album[kind]["n"] = 0
+                self.album[kind]["open"] = (kind == "image")
+                self._apply_album_height(kind)
+                self._album_head_text(kind, 0)
             return
         self.lbl_name.setText(p["name"])
         self.lbl_type.setText("产品" if p["type"] == ps.TYPE_PRODUCT else "KOL")
@@ -352,11 +385,13 @@ class ProductsPage(QWidget):
                 it = QListWidgetItem(name)
                 it.setData(Qt.ItemDataRole.UserRole, fpath)
                 it.setToolTip(fpath)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
                 if kind == "image" and Path(fpath).suffix.lower() in IMG_EXT and Path(fpath).exists():
-                    pm = QPixmap(fpath).scaled(84, 60, Qt.AspectRatioMode.KeepAspectRatio,
+                    pm = QPixmap(fpath).scaled(96, 72, Qt.AspectRatioMode.KeepAspectRatio,
                                                Qt.TransformationMode.SmoothTransformation)
-                    it.setIcon(QPixmap(pm))
-                    it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+                    it.setIcon(QIcon(pm))
+                elif kind in ("video", "audio"):
+                    it.setIcon(QIcon(_media_tile(kind)))
                 if focus and fpath == focus:
                     w.setCurrentItem(it)
                 w.addItem(it)
@@ -365,11 +400,36 @@ class ProductsPage(QWidget):
                 empty.setFlags(Qt.ItemFlag.NoItemFlags)
                 empty.setForeground(QColor("#8F959E"))
                 w.addItem(empty)
+            self.album[kind]["n"] = len(files)
+            # 选中新品回到默认手风琴态：参考图展开、其余收起
+            self.album[kind]["open"] = (kind == "image")
+            self._apply_album_height(kind)
+            self._album_head_text(kind, len(files))
 
     def _save_note(self):
         if self._pid is not None:
             ps.set_note(self._pid, self.ed_note.text().strip())
             self.lbl_hint.setText("备注已保存")
+
+    # ================= 相册分区：展开/收起 =================
+    def _apply_album_height(self, kind):
+        a = self.album[kind]
+        self.sections[kind].setFixedHeight(
+            ALBUM_COLLAPSED_H if not a["open"] else ALBUM_EXPANDED_H)
+
+    def _album_head_text(self, kind, n):
+        a = self.album[kind]
+        a["head"].setText(("▾ " if a["open"] else "▸ ")
+                          + f"{a['icon']} {a['label']}（{n}）")
+
+    def _toggle_album(self, kind):
+        # 手风琴：点亮当前分区就收起其余；再点已展开的那个则全收起
+        a = self.album[kind]
+        target = not a["open"]
+        for k in self.album:
+            self.album[k]["open"] = (k == kind and target)
+            self._apply_album_height(k)
+            self._album_head_text(k, self.album[k]["n"])
 
     # ================= 预览 / 文件操作 =================
     def _on_double(self, it, col):
@@ -432,7 +492,7 @@ class ProductsPage(QWidget):
         ps.remove_file(pid, kind, path)
         self.rebuild(keep=pid)
 
-    # ================= 拖拽入库 / 规范卡 =================
+    # ================= 拖拽入库 =================
     def _on_drop(self, paths, role):
         """拖入文件：目标产品取自落点节点（file/kind/item），类型按扩展名自动判定；
         落点无法判断类型时才用拖放位置的类型兜底"""
@@ -477,14 +537,6 @@ class ProductsPage(QWidget):
         if unknown:
             msg += f"，{unknown} 个格式不支持已跳过（仅图片/视频/音频）"
         self.lbl_hint.setText(msg)
-
-    def _open_spec(self):
-        p = ps.get_product(self._pid) if self._pid is not None else None
-        if not p:
-            return
-        SpecCardDialog(self, p).exec()
-        self._sig = None
-        self.lbl_hint.setText(f"「{p['name']}」规范卡已更新，任务中心右键可检测口播")
 
     # ================= 右键菜单 =================
     def _tree_menu(self, pos):

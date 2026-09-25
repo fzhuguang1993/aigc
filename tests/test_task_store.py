@@ -132,6 +132,43 @@ def test_range_stats_none_covers_all_history():
     assert st["days"] is None
 
 
+def test_range_stats_products_and_durations():
+    """看板新增：产品执行分布（空品名归「未填品名」）+ 视频时长四档分桶
+    （只计成功且时长已知的）"""
+    from datetime import date
+    today = date.today().isoformat()
+    _add_task_with_run("甲", 15, "completed", today)
+    _add_task_with_run("甲", 5, "failed", today)       # 失败不进时长桶
+    _add_task_with_run("乙", 8, "completed", today)
+    _add_task_with_run("", 20, "completed", today)     # 空品名 → 未填品名
+    _add_task_with_run("丙", 0, "completed", today)    # 时长未知 → 不落任何桶
+    st = ts.range_stats(7)
+    prods = {p: (r, o) for p, r, o in st["products"]}
+    assert prods["甲"] == (2, 1) and prods["乙"] == (1, 1)
+    assert prods["未填品名"] == (1, 1) and prods["丙"] == (1, 1)
+    assert st["products"][0][0] == "甲", "按执行次数降序，甲(2次) 排最前"
+    dur = {d["label"]: d["value"] for d in st["durations"]}
+    assert dur == {"≤5 秒": 0, "6~10 秒": 1, "11~15 秒": 1, ">15 秒": 1}
+
+
+def test_range_stats_hourly_today():
+    """当日逐时节奏：固定只看今天、钟点补到当前小时（未来钟点不补 0）；
+    失败只进 total 不进 ok"""
+    from datetime import date, datetime
+    now = datetime.now()
+    today = date.today().isoformat()
+    hm = now.strftime("%H:%M")          # 钉在当前小时，用例不看时钟脸色
+    _add_task_with_run("甲", 5, "completed", today, hm=hm)
+    _add_task_with_run("甲", 5, "failed", today, hm=hm)
+    st = ts.range_stats(7)
+    hourly = st["hourly"]
+    assert [x["h"] for x in hourly] == [f"{i:02d}" for i in range(now.hour + 1)], \
+        "只补到当前小时，后面的钟点还没跑到不摆空 0"
+    slot = hourly[now.hour]
+    assert slot["total"] == 2 and slot["ok"] == 1
+    assert sum(x["total"] for x in hourly) == 2, "逐时合计＝当日总执行数"
+
+
 # ---------------- 日汇报（今日 vs 昨日同时段、分产品、时长分桶）----------------
 
 def _add_task_with_run(product, duration, status, day, hm="10:00"):

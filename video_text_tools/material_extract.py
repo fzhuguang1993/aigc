@@ -71,16 +71,37 @@ def host_allowed(link, allowed):
     return any(host == h or host.endswith("." + h) for h in allowed)
 
 
-def call_parse_api(base, uid, key, qtype, share_url, timeout=30):
-    """调解析接口，成功返回 data dict；失败抛 ValueError。qtype: dsp/wenan"""
-    r = requests.get(base, params={"type": qtype, "uid": uid, "key": key,
-                                   "url": share_url},
-                     timeout=timeout, headers=_UA)
-    r.raise_for_status()
+def _gateway_base():
+    """网关根地址：非空即商用网关模式（取料走网关，本机 base/uid/key 作废）。"""
     try:
-        j = r.json()
-    except ValueError:
-        raise ValueError(f"接口未返回 JSON（地址可能已变更）：{r.text[:120]}")
+        from core.config import GATEWAY_BASE
+        return str(GATEWAY_BASE or "").strip()
+    except Exception:
+        return ""
+
+
+def call_parse_api(base, uid, key, qtype, share_url, timeout=30):
+    """调解析接口，成功返回 data dict；失败抛 ValueError。qtype: dsp/wenan
+
+    网关模式：走网关 /material/parse（真实 base/uid/key 只在服务端），本机凭证忽略；
+    直连模式：按传入 base/uid/key 直连聚客。两条路返回的都是聚客 {code,msg,data}，
+    下游取数逻辑一致。"""
+    gw = _gateway_base()
+    if gw:
+        from core import api_client
+        try:
+            j = api_client.material_parse(gw, qtype, share_url)
+        except Exception as e:
+            raise ValueError(f"提取接口调用失败：{e}")
+    else:
+        r = requests.get(base, params={"type": qtype, "uid": uid, "key": key,
+                                       "url": share_url},
+                         timeout=timeout, headers=_UA)
+        r.raise_for_status()
+        try:
+            j = r.json()
+        except ValueError:
+            raise ValueError(f"接口未返回 JSON（地址可能已变更）：{r.text[:120]}")
     if int(j.get("code", 0) or 0) != 200:
         raise ValueError(f"{j.get('msg') or '解析失败'}（code={j.get('code')}）")
     return j.get("data") or {}

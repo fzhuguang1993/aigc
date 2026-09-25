@@ -3,7 +3,6 @@ gui/pages_api.py —— 接口管理（维护人页：默认不进导航，设�
 
 这里集中全软件所有「对外接口」的部署与状态：
 - 线路部署（API 服务地址）：一个地址＝一个账号，调度按它们分负载
-- 脚本 AI 检测接口：「🧐 口播规范检测」用的 OpenAI 兼容接口（可选）
 - 机器翻译接口：火山引擎 MT，任务弹窗「提示词中文对照」用
 - 素材提取接口：api_text/api_config.json 凭证（外部维护文件，只给状态与入口）
 
@@ -19,10 +18,10 @@ from PySide6.QtCore import Qt, QThread, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
-                               QHeaderView, QMessageBox, QCheckBox, QApplication,
+                               QHeaderView, QMessageBox, QApplication,
                                QAbstractItemView)
 
-from core.config import CONFIG_JSON, ACCOUNTS, SCRIPT_CHECK, TRANSLATE
+from core.config import CONFIG_JSON, ACCOUNTS, TRANSLATE
 from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header
@@ -210,27 +209,6 @@ class ApiManagerPage(QWidget):
             self._add_row()
         self._checker = None
 
-        # ---------- 脚本 AI 检测接口（规范卡口播检测用，可留空） ----------
-        lay.addWidget(QLabel("脚本 AI 检测接口（可选 —— 「🧐 口播规范检测」的 AI 智能检测用，不配置也能用本地规则检测）："))
-        crow = QHBoxLayout()
-        self.ck_ai = QCheckBox("启用")
-        self.ck_ai.setChecked(bool(SCRIPT_CHECK.get("enabled")))
-        crow.addWidget(self.ck_ai)
-        crow.addWidget(QLabel("地址"))
-        self.ed_ai_url = QLineEdit(SCRIPT_CHECK.get("url", ""))
-        self.ed_ai_url.setPlaceholderText("https://.../v1/chat/completions（OpenAI 兼容格式）")
-        crow.addWidget(self.ed_ai_url, 2)
-        crow.addWidget(QLabel("Key"))
-        self.ed_ai_key = QLineEdit(SCRIPT_CHECK.get("api_key", ""))
-        self.ed_ai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        crow.addWidget(self.ed_ai_key, 1)
-        crow.addWidget(QLabel("模型"))
-        self.ed_ai_model = QLineEdit(SCRIPT_CHECK.get("model", ""))
-        self.ed_ai_model.setPlaceholderText("gpt-4o-mini")
-        self.ed_ai_model.setFixedWidth(140)
-        crow.addWidget(self.ed_ai_model)
-        lay.addLayout(crow)
-
         # ---------- 机器翻译接口（火山引擎 MT，「提示词中文对照」用） ----------
         lay.addWidget(QLabel("机器翻译接口（火山引擎文本翻译 —— 任务弹窗「提示词中文对照」用；"
                              "也可留空，留空时界面点翻译会明确提示未配置）："))
@@ -276,8 +254,6 @@ class ApiManagerPage(QWidget):
 
     def _update_status(self):
         lines = self._rows()
-        ai = "已启用" if (self.ck_ai.isChecked() and self.ed_ai_url.text().strip()) \
-            else ("地址没填" if self.ck_ai.isChecked() else "未启用（本地规则照常可用）")
         tr = "已配置" if (self.ed_tr_ak.text().strip() and self.ed_tr_sk.text().strip()) \
             else ("未配置（弹窗点翻译会提示）" if not TRANSLATE.get("ak")
                   else "由本机 config_local 兜底（这里填了会覆盖）")
@@ -288,7 +264,7 @@ class ApiManagerPage(QWidget):
         except Exception:
             ex = "未知"
         self.lbl_status.setText(
-            f"生成线路 <b>{len(lines)}</b> 条　·　脚本 AI 检测：{ai}　·　"
+            f"生成线路 <b>{len(lines)}</b> 条　·　"
             f"机器翻译：{tr}　·　素材提取接口：{ex}")
 
     def _open_api_text(self):
@@ -325,7 +301,7 @@ class ApiManagerPage(QWidget):
     def reload_from_disk(self):
         """按盘上的 config.json 重建线路表与接口字段
 
-        不能吃启动缓存 ACCOUNTS/SCRIPT_CHECK（导入刚写完盘它们还是旧值），
+        不能吃启动缓存 ACCOUNTS（导入刚写完盘它还是旧值），
         也不能往表里追加（会跟启动加的那批叠成重复行）——清空重建。"""
         try:
             data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
@@ -338,11 +314,6 @@ class ApiManagerPage(QWidget):
                           a.get("concurrency", 1))
         if self.acc_table.rowCount() == 0:
             self._add_row()
-        sc = data.get("script_check") or {}
-        self.ck_ai.setChecked(bool(sc.get("enabled")))
-        self.ed_ai_url.setText(str(sc.get("url", "")))
-        self.ed_ai_key.setText(str(sc.get("api_key", "")))
-        self.ed_ai_model.setText(str(sc.get("model", "")))
         tr = data.get("translate") or {}
         self.ed_tr_ak.setText(str(tr.get("ak", "")))
         self.ed_tr_sk.setText(str(tr.get("sk", "")))
@@ -538,12 +509,6 @@ class ApiManagerPage(QWidget):
             except Exception:
                 data = {}
         data["accounts"] = accounts
-        data["script_check"] = {
-            "enabled": self.ck_ai.isChecked(),
-            "url": self.ed_ai_url.text().strip(),
-            "api_key": self.ed_ai_key.text().strip(),
-            "model": self.ed_ai_model.text().strip(),
-        }
         tr = dict(data.get("translate") or {})   # region/project 等键原样留着
         tr["ak"] = self.ed_tr_ak.text().strip()
         tr["sk"] = self.ed_tr_sk.text().strip()

@@ -1,28 +1,36 @@
 """
 gui/pages_settings.py —— 设置（编辑 config.json，保存后需重启软件生效；
-例外：「🏷 命名规则」在自己的对话框里就写盘并立即生效）
+例外：「成品命名」「内容标签」在各自的展开编辑栏里就写盘并立即生效）
 
-线路部署与各接口（AI 检测/翻译/提取凭证）的编辑已整体搬到「接口管理」页
+线路部署与各接口（翻译/提取凭证）的编辑已整体搬到「接口管理」页
 （gui/pages_api.py）：那页默认不进导航，本页口令（Alt+W / Mac ⌘+W）验证
-通过后才会出现并自动跳入；本页只留姓名、命名规则、输出目录与配置迁移。
+通过后才会出现并自动跳入；本页只留姓名、视频预览、命名/标签展开栏、
+输出目录与配置迁移（后者与「保存设置」同行）。
 """
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QStandardPaths
+from PySide6.QtCore import Qt, QStandardPaths, QPoint
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QMessageBox,
-                               QFileDialog, QInputDialog, QSlider)
+                               QPushButton, QMessageBox, QMenu, QScrollArea, QFrame,
+                               QFileDialog, QInputDialog, QSpinBox, QComboBox,
+                               QKeySequenceEdit)
 
 from core.config import (CONFIG_JSON, USER_NAME,
-                         DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR)
+                         DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR,
+                         GATEWAY_MODE)
+from core import license as lic
 from core import naming
 from core import tags as tag_lib
 from gui.header import page_header
-from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT
+from gui.dialogs_naming import NamingEditor
+from gui.dialogs_tags import TagEditor
+from gui.pages_tools import TOOLS
+from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, PANEL_FACTORIES
 from gui.widgets import VideoPlayerDialog
 from store import app_state
 
@@ -33,167 +41,287 @@ def _same_path(a, b):
         os.path.normcase(os.path.normpath(str(b)))
 
 
+class _ExpandSection(QWidget):
+    """点击标题栏向下展开的编辑栏：平时收起只显示概要，点一下展开内嵌编辑器。
+    取代旧的「label + 右侧按钮弹窗」样式（命名/标签都用它）。"""
+    def __init__(self, title, editor, icon=""):
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        self._title = title
+        self._icon = icon
+        self._summary = ""
+        self._open = False
+        self._head = QPushButton()
+        self._head.setObjectName("AccHead")
+        self._head.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._head.clicked.connect(self._toggle)
+        self._body = QWidget()
+        bl = QVBoxLayout(self._body)
+        bl.setContentsMargins(2, 4, 2, 2)
+        bl.addWidget(editor)
+        self._body.setVisible(False)
+        v.addWidget(self._head)
+        v.addWidget(self._body)
+        self._render()
+
+    def set_summary(self, text):
+        self._summary = text or ""
+        self._render()
+
+    def collapse(self):
+        if self._open:
+            self._open = False
+            self._body.setVisible(False)
+            self._render()
+
+    def _toggle(self):
+        self._open = not self._open
+        self._body.setVisible(self._open)
+        self._render()
+
+    def _render(self):
+        arrow = "▾" if self._open else "▸"
+        self._head.setText(f"{arrow}  {self._icon} {self._title}：{self._summary}")
+
+
+def _form_label(text, w=110):
+    """表单行右对齐标签：所有设置卡共用同一列宽，标签参差是页面显乱的头一个来源"""
+    lb = QLabel(text)
+    lb.setFixedWidth(w)
+    lb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    lb.setStyleSheet("color:#646A73; background:transparent;")
+    return lb
+
+
+def _field_row(label, widget, hint=""):
+    """一行「标签 + 控件 + 可选灰色提示」：设置项统一走这个口径"""
+    r = QHBoxLayout()
+    r.setSpacing(10)
+    r.addWidget(_form_label(label))
+    r.addWidget(widget)
+    if hint:
+        h = QLabel(hint)
+        h.setStyleSheet("color:#8F959E; font-size:12px; background:transparent;")
+        r.addWidget(h)
+    r.addStretch(1)
+    return r
+
+
+def _section_card(title, hint=""):
+    """白底圆角分区卡（蓝竖条 + 标题 + 灰色说明，与页头同一视觉语言）：
+    设置项按业务分组进卡，不再裸摆在灰底上——商业软件设置页的基本形态"""
+    card = QWidget()
+    card.setObjectName("Card")
+    v = QVBoxLayout(card)
+    v.setContentsMargins(18, 14, 18, 16)
+    v.setSpacing(12)
+    head = QHBoxLayout()
+    head.setSpacing(8)
+    bar = QLabel()
+    bar.setFixedSize(3, 14)
+    bar.setStyleSheet("background:#3370FF; border-radius:2px;")
+    head.addWidget(bar, 0, Qt.AlignmentFlag.AlignVCenter)
+    t = QLabel(title)
+    t.setStyleSheet("font-size:14px; font-weight:700; color:#1F2329; background:transparent;")
+    head.addWidget(t)
+    if hint:
+        h = QLabel(hint)
+        h.setStyleSheet("font-size:12px; color:#8F959E; background:transparent;")
+        head.addWidget(h, 0, Qt.AlignmentFlag.AlignVCenter)
+    head.addStretch(1)
+    v.addLayout(head)
+    return card, v
+
+
 class SettingsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 12, 24, 12)
-        lay.setSpacing(8)
+        # 整页套一层滚动区：命名/标签展开编辑栏会变高，短窗口下可滚动不裁剪
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(24, 12, 24, 24)
+        lay.setSpacing(12)
 
         head = page_header("设置", "修改保存后重启生效（命名规则除外：保存即生效）", icon="⚙️")
         head.setToolTip(f"配置文件：{CONFIG_JSON}")
         lay.addWidget(head)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("姓名："))
+        # ---------- 账户与授权 ----------
+        card, cv = _section_card("账户与授权", "姓名参与成品文件命名")
         self.name_edit = QLineEdit(USER_NAME)
-        self.name_edit.setFixedWidth(220)
-        row.addWidget(self.name_edit)
-        row.addStretch(1)
-        lay.addLayout(row)
+        self.name_edit.setFixedWidth(240)
+        cv.addLayout(_field_row("姓名", self.name_edit))
+        # 授权状态（仅网关模式）：到期时间 + 续费入口
+        if GATEWAY_MODE:
+            lr = QHBoxLayout()
+            lr.setSpacing(10)
+            self.lbl_license = QLabel()
+            self.lbl_license.setObjectName("InlineTip")
+            lr.addWidget(_form_label("授权状态"))
+            lr.addWidget(self.lbl_license, 1)
+            b_renew = QPushButton("💳 输入卡密续费")
+            b_renew.setObjectName("GhostBtn")
+            b_renew.setToolTip("用一张新卡密续费，剩余天数自动叠加；无需重启")
+            b_renew.clicked.connect(self._renew)
+            lr.addWidget(b_renew)
+            cv.addLayout(lr)
+            self._update_license_label()
+        lay.addWidget(card)
 
-        # ---------- 成品命名规则（唯一「保存即生效」的一项，不进下面的「保存设置」） ----------
-        nrow = QHBoxLayout()
-        nrow.addWidget(QLabel("成品命名："))
-        self.lbl_naming = QLabel()
-        self.lbl_naming.setObjectName("InlineTip")
-        self.lbl_naming.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        b_naming = QPushButton("🏷 自定义规则…")
-        b_naming.setObjectName("GhostBtn")
-        b_naming.clicked.connect(self._edit_naming)
-        nrow.addWidget(self.lbl_naming, 1)
-        nrow.addWidget(b_naming)
-        lay.addLayout(nrow)
-        self._refresh_naming()
-
-        # ---------- 内容标签词库（保存即生效：任务表「标签」列与归档目录名都靠它） ----------
-        trow = QHBoxLayout()
-        trow.addWidget(QLabel("内容标签："))
-        self.lbl_tags = QLabel()
-        self.lbl_tags.setObjectName("InlineTip")
-        self.lbl_tags.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        b_tags = QPushButton("🏷 管理标签…")
-        b_tags.setObjectName("GhostBtn")
-        b_tags.clicked.connect(self._edit_tags)
-        trow.addWidget(self.lbl_tags, 1)
-        trow.addWidget(b_tags)
-        lay.addLayout(trow)
-        self._refresh_tags()
-
-        # ---------- 视频预览框大小（UI 偏好，存 ui_state.json，拖动即时生效、不用重启） ----------
-        prow = QHBoxLayout()
-        prow.addWidget(QLabel("视频预览框大小："))
-        self.sl_preview = QSlider(Qt.Orientation.Horizontal)
-        self.sl_preview.setRange(VideoPlayerDialog.SCALE_MIN, VideoPlayerDialog.SCALE_MAX)
-        self.sl_preview.setSingleStep(5)
-        self.sl_preview.setPageStep(10)
-        self.sl_preview.setFixedWidth(200)
-        self.lbl_preview_scale = QLabel()          # 先连信号、再 setValue，保证初始不落盘
+        # ---------- 界面偏好（UI 偏好，存 ui_state.json：填数字即时写入，下次开播放器即生效） ----------
+        card, cv = _section_card("界面偏好", "即时保存，无需重启")
+        self.spin_preview = QSpinBox()            # 先连信号、再 setValue，保证初始不落盘
+        self.spin_preview.setRange(VideoPlayerDialog.SCALE_MIN, VideoPlayerDialog.SCALE_MAX)
+        self.spin_preview.setSingleStep(5)
+        self.spin_preview.setSuffix("%")
+        self.spin_preview.setFixedWidth(96)
+        self.spin_preview.setToolTip(
+            f"填数字改大小：{VideoPlayerDialog.SCALE_MIN}%~{VideoPlayerDialog.SCALE_MAX}%，"
+            "100%＝默认基准（已整体缩小 30% 后）；数字越大播放器窗口越大，改完下次打开播放器即生效")
         b_pv_reset = QPushButton("恢复默认")
         b_pv_reset.setObjectName("GhostBtn")
         b_pv_reset.setToolTip("回到 100%（即已整体缩小 30% 后的默认基准大小）")
         b_pv_reset.clicked.connect(
-            lambda: self.sl_preview.setValue(VideoPlayerDialog.SCALE_DEFAULT))
-        self.sl_preview.valueChanged.connect(self._preview_scale_changed)
-        self.sl_preview.setValue(self._load_preview_scale())
-        prow.addWidget(self.sl_preview)
-        prow.addWidget(self.lbl_preview_scale)
-        prow.addWidget(b_pv_reset)
-        prow.addWidget(QLabel("（向左更小、向右更大；相对默认缩小 30% 后的基准等比缩放，下次打开播放器即生效）"))
-        prow.addStretch(1)
-        lay.addLayout(prow)
+            lambda: self.spin_preview.setValue(VideoPlayerDialog.SCALE_DEFAULT))
+        self.spin_preview.valueChanged.connect(self._preview_scale_changed)
+        self.spin_preview.setValue(self._load_preview_scale())
+        pr = QHBoxLayout()
+        pr.setSpacing(10)
+        pr.addWidget(_form_label("视频预览框大小"))
+        pr.addWidget(self.spin_preview)
+        pr.addWidget(b_pv_reset)
+        pr.addStretch(1)
+        cv.addLayout(pr)
+        lay.addWidget(card)
+
+        # ---------- 工具快捷键：一键呼出工具中心窗口（存 ui_state，保存即生效） ----------
+        card, cv = _section_card("工具快捷键", "全窗口任意页面按组合键即弹出工具窗口，保存即生效")
+        self.tool_combo = QComboBox()
+        self.tool_combo.setFixedWidth(220)
+        for t_name, t_icon, _desc, t_fac in TOOLS:
+            if t_fac and t_fac in PANEL_FACTORIES:
+                i = self.tool_combo.count()
+                self.tool_combo.addItem(f"{t_icon} {t_name}", t_fac)
+                # 原名存 UserRole+1：刷新显示时拼上已配键位，不会滚雪球
+                self.tool_combo.setItemData(i, f"{t_icon} {t_name}",
+                                            Qt.ItemDataRole.UserRole + 1)
+        self.tool_key = QKeySequenceEdit()
+        self.tool_key.setFixedWidth(220)
+        b_key_clear = QPushButton("清空")
+        b_key_clear.setObjectName("GhostBtn")
+        b_key_clear.setToolTip("清除当前工具的快捷键")
+        b_key_clear.clicked.connect(self._clear_tool_key)
+        kr = QHBoxLayout()
+        kr.setSpacing(10)
+        kr.addWidget(_form_label("快捷键"))
+        kr.addWidget(self.tool_key)
+        kr.addWidget(b_key_clear)
+        h = QLabel("示例：F9 / Ctrl+Alt+1；同一键位只归最后一个工具")
+        h.setStyleSheet("color:#8F959E; font-size:12px; background:transparent;")
+        kr.addWidget(h)
+        kr.addStretch(1)
+        cv.addLayout(_field_row("工具", self.tool_combo))
+        cv.addLayout(kr)
+        self.tool_combo.currentIndexChanged.connect(self._load_tool_key)
+        self.tool_key.editingFinished.connect(self._save_tool_shortcut)
+        self._refresh_tool_combo()
+        self._load_tool_key()
+        lay.addWidget(card)
+
+        # ---------- 内容规则：命名/标签点击展开的编辑栏（保存即生效，不进下面的「保存设置」） ----------
+        card, cv = _section_card("内容规则", "展开编辑，保存即生效")
+        self.editor_naming = NamingEditor()
+        self.editor_naming.saved.connect(self._on_naming_saved)
+        self.sec_naming = _ExpandSection("成品命名", self.editor_naming, icon="🏷")
+        cv.addWidget(self.sec_naming)
+        self._refresh_naming()
+
+        self.editor_tags = TagEditor()
+        self.editor_tags.saved.connect(self._on_tags_saved)
+        self.sec_tags = _ExpandSection("内容标签", self.editor_tags, icon="🏷")
+        cv.addWidget(self.sec_tags)
+        self._refresh_tags()
+        lay.addWidget(card)
 
         # ---------- 输出目录：默认隐藏，Alt+W（Mac ⌘+W）口令解锁后才出现（不暴露入口） ----------
         # 口令同时放出导航里的「🔌 接口管理」页：一个口令管全部维护人入口
+        # 网关模式（终端买家）：线路/接口都在服务端，买家无线路可维护，
+        # 但输出目录是个人偏好：直接放出来（不走口令）
         self._dirs_unlocked = False
-        self.dirs_box = QWidget()
-        dbox = QVBoxLayout(self.dirs_box)
-        dbox.setContentsMargins(0, 0, 0, 0)
-        dbox.setSpacing(8)
-        dbox.addWidget(QLabel("输出目录（留空＝用默认，修改保存后重启生效）："))
+        card, cv = _section_card("输出目录", "留空＝用默认，修改保存后重启生效")
+        self.dirs_box = card
         self._dir_edits = {}
         for key, label, cur, dft in (
                 ("output", "视频输出", DOWNLOAD_DIR, str(RUNTIME_DIR / "outputs")),
                 ("export", "模板/导出", EXPORT_DIR, str(RUNTIME_DIR / "exports")),
                 ("material", "素材目录", MATERIAL_DIR, str(RUNTIME_DIR / "material"))):
-            r = QHBoxLayout()
-            r.addWidget(QLabel(label + "："))
             ed = QLineEdit("" if _same_path(cur, dft) else cur)
             ed.setPlaceholderText("默认：" + dft)
             ed.setProperty("default", dft)
             b = QPushButton("浏览…")
             b.setObjectName("GhostBtn")
             b.clicked.connect(lambda _=False, e=ed: self._pick_dir(e))
+            r = QHBoxLayout()
+            r.setSpacing(10)
+            r.addWidget(_form_label(label))
             r.addWidget(ed, 1)
             r.addWidget(b)
-            dbox.addLayout(r)
+            cv.addLayout(r)
             self._dir_edits[key] = ed
         self.dirs_box.setVisible(False)
-        lay.addWidget(self.dirs_box)
+        lay.addWidget(card)
+        if GATEWAY_MODE:
+            self.dirs_box.setVisible(True)
+            self._dirs_unlocked = True
 
-        # 线路部署与 AI 检测/翻译接口已搬到「接口管理」页（gui/pages_api.py）；
-        # 接口地址本身就是访问凭证，日常两个界面都不露：普通使用者只走
-        # 「线路包 / 配置包」分发，编辑入口对维护人保留（Alt+W 解锁后跳页）。
-        # 锁着的时候给一句人话：告诉使用者线路从哪来，但不暴露解锁入口
-        tip = QLabel("线路与各接口地址由维护人管理：换线路时找维护人要一份线路包（或配置包），\n"
-                     "用下方「📥 导入线路」或「📥 一键导入配置」导入即可，不用手敲任何地址。")
-        tip.setStyleSheet("color:#6B7280;")
-        lay.addWidget(tip)
-
-        # ---------- 配置迁移（加密包）：接口/命名/字段/SMB/溯源/产品风控图片一键搬家 ----------
-        lay.addWidget(QLabel(
-            "配置迁移（加密包：线路与各接口、SMB/溯源账密、命名规则、任务界面字段、"
-            "产品与规范卡（含产品图片）、风控政策全部在内，换新机器 / 交给同事时用）："))
-        mrow = QHBoxLayout()
-        b_pkg_exp = QPushButton("📤 导出配置包")
-        b_pkg_exp.setObjectName("GhostBtn")
-        b_pkg_exp.setToolTip(
-            "把本机全部配置与产品/风控业务数据（含产品图片）加密成一个 .aigccfg 文件\n"
-            "（默认存到桌面）；包内容清单见上方说明。\n"
-            "文件用软件内置口令加密，外人拿到看不到接口地址和 key；\n"
-            "里面含凭证和业务数据，只发给信得过的同事")
-        b_pkg_exp.clicked.connect(self._export_pkg)
-        b_pkg_imp = QPushButton("📥 一键导入配置")
-        b_pkg_imp.setObjectName("GhostBtn")
-        b_pkg_imp.setToolTip(
-            "选一个同事导出的 .aigccfg 配置包，软件自动解密逐条目覆盖本机配置\n"
-            "（导入前列清单让你确认；旧配置文件备份成 *.bak-时间戳；"
-            "产品/风控表整表替换，任务列表不动）；导入后重启软件生效")
-        b_pkg_imp.clicked.connect(self._import_pkg)
-        mrow.addWidget(b_pkg_exp)
-        mrow.addWidget(b_pkg_imp)
-        mrow.addStretch(1)
-        lay.addLayout(mrow)
-        # 线路天天变：单独进出口的小包，只碰线路，其它配置不动
-        lrow = QHBoxLayout()
-        b_line_exp = QPushButton("🔗 导出线路")
-        b_line_exp.setObjectName("GhostBtn")
-        b_line_exp.setToolTip(
-            "只导接口线路（名称+地址+并发），加密成一个 .aigcline 小文件\n"
-            "（默认存桌面，文件名带日期如 线路_0924.aigcline）。\n"
-            "线路地址天天换时用这个，不用动整套配置；文件名自带日期，发群里好认新旧")
-        b_line_exp.clicked.connect(self._export_lines)
-        b_line_imp = QPushButton("📥 导入线路")
-        b_line_imp.setObjectName("GhostBtn")
-        b_line_imp.setToolTip(
-            "选一个同事发来的 .aigcline 线路包，只替换本机线路，\n"
-            "其它配置（命名/字段/SMB/产品…）一个字不动；重启后生效\n"
-            "（正在跑的任务不受影响）")
-        b_line_imp.clicked.connect(self._import_lines)
-        lrow.addWidget(b_line_exp)
-        lrow.addWidget(b_line_imp)
-        lrow.addStretch(1)
-        lay.addLayout(lrow)
-
-        # ---------- 保存：常驻底部 ----------
-        # 只写姓名/输出目录；线路与各接口归「接口管理」页自己的保存按钮管，
-        # 这边合并写回不碰那些段，不会把同事导进配置的线路弄丢。
-        srow = QHBoxLayout()
+        # ---------- 底部动作栏：钉在窗口底（不随内容滚动） ----------
+        # 迁移入口贴左下角、主操作「保存」贴右下角；只写姓名/输出目录，
+        # 线路与各接口归「接口管理」页自己的保存按钮管。
+        foot = QWidget()
+        foot.setObjectName("SettingsFoot")
+        srow = QHBoxLayout(foot)
+        srow.setContentsMargins(24, 10, 24, 10)
+        srow.setSpacing(10)
+        b_pkg = QPushButton("📦 配置迁移 ▾")
+        b_pkg.setObjectName("GhostBtn")
+        b_pkg.setToolTip(
+            "把本机全部配置与产品业务数据（含产品图片、SMB/溯源账密、命名/字段）\n"
+            "加密成一个 .aigccfg 整包导出，或从同事的整包一键导入。\n"
+            "含凭证与业务数据，只发给信得过的同事；点按钮展开选择导出/导入")
+        self._pkg_menu = self._build_pkg_menu()
+        b_pkg.clicked.connect(
+            lambda: self._pkg_menu.exec(b_pkg.mapToGlobal(QPoint(0, b_pkg.height()))))
+        b_lines = QPushButton("🔗 线路小包 ▾")
+        b_lines.setObjectName("GhostBtn")
+        b_lines.setToolTip(
+            "只导出/导入接口线路（名称+地址+并发，.aigcline 加密小包），\n"
+            "线路天天换时用这个，其它配置一个字不动；点按钮展开选择导出/导入")
+        self._lines_menu = self._build_lines_menu()
+        b_lines.clicked.connect(
+            lambda: self._lines_menu.exec(b_lines.mapToGlobal(QPoint(0, b_lines.height()))))
+        b_pkg.setVisible(not GATEWAY_MODE)
+        b_lines.setVisible(not GATEWAY_MODE)
+        srow.addWidget(b_pkg)
+        srow.addWidget(b_lines)
+        srow.addStretch(1)
         b_save = QPushButton("💾 保存设置")
         b_save.clicked.connect(self._save)
         srow.addWidget(b_save)
-        srow.addStretch(1)
-        lay.addLayout(srow)
+        outer.addWidget(foot)
+
+        # 卡片顶部对齐：没有这个 stretch，滚动区会把多余空间摊到卡片之间，
+        # 页面全是“空洞”（旧版最丑的来源）；内容超高时它自动让位。
+        lay.addStretch(1)
 
         # 维护人入口：Alt+W（Mac ⌘+W）唤出口令框，验证通过才显示「输出目录」；
         # 仅当停在设置页时激活（show/hideEvent 开关），避免别处误触。
@@ -203,37 +331,51 @@ class SettingsPage(QWidget):
         self._sc_dirs.setEnabled(False)
 
     def refresh(self):
-        pass  # 不自动覆盖用户正在编辑的内容
+        if GATEWAY_MODE:
+            self._update_license_label()
+        # 不自动覆盖用户正在编辑的内容（命名/线路等）
 
-    # ---------- 命名规则 ----------
+    # ---------- 授权/续费（网关模式） ----------
+    def _update_license_label(self):
+        left = lic.days_remaining()
+        exp = lic.expire_at()
+        when = datetime.fromtimestamp(exp).strftime("%Y-%m-%d") if exp else "-"
+        if left <= 0:
+            self.lbl_license.setText("⚠ 授权已到期，请续费")
+            self.lbl_license.setStyleSheet("color: #E5484D;")
+        elif left <= 3:
+            self.lbl_license.setText(f"🟡 剩余 {left} 天（{when} 到期），请尽快续费")
+            self.lbl_license.setStyleSheet("color: #FF8D19;")
+        else:
+            self.lbl_license.setText(f"🟢 剩余 {left} 天（{when} 到期）")
+            self.lbl_license.setStyleSheet("")
+
+    def _renew(self):
+        from gui.dialogs_license import LicenseDialog   # 只在打开时导入，减启动开销
+        if LicenseDialog(self, mode="renew").exec():
+            self._update_license_label()
+
+    # ---------- 命名规则（展开编辑栏内保存即生效） ----------
     def _refresh_naming(self):
-        """把当前生效的规则写成一句话：下载成品时就按它拼文件名"""
-        self.lbl_naming.setText(f"{naming.describe()}　→　例如 {naming.preview()}")
-        self.lbl_naming.setToolTip(
-            "下载成品时的文件命名规则，点右侧「🏷 自定义规则…」可重新排列组合。\n"
-            "这一项保存后立即生效（不用重启），且只影响之后新下载的视频。")
+        """把当前生效的规则写成一句概要显示在折叠标题上"""
+        self.sec_naming.set_summary(
+            f"{naming.describe()}　→　例如 {naming.preview()}")
 
-    def _edit_naming(self):
-        from gui.dialogs_naming import NamingRuleDialog   # 只在打开时导入，减启动开销
-        if NamingRuleDialog(self).exec():
-            self._refresh_naming()
+    def _on_naming_saved(self):
+        self._refresh_naming()
+        self.sec_naming.collapse()
 
-    # ---------- 内容标签词库（与命名规则一样：自己写盘、保存即生效） ----------
+    # ---------- 内容标签词库（同样：展开编辑栏内保存即生效） ----------
     def _refresh_tags(self):
-        """把当前词库写成一行；任务表标签下拉与归档目录名都按它来"""
-        self.lbl_tags.setText("、".join(tag_lib.load()))
-        self.lbl_tags.setToolTip(
-            "给任务打内容标签用的一组词，也是批量归档时的子文件夹名。\n"
-            "点右侧「🏷 管理标签…」可新增/删除/排序（保存后立即生效，不用重启）。")
+        self.sec_tags.set_summary("、".join(tag_lib.load()))
 
-    def _edit_tags(self):
-        from gui.dialogs_tags import TagManagerDialog     # 只在打开时导入
-        if TagManagerDialog(self).exec():
-            self._refresh_tags()
-            w = self.window()
-            page = getattr(w, "page_tasks", None)        # 让任务表筛选下拉同步新词库
-            if page is not None and hasattr(page, "refresh"):
-                page.refresh()
+    def _on_tags_saved(self):
+        self._refresh_tags()
+        self.sec_tags.collapse()
+        w = self.window()
+        page = getattr(w, "page_tasks", None)            # 让任务表筛选下拉同步新词库
+        if page is not None and hasattr(page, "refresh"):
+            page.refresh()
 
     # ---------- 视频预览框大小（存 ui_state，与播放器共享同一个键） ----------
     def _load_preview_scale(self):
@@ -246,12 +388,65 @@ class SettingsPage(QWidget):
                    min(VideoPlayerDialog.SCALE_MAX, v))
 
     def _preview_scale_changed(self, val):
-        val = int(val)
-        app_state.set_value(VideoPlayerDialog.SCALE_KEY, val)
-        self.lbl_preview_scale.setText(f"{val}%")
+        app_state.set_value(VideoPlayerDialog.SCALE_KEY, int(val))
+
+    # ---------- 工具快捷键（存 ui_state：tool_shortcuts = {工具名: 键序列}） ----------
+    def _refresh_tool_combo(self):
+        """下拉项文本实时拼上已配键位：一眼看出哪些工具设过快捷键"""
+        seqs = app_state.get("tool_shortcuts") or {}
+        for i in range(self.tool_combo.count()):
+            name = self.tool_combo.itemData(i)
+            base = self.tool_combo.itemData(i, Qt.ItemDataRole.UserRole + 1)
+            sc = seqs.get(name) or ""
+            self.tool_combo.setItemText(i, base + (f"　[{sc}]" if sc else ""))
+
+    def _load_tool_key(self):
+        """切工具时把已存键位回填到输入框（没配就清空）"""
+        name = self.tool_combo.currentData()
+        seq = (app_state.get("tool_shortcuts") or {}).get(name or "", "")
+        self.tool_key.setKeySequence(QKeySequence(seq))
+
+    def _clear_tool_key(self):
+        self.tool_key.clear()
+        self._save_tool_shortcut()
+
+    def _save_tool_shortcut(self):
+        """编辑完（失焦/回车）即落盘并让主窗口重注册快捷键，不用重启"""
+        name = self.tool_combo.currentData()
+        if not name:
+            return
+        seq = self.tool_key.keySequence().toString()
+        seqs = dict(app_state.get("tool_shortcuts") or {})
+        if seq:
+            # 一键一工具：同键其他工具让位，避免一个键弹两个窗口
+            for k in [k for k, v in seqs.items() if v == seq and k != name]:
+                seqs.pop(k)
+            seqs[name] = seq
+        else:
+            seqs.pop(name, None)
+        app_state.set_value("tool_shortcuts", seqs)
+        self._refresh_tool_combo()
+        w = self.window()
+        if hasattr(w, "apply_tool_shortcuts"):
+            w.apply_tool_shortcuts()
+
+    # ---------- 配置迁移 / 线路包下拉菜单（各将导出/导入合一） ----------
+    def _build_pkg_menu(self):
+        m = QMenu(self)
+        m.addAction("📤 导出配置包", self._export_pkg)
+        m.addAction("📥 一键导入配置", self._import_pkg)
+        return m
+
+    def _build_lines_menu(self):
+        m = QMenu(self)
+        m.addAction("🔗 导出线路小包", self._export_lines)
+        m.addAction("📥 导入线路小包", self._import_lines)
+        return m
 
     # ---------- 维护人入口：口令解锁「输出目录」并放出导航里的「接口管理」 ----------
     def _summon_dirs(self):
+        if GATEWAY_MODE:                 # 买家模式：输出目录已直接展示，不要口令
+            return
         if self._dirs_unlocked:               # 已展开则不重复要口令
             return
         code, ok = QInputDialog.getText(self, "维护人验证", "请输入维护人口令：",
@@ -371,7 +566,7 @@ class SettingsPage(QWidget):
         if QMessageBox.question(
                 self, "确认导入",
                 "将覆盖本机以下内容：\n" + "\n".join(lines) + "\n\n"
-                "配置文件旧值会备份成 *.bak-时间戳；产品/风控表整表替换；"
+                "配置文件旧值会备份成 *.bak-时间戳；产品表整表替换；"
                 "任务列表不受影响。\n确定导入吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
@@ -393,7 +588,7 @@ class SettingsPage(QWidget):
         done = "、".join(result["applied"])
         QMessageBox.information(self, "导入完成",
                                 f"已导入：{done}。\n"
-                                "旧配置已备份，产品/风控页切过去即是新数据；\n"
+                                "旧配置已备份，产品页切过去即是新数据；\n"
                                 "接口线路等重启软件后全部生效。")
 
     # ---------- 线路小包：地址日更的轻量进出口 ----------

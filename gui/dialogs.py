@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
 
 from core import translate
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
+from gui.window_frame import apply_rounded
 from store import product_store, task_store
 
 
@@ -105,6 +106,7 @@ class TaskDialog(QDialog):
         btns.addWidget(btn_cancel)
         btns.addWidget(btn_ok)
         lay.addLayout(btns)
+        apply_rounded(self, show_min=False, show_max=False)
 
     def _update_ref_hint(self, name):
         if not name:
@@ -187,7 +189,8 @@ class TaskDialog(QDialog):
 
     def _show_tray(self, on):
         self.tray.setVisible(on)
-        self.setFixedSize(self.width(), 520 + (self.TRAY_H if on else 0))
+        base = 520 + getattr(self, "_chrome_h", 0)     # 标题栏高度已补进固定尺寸
+        self.setFixedSize(self.width(), base + (self.TRAY_H if on else 0))
         if not on:
             self._show_zh(False)          # 收起工具条时别把人留在中文对照上
 
@@ -400,6 +403,7 @@ class ScriptBindDialog(QDialog):
         btns.addWidget(b_cancel)
         btns.addWidget(b_ok)
         lay.addLayout(btns)
+        apply_rounded(self, show_min=False, show_max=False)
 
     @staticmethod
     def ask(parent, count=1, current=""):
@@ -460,6 +464,7 @@ class FindReplaceDialog(QDialog):
         lay.addLayout(btns)
 
         self._apply_mode()
+        apply_rounded(self, show_min=False, show_max=False)
 
     def _toggle_mode(self):
         self._mode = "replace" if self._mode == "find" else "find"
@@ -599,6 +604,7 @@ class ForceRerunDialog(QDialog):
             b_ok.clicked.connect(self.accept)
             btns.addWidget(b_ok)
         lay.addLayout(btns)
+        apply_rounded(self, show_min=False, show_max=False)
 
     def _pick_cancel_first(self):
         self.cancel_first = True

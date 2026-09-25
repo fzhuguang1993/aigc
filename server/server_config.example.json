@@ -1,0 +1,5 @@
+{
+  "secret": "<必填：HMAC 令牌密钥，随机 32+ 位字符串，如 python -c \"import secrets;print(secrets.token_hex(32))\">",
+  "admin_token": "<留空则 /admin/* 整体关闭>",
+  "upstreams_file": ""
+}

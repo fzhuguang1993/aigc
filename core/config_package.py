@@ -2,7 +2,7 @@
 core/config_package.py —— 全量配置的加密导出/导入（.aigccfg 配置迁移包 v2）
 
 为什么要加密：包里是线路地址、接口 key、SMB 共享盘账号、溯源 MySQL 账密、
-产品与风控业务数据——明文发给同事，等于谁捡到文件都能刷我们的付费接口。
+产品业务数据——明文发给同事，等于谁捡到文件都能刷我们的付费接口。
 口令内置在软件里（同事导入零输入）；防的是「传输/落盘途中被人看到」，
 不是防拿到 exe 逆向的人（内置口令本来也扛不住，别自欺）。
 
@@ -14,7 +14,7 @@ zip 内部：
     data/<item_id>/<路径>   各条目自己的文件（文本按 utf-8 存、图片按原始字节存）
 （v1 = 明文 JSON 的旧包，只含 3 个文本文件；导入侧兼容读，导出不再产生。）
 
-为什么做成「注册表」：使用者要搬的东西只会越来越多（产品/规范卡/风控/
+为什么做成「注册表」：使用者要搬的东西只会越来越多（产品/
 界面字段/SMB/溯源/命名规则/产品图片…），如果收集逻辑写死在 export 里，
 每次加功能都得改迁移代码。现在一个配置面就是一个 Item：
     ITEMS.append(Item(id, title, collect, apply))
@@ -157,7 +157,7 @@ def _apply_api_text(files):
     return n
 
 
-# ---------- 条目 4：产品（含规范卡）+ 产品图片 ----------
+# ---------- 条目 4：产品 + 产品图片 ----------
 
 def _material_root() -> Path:
     return Path(RUNTIME_DIR) / MATERIAL_DIR
@@ -219,43 +219,15 @@ def _apply_products(files):
             row[field] = ";".join(
                 str(root / p) if "/" in p and not Path(p).is_absolute()
                 else p for p in parts)
-    cols = ("id", "type", "name", "images", "videos", "audios", "note", "spec",
+    cols = ("id", "type", "name", "images", "videos", "audios", "note",
             "updated_at")
     conn = db._new_conn()
     try:
         conn.execute("DELETE FROM products")
         for row in rows:
             conn.execute(
-                "INSERT INTO products(id,type,name,images,videos,audios,note,spec,"
-                "updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                tuple(row.get(c) for c in cols))
-        conn.commit()
-    finally:
-        conn.close()
-    return len(rows)
-
-
-# ---------- 条目 5：风控政策（平台/产品） ----------
-
-def _collect_risk():
-    from store import db
-    rows = [dict(r) for r in db.query("SELECT * FROM risk_rules ORDER BY id")]
-    return {"risk_rules.json": json.dumps(
-        {"rows": rows}, ensure_ascii=False, indent=1).encode("utf-8")}
-
-
-def _apply_risk(files):
-    from store import db
-    rows = json.loads(files["risk_rules.json"])["rows"]
-    cols = ("id", "scope", "title", "applies", "content", "banned", "active",
-            "updated_at")
-    conn = db._new_conn()
-    try:
-        conn.execute("DELETE FROM risk_rules")
-        for row in rows:
-            conn.execute(
-                "INSERT INTO risk_rules(id,scope,title,applies,content,banned,"
-                "active,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO products(id,type,name,images,videos,audios,note,"
+                "updated_at) VALUES(?,?,?,?,?,?,?,?)",
                 tuple(row.get(c) for c in cols))
         conn.commit()
     finally:
@@ -270,9 +242,8 @@ ITEMS = [
          _collect_ui_state, _apply_ui_state),
     Item("text_api_text", "素材提取接口凭证与直链白名单",
          _collect_api_text, _apply_api_text),
-    Item("db_products", "产品与商品规范卡（含产品图片）",
+    Item("db_products", "产品（含产品图片）",
          _collect_products, _apply_products),
-    Item("db_risk", "风控政策（平台/产品）", _collect_risk, _apply_risk),
 ]
 
 ITEMS_BY_ID = {it.id: it for it in ITEMS}

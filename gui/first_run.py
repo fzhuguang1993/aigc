@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QLineEdit,
 
 from core.config import defaults_accounts
 from core.setup_wizard import _normalize_base, _freeze_accounts, save_first_config
+from gui.window_frame import apply_rounded
 
 
 class FirstRunDialog(QDialog):
@@ -20,7 +21,7 @@ class FirstRunDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(28, 24, 28, 24)
 
-        title = QLabel("欢迎使用 AIGC 视频助手")
+        title = QLabel("欢迎使用 AIGC 工厂")
         title.setObjectName("DialogTitle")
         lay.addWidget(title)
 
@@ -46,6 +47,7 @@ class FirstRunDialog(QDialog):
         btn = QPushButton("保存并开始使用")
         btn.clicked.connect(self._save)
         lay.addWidget(btn)
+        apply_rounded(self, show_min=False, show_max=False)
 
     def _save(self):
         name = self.name_edit.text().strip()

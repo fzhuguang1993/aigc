@@ -108,6 +108,18 @@ def is_client_error(err):
     return bool(code) and 400 <= code < 500 and code != 429
 
 
+def _license_error(err):
+    """网关授权判定：只有服务端鉴权层产生的 401/403 算（detail.reason 标记）。
+
+    上游被拒报文透传同状态码时没有这个标记，不会误判；命中后不换线不重试，
+    直接把人话错误回给界面（续卡入口在 ⚙️ 设置页）。"""
+    if getattr(err, "status_code", None) not in (401, 403):
+        return False
+    text = str(err)
+    return '"reason"' in text and any(
+        k in text for k in ("invalid", "expired", "banned", "machine_mismatch"))
+
+
 def parse_rejected(err_text):
     """从 422 报文里取出「云端不认识的字段路径」，如 [["body","parameters","steps"]]。
 
@@ -248,6 +260,10 @@ def do_submit(row_idx, product, prompt, options=None, *, balancer=None, _sleep=t
                 return job_id, None, acc.name
             except ApiError as e:
                 last_err = client_error_brief(e)
+                if _license_error(e):
+                    # 令牌无效/到期/封禁：重试换线都无意义，直接把激活引导回给界面
+                    ctx.error("网关拒绝：授权无效或已到期 — 请在「⚙️ 设置」输入卡密激活后重试")
+                    return None, "授权无效或已到期，请在「⚙️ 设置」输入卡密激活", acc.name
                 if is_client_error(e):
                     # 参数名/取值不对：换线路毫无意义，先尝试摘掉被拒字段原线重试
                     dropped = drop_rejected(payload, parse_rejected(str(e)))

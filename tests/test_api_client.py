@@ -85,3 +85,65 @@ def test_extract_script_missing_field_returns_empty(monkeypatch):
     monkeypatch.setattr(api.requests, "request",
                         lambda m, u, **kw: FakeResp(200, {}))
     assert api.extract_script("http://x/api/v1", "p") == ""
+
+
+# ---------------- 网关鉴权头收口（商用改造第二阶段） ----------------
+
+def test_request_carries_auth_headers(monkeypatch):
+    """_request 是唯一出口：四个鉴权头必须从这里统一长出去"""
+    monkeypatch.setattr("core.license.request_headers",
+                        lambda: {"X-License": "tk.sig", "X-Machine": "M",
+                                 "X-Ts": "123", "X-Nonce": "n1"})
+    seen = {}
+
+    def cap(m, u, **kw):
+        seen.update(kw.get("headers") or {})
+        return FakeResp(200, {"job_id": "j"})
+    monkeypatch.setattr(api.requests, "request", cap)
+    assert api.submit_job("http://gate/api/v1", {}) == "j"
+    assert seen == {"X-License": "tk.sig", "X-Machine": "M",
+                    "X-Ts": "123", "X-Nonce": "n1"}
+
+
+def test_real_license_module_returns_no_headers_in_dev_mode(monkeypatch):
+    """开发直连模式：真 license 模块不往请求里塞任何多余头（旧行为零变化）"""
+    import core.license as lic
+    monkeypatch.setattr(lic, "_gateway_base", lambda: "")
+    lic.clear_cache()
+    seen = {}
+
+    def cap(m, u, **kw):
+        seen.update(kw.get("headers") or {})
+        return FakeResp(200, {"job_id": "j"})
+    monkeypatch.setattr(api.requests, "request", cap)
+    api.health("http://x/api/v1")
+    assert seen == {}
+    lic.clear_cache()
+
+
+def test_download_to_carries_auth_headers(monkeypatch, tmp_path):
+    """产物中转下载也要鉴权：download_to 走 requests.get，单独把口钉住"""
+    monkeypatch.setattr("core.license.request_headers",
+                        lambda: {"X-License": "tk.sig", "X-Nonce": "n9"})
+    seen = {}
+
+    class R:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def iter_content(self, chunk_size=None):
+            yield b"VIDEO"
+
+    def cap(url, headers=None, **kw):
+        seen.update(headers or {})
+        return R()
+    monkeypatch.setattr(api.requests, "get", cap)
+    dst = tmp_path / "v.mp4"
+    api.download_to("http://gate/api/v1/file?p=x&s=y", str(dst))
+    assert seen.get("X-License") == "tk.sig" and seen.get("X-Nonce") == "n9"
+    assert dst.read_bytes() == b"VIDEO"

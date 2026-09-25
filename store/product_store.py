@@ -114,37 +114,6 @@ def set_note(pid, note):
     db.execute("UPDATE products SET note=?, updated_at=? WHERE id=?", (note, _now(), pid))
 
 
-# ---------------- 规范卡 ----------------
-# 模板字段：新建产品时展示占位提示，填写后存 JSON 到 products.spec
-SPEC_FIELDS = [
-    ("卖什么套餐", "例：3盒疗程装 + 送1盒体验装；单盒/双盒/疗程装分别什么内容"),
-    ("价格口径", "例：日常价89元/盒，活动到手价59元/盒；口播中只能出现这几个价"),
-    ("活动口径", "例：仅限直播间下单，前100名加赠；活动截止 x月x日；不支持无理由退款"),
-    ("核心卖点", "例：专利菌株、活菌数450亿、0蔗糖；只允许提这些卖点"),
-    ("必含话术", "每行一条，口播脚本必须出现的内容，例：点击下方链接、以页面价格为准"),
-    ("禁用词", "逗号或换行分隔，出现即高风险，例：根治,100%有效,无副作用"),
-    ("资质/备案号", "例：食健备J20xxxxxx / 生产许可证 SCxxxxxxxx"),
-    ("其他注意事项", "例：不得出现医生/医院形象；不得对比药品；未成年人场景禁用"),
-]
-
-
-def get_spec(pid):
-    """返回规范卡 dict（字段名 -> 文本），未填过的字段为空串"""
-    import json
-    p = get_product(pid)
-    try:
-        data = json.loads((p or {}).get("spec") or "{}")
-    except Exception:
-        data = {}
-    return {k: str(data.get(k, "")) for k, _ in SPEC_FIELDS}
-
-
-def set_spec(pid, spec):
-    import json
-    db.execute("UPDATE products SET spec=?, updated_at=? WHERE id=?",
-               (json.dumps(spec, ensure_ascii=False), _now(), pid))
-
-
 def add_files(pid, kind, src_paths):
     """把素材文件复制进产品目录并登记，返回登记后的路径列表"""
     field = _KIND_FIELDS[kind]
