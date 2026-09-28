@@ -19,12 +19,13 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QHeaderView, QMessageBox, QApplication,
-                               QAbstractItemView)
+                               QAbstractItemView, QCheckBox, QFormLayout, QPlainTextEdit,
+                               QScrollArea, QFrame, QFileDialog)
 
 from core.config import CONFIG_JSON, ACCOUNTS, TRANSLATE
 from core.api_client import health
 from core.setup_wizard import _normalize_base
-from gui.header import page_header
+from gui.header import page_header, Card
 from utils.desktop_utils import open_path
 
 # 线路表列号：末列是行内「打开接口」按钮（setCellWidget，不进 _rows/不写配置）
@@ -129,23 +130,48 @@ def parse_lines(text):
 class ApiManagerPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 12, 24, 12)
-        lay.setSpacing(8)
+        # 整页套一层滚动区：本页卡片多（线路/翻译/Whisper/豆包/纠错+词库），内容比
+        # 屏幕高时旧版直接被 QStackedWidget 裁掉、下面的卡片点不到。与设置页同款：
+        # 外层不留边距，滚动的 inner 自带内边距，页面随内容变长而可滚。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        inner = QWidget()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(24, 14, 24, 24)
+        lay.setSpacing(12)
 
         head = page_header("接口管理", "线路部署与各大接口的配置（维护人）—— 改完点「💾 保存部署」，重启生效",
                            icon="🔌")
         head.setToolTip(f"配置文件：{CONFIG_JSON}")
         lay.addWidget(head)
 
-        # ---------- 接口总览：一眼看清哪些配了、哪些没配 ----------
+        # ---------- 接口总览：一眼看清哪些配了、哪些没配（收进白卡）----------
+        ov = Card(margins=(16, 10, 16, 10))
+        ovh = QHBoxLayout()
         self.lbl_status = QLabel()
         self.lbl_status.setObjectName("InlineTip")
         self.lbl_status.setTextFormat(Qt.TextFormat.RichText)
-        lay.addWidget(self.lbl_status)
+        self.lbl_status.setWordWrap(True)
+        b_re = QPushButton("🔄 重新检查")
+        b_re.setObjectName("GhostBtn")
+        b_re.setToolTip("重算本地就绪（任务表/模型/豆包/纠错/词库）并重新检测线路连通性")
+        b_re.clicked.connect(self._recheck)
+        ovh.addWidget(self.lbl_status, 1)
+        ovh.addWidget(b_re)
+        ov.v.addLayout(ovh)
+        lay.addWidget(ov)
 
-        # ---------- 线路部署（原设置页「API 服务地址」区整体搬来） ----------
-        lay.addWidget(QLabel("线路部署（一个地址 = 一个账号，双击单元格可编辑；"
+        # ---------- 线路部署（原设置页「API 服务地址」区整体搬来，收进白卡）----------
+        line_card = Card(margins=(16, 14, 16, 12))
+        line_card.v.setSpacing(10)
+        line_card.v.addWidget(QLabel("线路部署（一个地址 = 一个账号，双击单元格可编辑；"
                              "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」看"
                              "单条线路，要一次对比几条就用下方「🌐 打开选中」）："))
         self.acc_table = QTableWidget(0, 4)
@@ -157,13 +183,15 @@ class ApiManagerPage(QWidget):
         self.acc_table.setColumnWidth(COL_OPEN, 86)
         # 行高见 ROW_H；本表再把 item 上下 padding 收到 3px，给文字留出富余
         self.acc_table.verticalHeader().setDefaultSectionSize(ROW_H)
+        # 套了滚动区后表格不再有“ extra 空间”自动撑高，给个下限免得塌成一行
+        self.acc_table.setMinimumHeight(180)
         self.acc_table.setStyleSheet(
             "QTableWidget::item { padding: 3px 8px; border-bottom: 1px solid #EFF0F1; }"
             "QTableWidget::item:selected { background: #EAF1FF; color: #1F2329; }")
         # 整行选中 + 连续多选：鼠标按住拖就能圈好几行，配合批量删除
         self.acc_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.acc_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        lay.addWidget(self.acc_table, 1)
+        line_card.v.addWidget(self.acc_table, 1)
 
         bar = QHBoxLayout()
         b_add = QPushButton("＋ 添加地址")
@@ -201,7 +229,8 @@ class ApiManagerPage(QWidget):
         bar.addWidget(b_copy)
         bar.addWidget(b_paste)
         bar.addStretch(1)
-        lay.addLayout(bar)
+        line_card.v.addLayout(bar)
+        lay.addWidget(line_card, 1)
 
         for a in ACCOUNTS:
             self._add_row(a["name"], a["base"], a["concurrency"])
@@ -210,7 +239,9 @@ class ApiManagerPage(QWidget):
         self._checker = None
 
         # ---------- 机器翻译接口（火山引擎 MT，「提示词中文对照」用） ----------
-        lay.addWidget(QLabel("机器翻译接口（火山引擎文本翻译 —— 任务弹窗「提示词中文对照」用；"
+        tr_card = Card(margins=(16, 14, 16, 12))
+        tr_card.v.setSpacing(10)
+        tr_card.v.addWidget(QLabel("机器翻译接口（火山引擎文本翻译 —— 任务弹窗「提示词中文对照」用；"
                              "也可留空，留空时界面点翻译会明确提示未配置）："))
         trow = QHBoxLayout()
         trow.addWidget(QLabel("AK"))
@@ -222,7 +253,7 @@ class ApiManagerPage(QWidget):
         self.ed_tr_sk.setEchoMode(QLineEdit.EchoMode.Password)
         self.ed_tr_sk.setPlaceholderText("Secret Key")
         trow.addWidget(self.ed_tr_sk, 1)
-        lay.addLayout(trow)
+        tr_card.v.addLayout(trow)
         tr2 = QHBoxLayout()
         b_tr_test = QPushButton("🌐 测试翻译")
         b_tr_test.setObjectName("GhostBtn")
@@ -230,7 +261,11 @@ class ApiManagerPage(QWidget):
         b_tr_test.clicked.connect(self._test_translate)
         tr2.addWidget(b_tr_test)
         tr2.addStretch(1)
-        lay.addLayout(tr2)
+        tr_card.v.addLayout(tr2)
+        lay.addWidget(tr_card)
+
+        # ---------- 语音识别/纠错：模型下载 + 豆包 + DeepSeek + 词库（保存即生效） ----------
+        self._build_asr_cards(lay)
 
         # ---------- 保存：只写接口相关段，姓名/命名规则仍在设置页 ----------
         srow = QHBoxLayout()
@@ -263,9 +298,347 @@ class ApiManagerPage(QWidget):
             ex = "已配置" if os.path.isfile(api_cfg) else "缺 api_config.json"
         except Exception:
             ex = "未知"
-        self.lbl_status.setText(
-            f"生成线路 <b>{len(lines)}</b> 条　·　"
-            f"机器翻译：{tr}　·　素材提取接口：{ex}")
+        parts = [
+            f"生成线路 <b>{len(lines)}</b> 条",
+            f"机器翻译：{tr}",
+            f"素材提取接口：{ex}",
+            self._chk_task_excel(),
+            self._chk_whisper(),
+            self._chk_doubao(),
+            self._chk_asrfix(),
+        ]
+        self._refresh_model_labels()
+        self.lbl_status.setText("　·　".join(parts))
+
+    # ================= 配置检查：各项就绪判定（本地即时） =================
+    @staticmethod
+    def _chk_task_excel():
+        try:
+            from core.config import EXCEL_PATH
+            if os.path.isfile(EXCEL_PATH):
+                return "任务表：✅ 存在"
+            return f"任务表：⚠ 未生成（{EXCEL_PATH}）"
+        except Exception:
+            return "任务表：未知"
+
+    @staticmethod
+    def _chk_doubao():
+        try:
+            from core.config import doubao_vision_ready
+            return "豆包 Vision：" + ("✅ 已配置" if doubao_vision_ready() else "⚠ 未配置")
+        except Exception:
+            return "豆包 Vision：未知"
+
+    @staticmethod
+    def _chk_asrfix():
+        try:
+            from core.config import asr_fix_ready, asr_glossary_load
+            n = len(asr_glossary_load())
+            s = "✅ 已配置" if asr_fix_ready() else "⚠ 未配置"
+            return f"语音纠错(DeepSeek)：{s}　·　词库 {n} 词"
+        except Exception:
+            return "语音纠错：未知"
+
+    @staticmethod
+    def _chk_whisper():
+        try:
+            from video_text_tools.asr import transcribe as tr
+            segs = " ".join(("✅" if tr.model_ready(s) else "⚠") + s for s in tr.WHISPER_SIZES)
+            best = tr.best_ready_size()
+            tail = f"（识别优先用 {best}）" if best else "（尚无就绪模型，请下载）"
+            return "Whisper：" + segs + tail
+        except Exception:
+            return "Whisper：未知"
+
+    def _refresh_model_labels(self):
+        if not getattr(self, "_model_lbls", None):
+            return
+        try:
+            from video_text_tools.asr import transcribe as tr
+        except Exception:
+            return
+        for size, (lbl, btn) in self._model_lbls.items():
+            try:
+                ready = tr.model_ready(size)
+            except Exception:
+                ready = False
+            lbl.setText("已就绪 ✅" if ready else "未下载")
+            btn.setEnabled(not ready)
+
+    def _recheck(self):
+        """重新检查：本地就绪即时重算 + 起后台线路连通检测。"""
+        self._update_status()
+        self._check()
+
+    # ================= 语音模型 / 豆包 / DeepSeek / 词库 三卡 =================
+    def _build_asr_cards(self, lay):
+        from core.config import (doubao_vision_config, asr_fix_config, asr_glossary_load)
+        self._dl_worker = None
+
+        tip = QLabel("以下“语音相关”配置保存即生效、无需重启（上方线路/翻译仍需“保存部署”后重启）。")
+        tip.setObjectName("InlineTip")
+        lay.addWidget(tip)
+
+        # ---- 卡 1：Whisper 模型下载 ----
+        m_card = Card(margins=(16, 14, 16, 12))
+        m_card.v.setSpacing(8)
+        m_card.v.addWidget(QLabel("语音识别模型（Whisper，只下不打包；实时识别会自动优先用已就绪里最好的档）："))
+        from video_text_tools.asr import transcribe as tr
+        self._model_lbls = {}
+        for size in tr.WHISPER_SIZES:              # medium, small, base, tiny
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{size}："))
+            lbl = QLabel()
+            btn = QPushButton("⬇ 下载")
+            btn.setObjectName("GhostBtn")
+            btn.clicked.connect(lambda _=False, s=size: self._download_whisper(s))
+            row.addWidget(lbl, 1)
+            row.addWidget(btn)
+            m_card.v.addLayout(row)
+            self._model_lbls[size] = (lbl, btn)
+        mfoot = QHBoxLayout()
+        self.ck_mirror = QCheckBox("用国内镜像(hf-mirror)")
+        b_openm = QPushButton("📂 模型目录")
+        b_openm.setObjectName("GhostBtn")
+        b_openm.clicked.connect(self._open_models_dir)
+        mfoot.addWidget(self.ck_mirror)
+        mfoot.addWidget(b_openm)
+        mfoot.addStretch(1)
+        m_card.v.addLayout(mfoot)
+        lay.addWidget(m_card)
+
+        # ---- 卡 2：豆包 Vision ----
+        d_card = Card(margins=(16, 14, 16, 12))
+        d_card.v.setSpacing(8)
+        d_card.v.addWidget(QLabel("豆包 Vision（爆款拆解画面分析必需；api_key 按姓名加密落盘）："))
+        df = QFormLayout()
+        df.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.ed_d_key = QLineEdit()
+        self.ed_d_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ed_d_key.setPlaceholderText("API Key（留空=不改动已存的）")
+        self.ed_d_ep = QLineEdit()
+        self.ed_d_ep.setPlaceholderText("推理接入点 ID，形如 ep-xxxx")
+        _dc = doubao_vision_config()
+        self.ed_d_ep.setText(_dc.get("endpoint") or "")
+        self.ed_d_base = QLineEdit(_dc.get("base_url") or "https://ark.cn-beijing.volces.com/api/v3")
+        b_ds = QPushButton("💾 保存豆包")
+        b_ds.setObjectName("GhostBtn")
+        b_ds.clicked.connect(self._save_doubao_page)
+        df.addRow("API Key：", self.ed_d_key)
+        df.addRow("端点 ID：", self.ed_d_ep)
+        df.addRow("Base URL：", self.ed_d_base)
+        df.addRow("", b_ds)
+        d_card.v.addLayout(df)
+        lay.addWidget(d_card)
+
+        # ---- 卡 3：语音纠错（DeepSeek）+ 词库 ----
+        f_card = Card(margins=(16, 14, 16, 12))
+        f_card.v.setSpacing(8)
+        f_card.v.addWidget(QLabel("✨ 语音纠错（OpenAI 兼容 chat 端点，如 DeepSeek；识别后按语义改同音字）："))
+        ff = QFormLayout()
+        ff.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.ed_fix_key = QLineEdit()
+        self.ed_fix_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ed_fix_key.setPlaceholderText("API Key（留空=不改动已存的）")
+        _fc = asr_fix_config()
+        self.ed_fix_model = QLineEdit(_fc.get("model") or "deepseek-chat")
+        self.ed_fix_base = QLineEdit(_fc.get("base_url") or "https://api.deepseek.com/v1")
+        b_fs = QPushButton("💾 保存纠错配置")
+        b_fs.setObjectName("GhostBtn")
+        b_fs.clicked.connect(self._save_asr_fix_page)
+        b_ft = QPushButton("🌐 测试")
+        b_ft.setObjectName("GhostBtn")
+        b_ft.setToolTip("用当前填写的 key/model/base 现场纠正一句，验证连通（不用先保存）")
+        b_ft.clicked.connect(self._test_asr_fix)
+        fbtns = QHBoxLayout()
+        fbtns.addWidget(b_fs)
+        fbtns.addWidget(b_ft)
+        fbtns.addStretch(1)
+        ff.addRow("API Key：", self.ed_fix_key)
+        ff.addRow("Model：", self.ed_fix_model)
+        ff.addRow("Base URL：", self.ed_fix_base)
+        ff.addRow("", fbtns)
+        f_card.v.addLayout(ff)
+        f_card.v.addWidget(QLabel("领域词库（一行一个正确写法；既喂实时识别少写同音字，又作为纠错时的正确词清单。"
+                             "词多时用右侧「导入 / 导出」走 Excel / CSV / JSON 文件维护）："))
+        self.ed_gloss = QPlainTextEdit()
+        self.ed_gloss.setPlaceholderText("一行一个词，例如：\n钙片\n骨密度\n骨质疏松\n"
+                                         "（也可点右侧从 Excel/CSV/JSON 文件导入）")
+        self.ed_gloss.setMinimumHeight(120)
+        self.ed_gloss.setPlainText("\n".join(asr_glossary_load()))
+        f_card.v.addWidget(self.ed_gloss)
+        b_gs = QPushButton("💾 保存词库")
+        b_gs.setObjectName("GhostBtn")
+        b_gs.clicked.connect(self._save_glossary)
+        b_gi = QPushButton("📥 从 Excel/CSV/JSON 导入")
+        b_gi.setObjectName("GhostBtn")
+        b_gi.setToolTip("选一个词表文件读入（Excel/CSV 逐格取词、JSON 取字符串列表），"
+                        "合并去重后填进上方文本框，确认无误再点「保存词库」生效")
+        b_gi.clicked.connect(self._import_glossary)
+        b_ge = QPushButton("📤 导出为文件")
+        b_ge.setObjectName("GhostBtn")
+        b_ge.setToolTip("把当前词库另存为 .xlsx / .csv / .json（单列、逐行一个词），方便用 Excel 批量编辑")
+        b_ge.clicked.connect(self._export_glossary)
+        gsr = QHBoxLayout()
+        gsr.addWidget(b_gs)
+        gsr.addWidget(b_gi)
+        gsr.addWidget(b_ge)
+        gsr.addStretch(1)
+        f_card.v.addLayout(gsr)
+        lay.addWidget(f_card)
+        self._refresh_model_labels()
+
+    # ---- 模型下载（后台 ToolWorker，进度走悬浮球） ----
+    def _download_whisper(self, size):
+        from video_text_tools.asr import transcribe as tr
+        from core.config import MODELS_DIR
+        from gui.speed_ball import show_speed_ball
+        from gui.tool_panels import ToolWorker
+        if getattr(self, "_dl_worker", None) is not None and self._dl_worker.isRunning():
+            QMessageBox.information(self, "提示", "已有一个下载在进行，请等它结束")
+            return
+        mirror = self.ck_mirror.isChecked()
+        show_speed_ball(self, MODELS_DIR, f"下载「{size}」模型")
+
+        def fn(log, progress, should_stop):
+            try:
+                import faster_whisper  # noqa: F401
+            except ImportError:
+                from video_text_tools.asr.types import DepMissing
+                raise DepMissing("缺少 faster-whisper，无法下载模型")
+            tr.download_model_auto(size, mirror=mirror, log=log,
+                                   on_progress=lambda p: progress(max(p, 0), 100, ""))
+            return size
+
+        self._dl_worker = ToolWorker(fn, self)
+        self._dl_worker.done.connect(self._on_whisper_done)
+        self._dl_worker.start()
+
+    def _on_whisper_done(self, res):
+        from gui.speed_ball import hide_speed_ball
+        hide_speed_ball()
+        self._dl_worker = None
+        if isinstance(res, Exception):
+            QMessageBox.warning(self, "下载失败", str(res))
+        else:
+            QMessageBox.information(self, "下载完成", f"Whisper「{res}」模型已就绪。")
+        self._update_status()
+
+    def _open_models_dir(self):
+        from core.config import MODELS_DIR
+        try:
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            open_path(MODELS_DIR)
+        except Exception as e:
+            QMessageBox.warning(self, "打不开", str(e))
+
+    # ---- 豆包 / 纠错 / 词库 保存与测试 ----
+    def _save_doubao_page(self):
+        from core.config import save_doubao_vision, doubao_vision_config
+        key = self.ed_d_key.text().strip() or (doubao_vision_config().get("api_key") or "")
+        ep = self.ed_d_ep.text().strip()
+        if not key or not ep:
+            QMessageBox.information(self, "提示", "API Key 与端点 ID 都要填（首次配置不能留空 Key）")
+            return
+        try:
+            save_doubao_vision(key, ep, self.ed_d_base.text().strip())
+        except OSError as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+            return
+        self.ed_d_key.clear()
+        self._update_status()
+        QMessageBox.information(self, "已保存", "豆包配置已加密落盘，即时生效。")
+
+    def _save_asr_fix_page(self):
+        from core.config import save_asr_fix, asr_fix_config
+        key = self.ed_fix_key.text().strip() or (asr_fix_config().get("api_key") or "")
+        model = self.ed_fix_model.text().strip()
+        if not key or not model:
+            QMessageBox.information(self, "提示", "API Key 与 Model 都要填（首次配置不能留空 Key）")
+            return
+        try:
+            save_asr_fix(key, model, self.ed_fix_base.text().strip())
+        except OSError as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+            return
+        self.ed_fix_key.clear()
+        self._update_status()
+        QMessageBox.information(self, "已保存", "语音纠错配置已加密落盘，即时生效。")
+
+    def _test_asr_fix(self):
+        """拿当前输入框里的 key/model/base 现场纠正一句（允许未保存先测）。"""
+        from core.config import asr_fix_config
+        cfg = dict(asr_fix_config())
+        if self.ed_fix_key.text().strip():
+            cfg["api_key"] = self.ed_fix_key.text().strip()
+        if self.ed_fix_model.text().strip():
+            cfg["model"] = self.ed_fix_model.text().strip()
+        if self.ed_fix_base.text().strip():
+            cfg["base_url"] = self.ed_fix_base.text().strip()
+        from video_text_tools.asr.fixer import AsrFixer
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        ok = False
+        try:
+            out = AsrFixer(cfg).correct_segments(["长期吃盖片可以预防骨松"])
+            msg = f"连接成功，示例纠正：\n长期吃盖片可以预防骨松 → {out[0] if out else ''}"
+            ok = True
+        except Exception as e:
+            msg = f"失败：{type(e).__name__}: {e}"
+        finally:
+            QApplication.restoreOverrideCursor()
+        (QMessageBox.information if ok else QMessageBox.warning)(self, "语音纠错测试", msg)
+
+    def _save_glossary(self):
+        from core.config import asr_glossary_save
+        saved = asr_glossary_save(self.ed_gloss.toPlainText().splitlines())
+        self.ed_gloss.setPlainText("\n".join(saved))
+        self._update_status()
+        QMessageBox.information(self, "已保存", f"词库已保存（{len(saved)} 个词），即时生效。")
+
+    def _import_glossary(self):
+        """从 Excel/CSV/JSON 文件读词库，合并进当前文本框（去重、不自动落盘，让用户先审）。"""
+        from core.config import glossary_from_file
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入词库文件", "",
+            "词库文件 (*.xlsx *.xls *.csv *.json);;Excel (*.xlsx *.xls);;CSV (*.csv);;JSON (*.json)")
+        if not path:
+            return
+        try:
+            terms = glossary_from_file(path)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"读取 {os.path.basename(path)} 失败：\n{e}")
+            return
+        if not terms:
+            QMessageBox.information(self, "没读到词",
+                                    "文件里没解析出任何词条（确认 Excel/CSV 每格一个词、或 JSON 是词列表）")
+            return
+        cur = [s.strip() for s in self.ed_gloss.toPlainText().splitlines() if s.strip()]
+        seen, merged = set(), []
+        for s in cur + terms:                      # 现有在前、新导入在后，整体去重保序
+            if s and s not in seen:
+                seen.add(s)
+                merged.append(s)
+        self.ed_gloss.setPlainText("\n".join(merged))
+        QMessageBox.information(
+            self, "已导入",
+            f"从文件读入 {len(terms)} 词，合并去重后共 {len(merged)} 词（已填进上方文本框）。\n"
+            "确认无误后点「💾 保存词库」才正式生效。")
+
+    def _export_glossary(self):
+        """把当前文本框里的词库另存为 Excel/CSV/JSON（按选定后缀）。"""
+        from core.config import glossary_to_file
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出词库文件", "词库.xlsx",
+            "Excel (*.xlsx);;CSV (*.csv);;JSON (*.json)")
+        if not path:
+            return
+        terms = self.ed_gloss.toPlainText().splitlines()
+        try:
+            saved = glossary_to_file(path, terms)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"写入文件失败：\n{e}")
+            return
+        QMessageBox.information(self, "已导出", f"已导出 {len(saved)} 词到：\n{path}")
 
     def _open_api_text(self):
         from core.config import CONFIG_DIR

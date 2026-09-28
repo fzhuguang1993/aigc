@@ -7,10 +7,11 @@ gui/pages_tools.py —— 工具中心
 功能逻辑一律放 video_text_tools 包（纯功能、无 UI），本层只做界面。
 """
 from PySide6.QtCore import Qt, QTimer, QPoint, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QScrollArea, QSizePolicy, QDialog, QGridLayout,
-                               QGraphicsDropShadowEffect, QMenu)
+                               QGraphicsDropShadowEffect, QMenu, QKeySequenceEdit,
+                               QDialogButtonBox)
 
 from gui.header import page_header
 from gui.tool_panels import PANEL_FACTORIES
@@ -27,6 +28,9 @@ TOOLS = [
     ("视频溯源", "🔎", "溯源码池取码、按规则重命名并入库（需内网 MySQL）", "视频溯源"),
     ("素材提取", "🧲", "粘贴唞喑/筷手分享链接：提取去水印视频、图集、文案", "素材提取"),
     ("屏幕录制", "🎥", "全屏/框选区域/指定窗口录制，选帧率码率保存 MP4", "屏幕录制"),
+    ("语音识别", "🎙", "选视频→Whisper 转口播逐字稿，导出 TXT/SRT 字幕、DeepSeek 纠错、可烧录", "语音识别"),
+    ("爆款拆解", "🔥", "粘贴爆款链接：拆分镜/口播，产出画面/文案/复刻 3 类提示词与整体分析", "爆款拆解"),
+    ("一键发布", "🚀", "选成品视频与平台账号，一键分发到抖音/快手/小红书/视频号", "一键发布"),
     ("素材瘦身", "🗜", "把参考图批量压缩到接口要求的大小，避免上传失败", None),
     ("文案查重", "🔍", "提示词相似度检查，防止一批任务生成的视频互相雷同", None),
 ]
@@ -62,7 +66,12 @@ class ToolCard(QWidget):
     ⚠ 卡内所有子控件对鼠标透明（WA_TransparentForMouseEvents）：否则鼠标
     移到图标/文字上时卡片会收到 Leave（子控件是独立的 hover 目标），动效
     忽灭忽现就是“抖动”的根因；点击也落在子控件上收不到，只有卡片空白处
-    能点开——整卡必须是一个交互单元。"""
+    能点开——整卡必须是一个交互单元。
+
+    动效时长取 320ms：170ms 时卡片间快速扫鼠标、点开瞬间的明暗切换都嫌
+    “抽抽”，放缓后浮起/落回连贯得多（用户反馈“抖动太快”）。
+    标题旁用灰色小字显示已配快捷键（右键卡片可设/改/清），随主窗口
+    apply_tool_shortcuts() 重注册同步刷新（set_sc_hint）。"""
     _REST = (16, QPoint(0, 2), QColor(15, 23, 42, 26))       # 静止：轻阴影
     _HOVER = (30, QPoint(0, 8), QColor(51, 112, 255, 55))    # 悬停：浮起蓝影
 
@@ -87,9 +96,9 @@ class ToolCard(QWidget):
         self._shadow.setColor(r[2])
         self.setGraphicsEffect(self._shadow)
         self._anim = QPropertyAnimation(self._shadow, b"blurRadius", self)
-        self._anim.setDuration(170)
+        self._anim.setDuration(320)
         self._anim2 = QPropertyAnimation(self._shadow, b"offset", self)
-        self._anim2.setDuration(170)
+        self._anim2.setDuration(320)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 12)
         lay.setSpacing(6)
@@ -101,8 +110,13 @@ class ToolCard(QWidget):
         self._badge = badge
         t = QLabel(name)
         t.setStyleSheet("font-size:14px; font-weight:700; color:#1F2329; background:transparent;")
+        self._title_lbl = t
+        sc = QLabel("")
+        sc.setStyleSheet("font-size:12px; font-weight:600; color:#8F959E; background:transparent;")
+        self._sc_lbl = sc
         h.addWidget(badge)
         h.addWidget(t)
+        h.addWidget(sc)
         h.addStretch(1)
         lay.addLayout(h)
         d = QLabel(desc)
@@ -116,10 +130,16 @@ class ToolCard(QWidget):
             "font-size:12px; color:#8F959E; background:transparent;")
         lay.addWidget(state)
         # 整卡一个交互单元：子控件不吃鼠标（见类注释的抖动/点不开根因）
-        for w in (badge, t, d, state):
+        for w in (badge, t, self._sc_lbl, d, state):
             w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         if factory:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.set_sc_hint((app_state.get("tool_shortcuts") or {}).get(name, ""))
+
+    def set_sc_hint(self, seq):
+        """标题旁的快捷键小字：随保存/主窗口重注册同步刷新"""
+        self._sc_lbl.setText(f"[{seq}]" if seq else "")
+        self._sc_lbl.setVisible(bool(seq))
 
     def mouseReleaseEvent(self, e):
         if self.factory and e.button() == Qt.MouseButton.LeftButton \
@@ -128,14 +148,53 @@ class ToolCard(QWidget):
         super().mouseReleaseEvent(e)
 
     def contextMenuEvent(self, e):
-        """右键：固定到左侧导航 / 从左侧取消（仅可用工具）"""
+        """右键：固定到左侧导航 / 设置・更改・清除快捷键（仅可用工具）"""
         if not self.factory:
             return
         pinned = self.tool_name in load_pinned()
+        cur = (app_state.get("tool_shortcuts") or {}).get(self.tool_name, "")
         m = QMenu(self)
         m.addAction("📌 从左侧导航取消" if pinned else "📌 固定在左侧导航",
                     self._toggle_pin)
+        m.addAction("⌨ 更改快捷键…" if cur else "⌨ 设置快捷键…", self._set_shortcut)
+        if cur:
+            m.addAction("✕ 清除快捷键", self._clear_shortcut)
         m.exec(e.globalPos())
+
+    def _set_shortcut(self):
+        """卡片就地录入：按下组合键→确定即生效；清空键位＝取消绑定"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("工具快捷键")
+        dlg.setModal(True)
+        v = QVBoxLayout(dlg)
+        cur = (app_state.get("tool_shortcuts") or {}).get(self.tool_name, "")
+        v.addWidget(QLabel(f"为「{self.tool_name}」按下组合键（示例：F9 / Ctrl+Alt+1）：\n"
+                           "同一键位只归一个工具，冲突时其它工具自动让位"))
+        ed = QKeySequenceEdit(QKeySequence(cur))
+        ed.keySequenceChanged.connect(lambda ks: dlg.accept() if ks.toString() else None)
+        v.addWidget(ed)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        ed.setFocus()
+        if not dlg.exec():
+            return
+        from gui.pages_settings import set_tool_shortcut
+        set_tool_shortcut(self.tool_name, ed.keySequence().toString())
+        w = self.window()
+        page = getattr(w, "page_tools", None)
+        if page is not None:
+            page.refresh_sc_hints()          # 全部卡片提示跟着刷新（含让位的）
+
+    def _clear_shortcut(self):
+        from gui.pages_settings import set_tool_shortcut
+        set_tool_shortcut(self.tool_name, "")
+        w = self.window()
+        page = getattr(w, "page_tools", None)
+        if page is not None:
+            page.refresh_sc_hints()
 
     def _toggle_pin(self):
         set_pinned(self.tool_name, self.tool_name not in load_pinned())
@@ -262,3 +321,9 @@ class ToolsPage(QWidget):
 
     def refresh(self):
         pass
+
+    def refresh_sc_hints(self):
+        """卡片快捷键提示全量重读（保存/清除后调用，让位的卡片也会变灰空）"""
+        seqs = app_state.get("tool_shortcuts") or {}
+        for card in self._cards:
+            card.set_sc_hint(seqs.get(card.tool_name, ""))

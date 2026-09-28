@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                                QWidget, QInputDialog)
 
 from core import translate
+from gui.maintainer import Gate, app_has_unlocked
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
 from gui.window_frame import apply_rounded
 from store import product_store, task_store
@@ -76,7 +77,8 @@ class TaskDialog(QDialog):
         # “库里的旧对照还作数”和“改过了得重翻”
         self._zh_src = self._raw
         self._showing_zh = False
-        self._tray_unlocked = False
+        self._gate_tray = Gate("task_translate")
+        self._tray_unlocked = app_has_unlocked("task_translate")
         self._worker = None
         self._op = ""
         # 接口刚翻出来的那份中文：跟编辑框里的对照一比，就知道人改没改过
@@ -171,16 +173,11 @@ class TaskDialog(QDialog):
         return tray
 
     def _summon_translate(self):
-        """Alt+W（macOS ⌘+W）：第一次要口令，之后就是纯开关"""
+        """Alt+W（macOS ⌘+W）：同一功能当天只验一次口令，之后就是纯开关"""
         if self._tray_unlocked:
             self._show_tray(not self.tray.isVisible())
             return
-        code, ok = QInputDialog.getText(self, "维护人验证", "请输入维护人口令：",
-                                        QLineEdit.EchoMode.Password)
-        if not ok:
-            return
-        if code != API_MAINTAINER_CODE:
-            QMessageBox.warning(self, "口令错误", "维护人口令不正确")
+        if not self._gate_tray.ask(self):
             return
         self._tray_unlocked = True
         self._show_tray(True)

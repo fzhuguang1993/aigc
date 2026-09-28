@@ -75,6 +75,34 @@ CREATE TABLE IF NOT EXISTS org_line_owners(
   owner TEXT DEFAULT '',               -- 归属成员名；空=未绑定（只 admin 可见）
   updated_at TEXT DEFAULT ''
 );
+-- 一键发布历史：一次「视频 × 平台账号」落一行（独立于任务/执行体系）。
+-- ok=1 成功，post_url 是平台回执的作品链接；失败行 ok=0 且 message 记人话原因。
+CREATE TABLE IF NOT EXISTS publishes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform TEXT DEFAULT '', account TEXT DEFAULT '', title TEXT DEFAULT '',
+  video_path TEXT DEFAULT '', ok INTEGER DEFAULT 0,
+  post_id TEXT DEFAULT '', post_url TEXT DEFAULT '', message TEXT DEFAULT '',
+  published_at TEXT DEFAULT '', created_at TEXT DEFAULT ''
+);
+-- 爆款拆解任务库：一次拆解落一行（独立于生成任务/发布体系）。
+-- payload 存 BreakdownResult.to_dict() 的 JSON，详情页三屏联动据此离线重建；
+-- cover/gallery_dir/report 指向持久图库目录（BREAKDOWN_LIBRARY），删行不删图。
+CREATE TABLE IF NOT EXISTS breakdown_tasks(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT DEFAULT '', video_path TEXT DEFAULT '', link TEXT DEFAULT '',
+  duration REAL DEFAULT 0, shot_count INTEGER DEFAULT 0,
+  cover TEXT DEFAULT '', gallery_dir TEXT DEFAULT '', report TEXT DEFAULT '',
+  status TEXT DEFAULT 'ok',         -- ok=完整 partial=半成品
+  payload TEXT DEFAULT '',          -- BreakdownResult.to_dict() 的 JSON
+  created_at TEXT DEFAULT '', updated_at TEXT DEFAULT ''
+);
+-- 拆解任务 ↔ 产品 多对多关联（不同产品打法不同，按产品沉淀爆款拆解样本）。
+-- 只存 id 引用，产品改名/删除不级联（关联自然失效，重开拆解不补）。
+CREATE TABLE IF NOT EXISTS breakdown_task_products(
+  task_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  PRIMARY KEY(task_id, product_id)
+);
 """
 
 # 老库升级：列不存在时 ALTER 补上（重复执行安全）

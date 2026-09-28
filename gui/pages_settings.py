@@ -18,7 +18,7 @@ from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QMessageBox, QMenu, QScrollArea, QFrame,
                                QFileDialog, QInputDialog, QSpinBox, QComboBox,
-                               QKeySequenceEdit)
+                               QKeySequenceEdit, QCheckBox, QApplication)
 
 from core.config import (CONFIG_JSON, USER_NAME,
                          DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR,
@@ -29,6 +29,9 @@ from core import tags as tag_lib
 from gui.header import page_header
 from gui.dialogs_naming import NamingEditor
 from gui.dialogs_tags import TagEditor
+from gui.maintainer import Gate, app_has_unlocked
+from gui.mouse_gesture import (GESTURE_COMMANDS, COMMAND_LABELS,
+                              gesture_display, shape_distance, SHAPE_MAX_DIST)
 from gui.pages_tools import TOOLS
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, PANEL_FACTORIES
 from gui.widgets import VideoPlayerDialog
@@ -135,6 +138,24 @@ def _section_card(title, hint=""):
     return card, v
 
 
+def set_tool_shortcut(name, seq):
+    """写 app_state 并让主窗口重注册（设置页与工具卡片右键共用）；返回生效值"""
+    seq = (seq or "").strip()
+    seqs = dict(app_state.get("tool_shortcuts") or {})
+    if seq:
+        # 一键一工具：同键其他工具让位，避免一个键弹两个窗口
+        for k in [k for k, v in seqs.items() if v == seq and k != name]:
+            seqs.pop(k)
+        seqs[name] = seq
+    else:
+        seqs.pop(name, None)
+    app_state.set_value("tool_shortcuts", seqs)
+    w = QApplication.instance().activeWindow()
+    if hasattr(w, "apply_tool_shortcuts"):
+        w.apply_tool_shortcuts()
+    return seq
+
+
 class SettingsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -149,7 +170,7 @@ class SettingsPage(QWidget):
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
         lay = QVBoxLayout(inner)
-        lay.setContentsMargins(24, 12, 24, 24)
+        lay.setContentsMargins(24, 14, 24, 24)
         lay.setSpacing(12)
 
         head = page_header("设置", "修改保存后重启生效（命名规则除外：保存即生效）", icon="⚙️")
@@ -238,6 +259,54 @@ class SettingsPage(QWidget):
         self._load_tool_key()
         lay.addWidget(card)
 
+        # ---------- 鼠标手势：按住右键划轨迹呼出命令（存 ui_state，保存即生效） ----------
+        card, cv = _section_card("鼠标手势", "在软件任意窗口按住右键划一段轨迹，"
+                                              "松开即执行命令；同一命令在不同页面自动对应不同行为")
+        self._gesture_rows = {}
+        gr0 = QHBoxLayout()
+        gr0.setSpacing(10)
+        self.ck_gesture = QCheckBox("启用鼠标手势")
+        self.ck_gesture.setChecked(bool(app_state.get("gesture_enabled", True)))
+        self.ck_gesture.stateChanged.connect(
+            lambda _s: app_state.set_value("gesture_enabled",
+                                           self.ck_gesture.isChecked()))
+        b_g_clear = QPushButton("清空全部绑定")
+        b_g_clear.setObjectName("GhostBtn")
+        b_g_clear.clicked.connect(self._clear_all_gestures)
+        gr0.addWidget(self.ck_gesture)
+        gr0.addWidget(b_g_clear)
+        self.lbl_gesture = QLabel("未绑定的命令不会触发，右键照常弹菜单")
+        self.lbl_gesture.setStyleSheet("color:#8F959E; font-size:12px; background:transparent;")
+        gr0.addWidget(self.lbl_gesture, 1)
+        cv.addLayout(gr0)
+        for cid, label, tip in GESTURE_COMMANDS:
+            rr = QHBoxLayout()
+            rr.setSpacing(10)
+            lb = QLabel(label)
+            lb.setFixedWidth(170)
+            lb.setStyleSheet("color:#1F2329; background:transparent;")
+            lb.setToolTip(tip)
+            val = QLabel("")
+            val.setFixedWidth(110)
+            val.setStyleSheet("color:#3370FF; background:transparent;")
+            b_rec = QPushButton("✏ 录制手势…")
+            b_rec.setObjectName("GhostBtn")
+            b_rec.clicked.connect(lambda _=False, c=cid: self._record_gesture(c))
+            b_un = QPushButton("解绑")
+            b_un.setObjectName("GhostBtn")
+            b_un.clicked.connect(lambda _=False, c=cid: self._unbind_gesture(c))
+            rr.addWidget(lb)
+            rr.addWidget(val)
+            rr.addWidget(b_rec)
+            rr.addWidget(b_un)
+            rr.addStretch(1)
+            cv.addLayout(rr)
+            self._gesture_rows[cid] = val
+        self._gesture_cid = None               # 正在录制的命令（None＝没在录）
+        self._gesture_engine = None           # 懒取主窗口引擎并接线一次
+        self._refresh_gestures()
+        lay.addWidget(card)
+
         # ---------- 内容规则：命名/标签点击展开的编辑栏（保存即生效，不进下面的「保存设置」） ----------
         card, cv = _section_card("内容规则", "展开编辑，保存即生效")
         self.editor_naming = NamingEditor()
@@ -257,7 +326,11 @@ class SettingsPage(QWidget):
         # 口令同时放出导航里的「🔌 接口管理」页：一个口令管全部维护人入口
         # 网关模式（终端买家）：线路/接口都在服务端，买家无线路可维护，
         # 但输出目录是个人偏好：直接放出来（不走口令）
-        self._dirs_unlocked = False
+        self._dirs_unlocked = app_has_unlocked("settings_dirs") or GATEWAY_MODE
+        self._gate_dirs = Gate("settings_dirs")
+        # 本会话是否已验证过「接口管理」：与按天解锁标记无关，重启后归 False，
+        # 保证每次启动第一次 Alt+W 必须先弹口令框验证，验证通过才放出页面。
+        self._api_verified = False
         card, cv = _section_card("输出目录", "留空＝用默认，修改保存后重启生效")
         self.dirs_box = card
         self._dir_edits = {}
@@ -278,11 +351,8 @@ class SettingsPage(QWidget):
             r.addWidget(b)
             cv.addLayout(r)
             self._dir_edits[key] = ed
-        self.dirs_box.setVisible(False)
+        self.dirs_box.setVisible(self._dirs_unlocked)   # 当天验过口令才默认展开
         lay.addWidget(card)
-        if GATEWAY_MODE:
-            self.dirs_box.setVisible(True)
-            self._dirs_unlocked = True
 
         # ---------- 底部动作栏：钉在窗口底（不随内容滚动） ----------
         # 迁移入口贴左下角、主操作「保存」贴右下角；只写姓名/输出目录，
@@ -411,24 +481,105 @@ class SettingsPage(QWidget):
         self._save_tool_shortcut()
 
     def _save_tool_shortcut(self):
-        """编辑完（失焦/回车）即落盘并让主窗口重注册快捷键，不用重启"""
+        """编辑完（失焦/回车）即落盘并让主窗口重注册快捷键，不用重启；
+        与工具卡片右键共用 set_tool_shortcut（互斥/清理由它统一维护）"""
         name = self.tool_combo.currentData()
         if not name:
             return
-        seq = self.tool_key.keySequence().toString()
-        seqs = dict(app_state.get("tool_shortcuts") or {})
-        if seq:
-            # 一键一工具：同键其他工具让位，避免一个键弹两个窗口
-            for k in [k for k, v in seqs.items() if v == seq and k != name]:
-                seqs.pop(k)
-            seqs[name] = seq
-        else:
-            seqs.pop(name, None)
-        app_state.set_value("tool_shortcuts", seqs)
+        set_tool_shortcut(name, self.tool_key.keySequence().toString())
         self._refresh_tool_combo()
-        w = self.window()
-        if hasattr(w, "apply_tool_shortcuts"):
-            w.apply_tool_shortcuts()
+
+    # ---------- 鼠标手势：录制 / 绑定 / 解绑 ----------
+    def _engine(self):
+        """懒取主窗口上的手势引擎，并把录制信号接过来（只接一次）"""
+        eng = getattr(self.window(), "gesture", None)
+        if eng is not None and self._gesture_engine is None:
+            eng.record_finished.connect(self._on_gesture_recorded)
+            eng.record_cancelled.connect(self._on_gesture_cancelled)
+            self._gesture_engine = eng
+        return eng
+
+    def _refresh_gestures(self):
+        bound = 0
+        gmap = app_state.get("gesture_map") or {}
+        for cid, val in self._gesture_rows.items():
+            ent = gmap.get(cid)
+            seq = ent.get("seq") if isinstance(ent, dict) else ent   # 兼容旧纯串格式
+            if seq:
+                val.setText(gesture_display(seq))
+                bound += 1
+            else:
+                val.setText("未绑定")
+                val.setStyleSheet("color:#8F959E; background:transparent;")
+                continue
+            val.setStyleSheet("color:#3370FF; background:transparent;")
+        self.lbl_gesture.setText(
+            f"已绑定 {bound} 条：软件内按住右键划出轨迹（形状相近即触发，不必划得一模一样）"
+            if bound else "未绑定的命令不会触发，右键照常弹菜单")
+
+    def _record_gesture(self, cid):
+        eng = self._engine()
+        if eng is None:
+            QMessageBox.warning(self, "不可用", "手势引擎还没初始化（不在主窗口里？）")
+            return
+        if self._gesture_cid is not None:
+            return                                   # 已经在录另一条：忽略本次
+        self._gesture_cid = cid
+        self.lbl_gesture.setText(
+            f"✏ 请按住鼠标右键划出「{COMMAND_LABELS[cid]}」的轨迹，松开即绑定；"
+            "原地点松开取消")
+        eng.start_record()
+
+    def _on_gesture_recorded(self, seq, shape):
+        cid, self._gesture_cid = self._gesture_cid, None
+        if cid is None:
+            return
+        gmap = dict(app_state.get("gesture_map") or {})
+
+        def _pts(ent):
+            return ent.get("pts") if isinstance(ent, dict) else None
+
+        # 与其命令形状太像（距离≤阈值）的 = 会被本次抢走，先拎出来确认
+        clash = [c for c, ent in gmap.items()
+                 if c != cid and _pts(ent) and shape
+                 and shape_distance(shape, _pts(ent)) <= SHAPE_MAX_DIST]
+        owner = clash[0] if clash else None
+        if owner and QMessageBox.question(
+                self, "轨迹相近",
+                f"这个形状与已绑定的「{COMMAND_LABELS.get(owner, owner)}」很相似，\n"
+                f"改绑到「{COMMAND_LABELS[cid]}」吗？（旧命令会被解绑）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+            self.lbl_gesture.setText("保持原绑定：未对任何命令做修改")
+            return
+        for c in clash:
+            gmap.pop(c)
+        gmap[cid] = {"seq": seq, "pts": shape}
+        app_state.set_value("gesture_map", gmap)
+        self._refresh_gestures()
+        self.lbl_gesture.setText(
+            f"✓ 已绑定「{COMMAND_LABELS[cid]}」← {gesture_display(seq)}（之后再划出相近形状即可触发）")
+
+    def _on_gesture_cancelled(self):
+        if self._gesture_cid is not None:
+            self._gesture_cid = None
+            self.lbl_gesture.setText("没划出轨迹：录制已取消，再点「录制手势」重来")
+
+    def _unbind_gesture(self, cid):
+        gmap = dict(app_state.get("gesture_map") or {})
+        if gmap.pop(cid, None) is not None:
+            app_state.set_value("gesture_map", gmap)
+        self._refresh_gestures()
+
+    def _clear_all_gestures(self):
+        if not (app_state.get("gesture_map") or {}):
+            return
+        if QMessageBox.question(
+                self, "清空手势", "确定解绑全部鼠标手势吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            app_state.set_value("gesture_map", {})
+            self._refresh_gestures()
 
     # ---------- 配置迁移 / 线路包下拉菜单（各将导出/导入合一） ----------
     def _build_pkg_menu(self):
@@ -443,30 +594,26 @@ class SettingsPage(QWidget):
         m.addAction("📥 导入线路小包", self._import_lines)
         return m
 
-    # ---------- 维护人入口：口令解锁「输出目录」并放出导航里的「接口管理」 ----------
+    # ---------- 维护人入口：Alt+W 先弹口令框，验证通过才放出「接口管理」（并展开输出目录） ----------
     def _summon_dirs(self):
-        if GATEWAY_MODE:                 # 买家模式：输出目录已直接展示，不要口令
+        if GATEWAY_MODE:                 # 买家模式：输出目录已直接展示，接口管理不对买家开放
             return
-        if self._dirs_unlocked:               # 已展开则不重复要口令
-            return
-        code, ok = QInputDialog.getText(self, "维护人验证", "请输入维护人口令：",
-                                        QLineEdit.EchoMode.Password)
-        if not ok:
-            return
-        if code == API_MAINTAINER_CODE:
+        w = self.window()
+        # 本会话已经验证过：再按 Alt+W 直接跳回「接口管理」，不重复弹框；
+        # （新开会话 _api_verified 重置为 False，会重新要求验证）
+        if self._api_verified:
             self.dirs_box.setVisible(True)
-            self._dirs_unlocked = True
-            w = self.window()
             if hasattr(w, "reveal_api_page"):
-                w.reveal_api_page()       # 「🔌 接口管理」补进导航并直接跳过去
-        else:
-            QMessageBox.warning(self, "口令错误", "维护人口令不正确")
-
-    def _relock_dirs(self):
-        # 只收回输出目录；接口管理页的导航项本次运行期内保持可见
-        # （口令都验证过了，再藏没意义）
-        self.dirs_box.setVisible(False)
-        self._dirs_unlocked = False
+                w.reveal_api_page()
+            return
+        # 本会话首次：强制弹口令框（force=True 绕过「当天已验」缓存），验证通过才放出页面
+        if not self._gate_dirs.ask(self, force=True):
+            return
+        self.dirs_box.setVisible(True)
+        self._dirs_unlocked = True
+        self._api_verified = True
+        if hasattr(w, "reveal_api_page"):
+            w.reveal_api_page()           # 「🔌 接口管理」补进导航并直接跳过去
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -502,8 +649,7 @@ class SettingsPage(QWidget):
             data.pop("paths", None)
         CONFIG_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                encoding="utf-8")
-        if self._dirs_unlocked:            # 保存后收回隐藏，下次再改需重新按口令
-            self._relock_dirs()
+        # 保存后不再收回输出目录：同一功能当天验过一次就不再问（跨天才重新验）
         QMessageBox.information(self, "已保存", "设置已保存，重启软件后生效")
 
     # ================= 配置迁移（加密包） =================

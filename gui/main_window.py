@@ -23,6 +23,7 @@ from gui.pages_tools import ToolsPage, load_pinned, set_pinned
 from gui.pages_guide import GuidePage
 from gui.pages_api import ApiManagerPage
 from gui.pages_org import OrgPage
+from gui.pages_breakdown import BreakdownTasksPage
 from store import app_state
 
 
@@ -42,9 +43,10 @@ def resource_path(rel):
 
 # 导航基础项：(文本, 页栈索引)。页栈顺序固定不变；导航行号与索引不再
 # 一一对应——「固定在左侧」的工具项插在「⚙️ 设置」之前，由 _nav_rows 映射表桥接
+# 「🔥 拆解任务」页常驻页栈末尾（索引 9），显示位在「工具中心」之后、「设置」仍在末位
 _NAV_PAGES = [("📊  数据中台", 0), ("📋  任务中心", 1), ("🧩  产品中心", 2),
-              ("📡  线路负载", 3), ("🧰  工具中心", 4), ("📖  新手入门", 5),
-              ("⚙️  设置", 6)]
+              ("📡  线路负载", 3), ("🧰  工具中心", 4), ("🔥  拆解任务", 9),
+              ("📖  新手入门", 5), ("⚙️  设置", 6)]
 
 
 class MainWindow(QMainWindow):
@@ -82,8 +84,11 @@ class MainWindow(QMainWindow):
         sidebar.setObjectName("Sidebar")
         slay = QVBoxLayout(sidebar)
         slay.setContentsMargins(6, 18, 6, 12)
-        logo = QLabel("🎬 AIGC\n工厂")
+        # 单行标题 + 关掉自动换行：旧版写“AIGC\n工厂”还带 17px，侧栏不够宽时
+        # “AIGC”几字会被挤得竖排换行（用户反馈很丑）；现在整行不高长、自适应宽度
+        logo = QLabel("🎬 AIGC 工厂")
         logo.setObjectName("Logo")
+        logo.setWordWrap(False)
         slay.addWidget(logo)
         self.nav = QListWidget()
         self.nav.setObjectName("NavList")
@@ -124,11 +129,14 @@ class MainWindow(QMainWindow):
         self.page_api = ApiManagerPage()
         # 组织结构：页面常驻页栈（索引固定 8），导航项只有 admin 看得见
         self.page_org = OrgPage()
+        # 拆解任务：爆款拆解历史库管理页，常驻页栈末尾（索引 9）
+        self.page_breakdown = BreakdownTasksPage()
         # 页栈顺序固定：数据中台(0)、任务、产品、线路负载、工具、新手、
-        # 设置、接口管理(7)、组织结构(8)，与 _NAV_PAGES 的索引一一对应
+        # 设置、接口管理(7)、组织结构(8)、拆解任务(9)，与 _NAV_PAGES 的索引对应
         for p in (self.page_dashboard, self.page_tasks, self.page_products,
                   self.page_console, self.page_tools, self.page_guide,
-                  self.page_settings, self.page_api, self.page_org):
+                  self.page_settings, self.page_api, self.page_org,
+                  self.page_breakdown):
             self.pages.addWidget(p)
         body.addWidget(self.pages, 1)
 
@@ -173,8 +181,81 @@ class MainWindow(QMainWindow):
         self.apply_tool_shortcuts()
         self._update_identity()
 
+        # 鼠标手势引擎：全局事件过滤器，右键划过阈值→匹配轨迹→按当前上下文派发
+        from gui.mouse_gesture import MouseGestureEngine
+        self.gesture = MouseGestureEngine(self)
+        self.gesture.set_resolver(self._resolve_gesture)
+
         # 整窗改无边框圆角：标题栏上面已自备，故 add_titlebar=False
         apply_rounded(self, add_titlebar=False, resizable=True)
+
+    # ---------- 鼠标手势：同一命令在不同上下文映射到不同行为 ----------
+    def _active_tool_dialog(self):
+        """当前活动窗口往上找最近的 ToolDialog（工具窗口开着时手势认它的面板）"""
+        from PySide6.QtWidgets import QApplication
+        from gui.pages_tools import ToolDialog
+        w = QApplication.activeModalWidget() or QApplication.activeWindow()
+        while w is not None:
+            if isinstance(w, ToolDialog):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def _resolve_gesture(self, cmd):
+        from PySide6.QtWidgets import QApplication, QDialog
+        from utils.desktop_utils import open_path
+        aw = QApplication.activeModalWidget() or QApplication.activeWindow()
+        dlg = self._active_tool_dialog()
+        if cmd == "close":
+            # 只关当前工具窗口/弹窗，绝不误关主窗口
+            if isinstance(aw, QDialog) and aw is not self:
+                aw.reject()
+            return
+        if cmd == "refresh":
+            if dlg is not None and hasattr(dlg.panel, "refresh"):
+                dlg.panel.refresh()
+            else:
+                self._refresh()
+            return
+        if cmd == "new":
+            page = self.pages.currentWidget()
+            if hasattr(page, "_new_task"):            # 任务中心→新建任务
+                page._new_task()
+            elif hasattr(page, "_create"):            # 产品中心→新建产品
+                from store import product_store as ps
+                page._create(ps.TYPE_PRODUCT)
+            else:
+                self.statusBar().showMessage("当前页面没有「新建」动作", 3000)
+            return
+        if cmd == "open_output":
+            # 工具窗口有自己输出目录就开它自己的（录屏/素材提取各自地址）
+            ed = getattr(dlg.panel, "ed_out", None) if dlg is not None else None
+            if ed is not None and ed.text().strip():
+                d = ed.text().strip()
+                Path(d).mkdir(parents=True, exist_ok=True)
+                open_path(d)
+            else:
+                self.open_output_dir()
+            return
+        if cmd == "open_tools":
+            self.pages.setCurrentWidget(self.page_tools)
+            self._sync_nav_to_page(self.page_tools)
+            return
+        if cmd == "open_dashboard":
+            self.pages.setCurrentWidget(self.page_dashboard)
+            self._sync_nav_to_page(self.page_dashboard)
+            return
+
+    def _sync_nav_to_page(self, page):
+        """手势切页后把左侧选中行也跟过去（否则高亮还停在旧项）"""
+        idx = self.pages.currentIndex()
+        for row, (kind, val) in enumerate(self._nav_rows):
+            if kind == "page" and val == idx:
+                self.nav.blockSignals(True)
+                self.nav.setCurrentRow(row)
+                self._page_row = row
+                self.nav.blockSignals(False)
+                return
 
     # ---------- 导航：基础 7 页 + 组织结构(admin) + 固定工具（插到「设置」前面）+ 接口管理 ----------
     def _rebuild_nav(self):
@@ -259,6 +340,7 @@ class MainWindow(QMainWindow):
             sc.setContext(Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(lambda n=name: self.page_tools.open_tool(n))
             self._tool_scuts.append(sc)
+        self.page_tools.refresh_sc_hints()      # 卡片标题旁的快捷键提示跟着重注册刷新
 
     def _setup_geometry(self):
         """初始尺寸＝屏幕可用区的 75%，并居中；窗口仍可自由拉大放小

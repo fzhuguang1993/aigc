@@ -1,0 +1,13 @@
+# 爆款拆解「可选重依赖」——不装进基础包，按需安装
+#
+# 为什么要单独一份：faster-whisper 会拉进 ctranslate2 / av / tokenizers 等大件，
+# 打进 onefile exe 会显著顶爆体积目标（<300MB）。所以基础 requirements.txt 不含它，
+# 代码里一律延迟导入：没装时「爆款拆解」照常打开，转写环节明确提示装什么。
+#
+# 安装（开发版）：  pip install -r requirements-breakdown.txt
+# 打包版：维护人自备 faster-whisper 后重新打包，或引导用户手动放置模型（见 docs/爆款拆解.md）
+faster-whisper>=1.0.0
+
+# 拆解结果导出 Word 报告（取代旧的 Excel 回写）。python-docx 本体很轻（仅带 lxml），
+# 代码里同样延迟导入：没装时拆解照跑，只在导出环节提示装本文件。
+python-docx>=1.1.0

@@ -68,6 +68,28 @@ COL_SUCCESS = "成功次数"
 COL_CANCEL = "取消次数"
 COL_SCRIPT_TEXT = "口播文案"
 
+# ---------- 爆款拆解回写列（工具中心「爆款拆解」写入任务表新增列） ----------
+COL_BK_LINK = "参考链接"
+COL_BK_HOOK = "拆解钩子"
+COL_BK_SHOTS = "拆解分镜"
+COL_BK_SCRIPT = "拆解口播"
+COL_BK_PROMPT_VISUAL = "画面提示词"
+COL_BK_PROMPT_COPY = "文案提示词"
+COL_BK_PROMPT_SHOOT = "复刻提示词"
+COL_BK_HOOK_SCORE = "钩子评分"
+COL_BK_FACTORS = "爆点因素"
+COL_BK_EMOTION = "情绪曲线"
+COL_BK_FORMULA = "内容公式"
+COL_BK_BLUEPRINT = "复刻蓝图"
+
+# 爆款拆解全部回写列（excel_utils 补列 / 写回共用这一份清单）
+BREAKDOWN_COLUMNS = [
+    COL_BK_LINK, COL_BK_HOOK, COL_BK_SHOTS, COL_BK_SCRIPT,
+    COL_BK_PROMPT_VISUAL, COL_BK_PROMPT_COPY, COL_BK_PROMPT_SHOOT,
+    COL_BK_HOOK_SCORE, COL_BK_FACTORS, COL_BK_EMOTION,
+    COL_BK_FORMULA, COL_BK_BLUEPRINT,
+]
+
 # ---------- 命名规则表列名 ----------
 COL_NAME = "姓名"
 
@@ -81,6 +103,17 @@ ASSET_DIR = str(RUNTIME_DIR)
 # ============================================================
 DOWNLOAD_DIR = _resolve_dir("output", str(RUNTIME_DIR / "outputs"))
 EXPORT_DIR = _resolve_dir("export", str(RUNTIME_DIR / "exports"))
+
+# ============================================================
+# 3.1 爆款拆解：Whisper 模型目录与临时工作目录
+#     模型不打包进 exe，首次运行下到隐藏配置家（%APPDATA%\AIGC视频助手\models）；
+#     拆解中间产物（下载的视频/关键帧/音频）落在运行目录 outputs/爆款拆解，用完即清。
+# ============================================================
+MODELS_DIR = str(CONFIG_DIR / "models")
+BREAKDOWN_TMP = str(RUNTIME_DIR / "outputs" / "爆款拆解")
+# 拆解任务库：图集/封面持久落盘的家（跨会话回看，不随 BREAKDOWN_TMP 用完即清）。
+# 每条任务一个 task_<id>/ 子目录，内含 cover.jpg + gallery/f*.jpg；DB 只存路径与 payload。
+BREAKDOWN_LIBRARY = str(RUNTIME_DIR / "outputs" / "爆款拆解" / "任务库")
 
 # ============================================================
 # 5. 日志（运行目录下自动创建 logs/）
@@ -412,3 +445,373 @@ def write_section(key, value):
     tmp.replace(CONFIG_JSON)           # 同盘 rename：不留半截文件
     global _JSON_CACHE
     _JSON_CACHE = data                 # 启动缓存跟着换，别读旧值
+
+
+# ============================================================
+# 17. 豆包（火山方舟 Vision）接入点配置：爆款拆解专用
+#     与提取接口/翻译同一套规矩：api_key 以使用人姓名(USER_NAME)为盐 Fernet
+#     加密后写进 config.json 的 doubao_vision 段（复用 material_extract 的加解密），
+#     盘上不留明文；未配姓名时退回明文兜底。占位值（<…>）视为未配置。
+# ============================================================
+DOUBAO_VISION_DEFAULTS = {
+    "api_key": "", "endpoint": "",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+}
+
+
+def _is_doubao_placeholder(v):
+    v = str(v or "").strip()
+    return not v or v.startswith("<")
+
+
+def _strip_bearer(v):
+    """剥掉误粘进 key 的 "Bearer " 前缀（大小写不敏感、允许多个）。
+
+    请求头由代码自己拼 'Authorization: Bearer {key}'；用户把整段头
+    ＂Bearer ark-xxx＂粘进输入框会变成 Bearer Bearer ark-xxx，服务端回
+    401 "The API key format is incorrect"——在读写两侧统一清洗。
+    """
+    s = str(v or "").strip()
+    while s[:7].lower() == "bearer ":
+        s = s[7:].strip()
+    return s
+
+
+def doubao_vision_config():
+    """生效的豆包接入点配置：api_key 密文用 USER_NAME 解密；占位/未配一律置空。"""
+    from video_text_tools.material_extract import decrypt_value
+    sec = read_section("doubao_vision", DOUBAO_VISION_DEFAULTS)
+    key = str(sec.get("api_key") or "").strip()
+    if key:
+        key = decrypt_value(key, USER_NAME) if key.startswith("enc:") else key
+    key = _strip_bearer(key)
+    base = str(sec.get("base_url") or DOUBAO_VISION_DEFAULTS["base_url"]).strip()
+    return {
+        "api_key": key if not _is_doubao_placeholder(key) else "",
+        "endpoint": "" if _is_doubao_placeholder(sec.get("endpoint")) else str(sec["endpoint"]).strip(),
+        "base_url": base.rstrip("/") or DOUBAO_VISION_DEFAULTS["base_url"],
+    }
+
+
+def doubao_vision_ready():
+    """是否已配齐（api_key + endpoint 都在）：GUI 首次引导据此提示。"""
+    c = doubao_vision_config()
+    return bool(c["api_key"] and c["endpoint"])
+
+
+def save_doubao_vision(api_key, endpoint, base_url=None):
+    """写回 doubao_vision 段：api_key 以 USER_NAME 为盐加密落盘（无姓名则明文兜底）。"""
+    from video_text_tools.material_extract import encrypt_value
+    sec = dict(DOUBAO_VISION_DEFAULTS)
+    sec.update({
+        "api_key": encrypt_value(_strip_bearer(api_key), USER_NAME),
+        "endpoint": (endpoint or "").strip(),
+    })
+    if base_url:
+        sec["base_url"] = base_url.strip().rstrip("/")
+    write_section("doubao_vision", sec)
+
+
+# ============================================================
+# 17.2 爆款拆解面板默认项（config.json 的 breakdown 段）
+#     vision_mode：video_url 直连（默认，整条视频一次调用、规避逐帧 429）
+#                 / frames 本地抽帧逐帧上传（传统兜底）。
+#     fps：video_url 直连时模型内部抽帧频率（方舟范围 [0.2,5]，默认 0.5）。
+#     GUI 面板初值从这里读；要改直接编辑 config.json 的 breakdown 段。
+# ============================================================
+BREAKDOWN_DEFAULTS = {"vision_mode": "video_url", "fps": 0.5}
+
+
+def breakdown_config():
+    """拆解面板默认项（清洗：模式只认 video_url/frames，fps 钳在 [0.2,5]）。"""
+    sec = read_section("breakdown", BREAKDOWN_DEFAULTS)
+    mode = str(sec.get("vision_mode") or "video_url").strip()
+    try:
+        fps = float(sec.get("fps", 0.5))
+    except (TypeError, ValueError):
+        fps = 0.5
+    return {"vision_mode": mode if mode in ("video_url", "frames") else "video_url",
+            "fps": min(5.0, max(0.2, fps))}
+
+
+# ============================================================
+# 17.5 语音纠错（DeepSeek 等 OpenAI 兼容 chat 端点）+ 领域词库
+#     asr_fix 段：识别后送大模型按语义改错别字/同音字。规矩与豆包完全一致：
+#       api_key 以 USER_NAME 为盐 Fernet 加密写盘（复用 material_extract 加解密，
+#       盘上不留明文；无姓名时明文兜底），占位值（<…>）视为未配置。
+#     asr_glossary 段：领域正确写法词表（字符串列表）。一份两用——实时识别喂
+#       whisper initial_prompt、纠错时作为“这些词的正确写法”清单送进 prompt。
+# ============================================================
+ASR_FIX_DEFAULTS = {
+    "api_key": "", "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+}
+
+
+def asr_fix_config():
+    """生效的语音纠错端点配置：api_key 密文用 USER_NAME 解密；占位/未配一律置空。"""
+    from video_text_tools.material_extract import decrypt_value
+    sec = read_section("asr_fix", ASR_FIX_DEFAULTS)
+    key = str(sec.get("api_key") or "").strip()
+    if key:
+        key = decrypt_value(key, USER_NAME) if key.startswith("enc:") else key
+    key = _strip_bearer(key)
+    base = str(sec.get("base_url") or ASR_FIX_DEFAULTS["base_url"]).strip()
+    return {
+        "api_key": key if not _is_doubao_placeholder(key) else "",
+        "model": "" if _is_doubao_placeholder(sec.get("model")) else str(sec["model"]).strip(),
+        "base_url": base.rstrip("/") or ASR_FIX_DEFAULTS["base_url"],
+    }
+
+
+def asr_fix_ready():
+    """是否已配齐（api_key + model 都在）：GUI 据此决定“纠错”能否发请求。"""
+    c = asr_fix_config()
+    return bool(c["api_key"] and c["model"])
+
+
+def save_asr_fix(api_key, model=None, base_url=None):
+    """写回 asr_fix 段：api_key 以 USER_NAME 为盐加密落盘（无姓名则明文兜底）。"""
+    from video_text_tools.material_extract import encrypt_value
+    sec = dict(ASR_FIX_DEFAULTS)
+    sec["api_key"] = encrypt_value(_strip_bearer(api_key), USER_NAME)
+    if model:
+        sec["model"] = model.strip()
+    if base_url:
+        sec["base_url"] = base_url.strip().rstrip("/")
+    write_section("asr_fix", sec)
+
+
+def _normalize_glossary(terms):
+    """词库清洗：去首尾空白、去空、去重、保序。"""
+    out, seen = [], set()
+    for t in terms or []:
+        s = str(t or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def asr_glossary_load():
+    """读 config.json 的 asr_glossary 段（每次现解析，不吃启动缓存）；返回拷贝。"""
+    v = _json_data().get("asr_glossary")
+    return _normalize_glossary(v if isinstance(v, list) else [])
+
+
+def asr_glossary_save(terms):
+    """整体替换词库（去重清洗后写回）；返回清洗后的列表。"""
+    terms = _normalize_glossary(terms)
+    write_section("asr_glossary", terms)
+    return terms
+
+
+def _iter_string_leaves(obj):
+    """递归收集 JSON 结构里的所有字符串叶子（list[str] / list[dict] / dict 都能吃到词）。"""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_string_leaves(v)
+    elif isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            yield from _iter_string_leaves(v)
+
+
+def glossary_from_file(path):
+    """从外部词表文件读词库（Excel / CSV / JSON 三格式），返回清洗去重保序后的列表。
+
+    - Excel(.xlsx/.xls) / CSV：整表逐格取非空值——单列清单＝逐行一个词，多列也一并收下；
+    - JSON：递归收集所有字符串叶子（["钙片",...]、[{"词":"钙片"}]、{"terms":[...]} 都吃）。
+    pandas 只在用到本函数时才现引入（精简包不装也不影响其它功能）。
+    """
+    ext = Path(path).suffix.lower()
+    raw = []
+    if ext == ".json":
+        data = _json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        raw = list(_iter_string_leaves(data))
+    elif ext in (".xlsx", ".xls", ".csv"):
+        import pandas as pd
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(path, header=None, dtype=str)
+        else:
+            df = None
+            # 中文单列清单下嗅探（sep=None）实测必炸「bad delimiter value」（pandas 2.3）：
+            # 显式分隔符优先，嗅探只给奇葩分隔符的文件兜底；编码仍 UTF-8/GBK 两轮。
+            for enc in ("utf-8-sig", "gbk", None):    # 中文 CSV 常见 UTF-8/GBK 两种
+                for sep in (",", ";", "\t", None):
+                    kw = {"header": None, "sep": sep, "engine": "python",
+                          "dtype": str}
+                    try:
+                        df = (pd.read_csv(path, encoding=enc, **kw) if enc
+                              else pd.read_csv(path, **kw))
+                        break
+                    except (UnicodeDecodeError, LookupError, ValueError):
+                        continue
+                if df is not None:
+                    break
+            if df is None:
+                raise ValueError("CSV 无法解析（试过 UTF-8/GBK 与逗号/分号/Tab 分隔），"
+                                 "请另存为 UTF-8 或改用 Excel/JSON")
+        for col in df.columns:
+            for v in df[col]:
+                s = "" if v is None else str(v).strip()
+                if s and s.lower() != "nan":
+                    raw.append(s)
+    else:
+        raise ValueError(f"不支持的词库文件格式：{ext or '(无扩展名)'}（请用 .xlsx/.xls/.csv/.json）")
+    return _normalize_glossary(raw)
+
+
+def glossary_to_file(path, terms):
+    """把词库写成外部文件（.xlsx / .csv / .json）；单列、逐行一个词（不带表头，
+    免导回来时把表头当成一个词）。返回清洗后的列表。"""
+    terms = _normalize_glossary(terms)
+    ext = Path(path).suffix.lower()
+    if ext == ".json":
+        Path(path).write_text(_json.dumps(terms, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+    elif ext in (".xlsx", ".xls", ".csv"):
+        import pandas as pd
+        df = pd.DataFrame({"词库": terms})
+        if ext == ".csv":
+            df.to_csv(path, index=False, header=False, encoding="utf-8-sig")
+        else:
+            df.to_excel(path, index=False, header=False)
+    else:
+        raise ValueError(f"不支持的导出格式：{ext or '(无扩展名)'}（请用 .xlsx/.csv/.json）")
+    return terms
+
+
+# ============================================================
+# 18. 一键发布：平台端点可变配置 + 各平台账号凭证
+#     publish 段：抖音等平台的端点地址/UA/签名参数名等**可变项**（web 内部端点会随
+#       平台改版变动，改配置不改代码）。一期只铺抖音，其余平台端点后期补。
+#     publish_accounts 段：一个列表，每条一个平台账号；凭证（cookie 串 / OAuth token
+#       字典）以使用人姓名(USER_NAME)为盐 Fernet 加密后存 secret_enc（复用 material_extract
+#       的加解密，盘上不留明文；无姓名时明文兜底）。读写走 publish/accounts.py 门面。
+# ============================================================
+PUBLISH_DEFAULTS = {
+    "douyin": {
+        # 创作者中心 web 内部端点：真实值后期填（占位 <...> 会被适配器判为"未配置"）
+        "upload_init_url": "",   # 申请上传（POST 视频元信息 → 返回直链 + video_uri）
+        "create_url": "",        # 创建发布（POST 标题/简介/标签/封面 + video_uri → aweme_id）
+        "user_info_url": "",     # 登录态探测（可留空：留空则跳过在线校验）
+        "post_url_base": "https://www.douyin.com/video/",
+        "user_agent": "",
+        "referer": "https://creator.douyin.com/",
+        "sign_params": {},       # a_bogus / msToken / verifyFp 等反爬参数名→值来源
+    },
+}
+
+
+def publish_config():
+    """一键发布的平台可变配置（config.json 的 publish 段，缺省回退内置默认）。"""
+    sec = read_section("publish", {})
+    out = {k: dict(v) for k, v in PUBLISH_DEFAULTS.items()}
+    for plat, vals in (sec or {}).items():
+        if isinstance(vals, dict):
+            out.setdefault(plat, {}).update(vals)
+    return out
+
+
+def _publish_accounts_raw():
+    v = _json_data().get("publish_accounts")
+    return v if isinstance(v, list) else []
+
+
+def list_publish_accounts():
+    """全部发布账号，secret 已解密回明文 dict（供 publish.accounts 组装 Account）。
+
+    每条：{id, platform, label, auth_type, secret(dict), extra(dict)}。
+    secret_enc 解不开（姓名不符/损坏）时该条 secret 置空，按未配置处理，不抛。"""
+    from video_text_tools.material_extract import decrypt_value
+    out = []
+    for e in _publish_accounts_raw():
+        if not isinstance(e, dict):
+            continue
+        enc = str(e.get("secret_enc") or "")
+        plain = decrypt_value(enc, USER_NAME) if enc else ""
+        try:
+            secret = _json.loads(plain) if plain else {}
+        except ValueError:
+            secret = {}
+        if not isinstance(secret, dict):
+            secret = {}
+        out.append({
+            "id": str(e.get("id") or ""),
+            "platform": str(e.get("platform") or ""),
+            "label": str(e.get("label") or ""),
+            "auth_type": str(e.get("auth_type") or "cookie"),
+            "secret": secret,
+            "extra": e.get("extra") if isinstance(e.get("extra"), dict) else {},
+        })
+    return out
+
+
+def save_publish_account(acct):
+    """按 id upsert 一个账号（acct 为 dict：id/platform/label/auth_type/secret/extra）。
+
+    secret（dict）序列化后以 USER_NAME 为盐加密写 secret_enc；无姓名则明文兜底。
+    id 为空时自动生成。返回最终 id。"""
+    from video_text_tools.material_extract import encrypt_value
+    import uuid
+    acct_id = str(acct.get("id") or "") or uuid.uuid4().hex[:12]
+    secret = acct.get("secret") or {}
+    blob = _json.dumps(secret, ensure_ascii=False)
+    entry = {
+        "id": acct_id,
+        "platform": str(acct.get("platform") or ""),
+        "label": str(acct.get("label") or ""),
+        "auth_type": str(acct.get("auth_type") or "cookie"),
+        "secret_enc": encrypt_value(blob, USER_NAME),
+        "extra": acct.get("extra") if isinstance(acct.get("extra"), dict) else {},
+    }
+    items = [e for e in _publish_accounts_raw() if isinstance(e, dict)]
+    items = [e for e in items if str(e.get("id") or "") != acct_id]
+    items.append(entry)
+    write_section("publish_accounts", items)
+    return acct_id
+
+
+def delete_publish_account(acc_id):
+    """按 id 删除一个账号；返回是否删掉了。"""
+    items = [e for e in _publish_accounts_raw() if isinstance(e, dict)]
+    kept = [e for e in items if str(e.get("id") or "") != str(acc_id)]
+    if len(kept) == len(items):
+        return False
+    write_section("publish_accounts", kept)
+    return True
+
+
+# ============================================================
+# 19. 录屏字幕：默认样式与处理参数（无新增凭证）
+#     subtitle 段：默认模型档位 + 字幕基础样式（前景/描边/位置/卖点强调色…）+
+#       烧录产物后缀。Whisper 模型目录复用 MODELS_DIR，卖点高亮/字幕检测复用
+#       doubao_vision 段——都不在这里另存密钥。可变项走界面/本段配置，改配不改代码。
+# ============================================================
+SUBTITLE_DEFAULTS = {
+    "model_size": "medium",
+    "output_suffix": "_字幕",
+    "highlight_enabled": False,
+    "default_style": {
+        "font_size": 16, "primary": "#FFFFFF", "outline": "#000000",
+        "back": "#00000000", "align": "bottom", "margin_v": 40,
+        "highlight": "#FFD400", "max_chars": 18,
+    },
+}
+
+
+def subtitle_config():
+    """生效的录屏字幕配置（config.json 的 subtitle 段，缺省回退内置默认）。
+
+    default_style 做一层深合并：用户只改某几个样式键时，其余仍走默认。"""
+    sec = read_section("subtitle", {})
+    out = {k: (dict(v) if isinstance(v, dict) else v)
+           for k, v in SUBTITLE_DEFAULTS.items()}
+    for k, v in (sec or {}).items():
+        if k == "default_style" and isinstance(v, dict):
+            out["default_style"].update(v)
+        else:
+            out[k] = v
+    return out

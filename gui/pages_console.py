@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QAbstractItemView, QScrollArea, QGridLayout,
                                QSizePolicy, QGraphicsDropShadowEffect)
 
-from gui.header import page_header, LightDot, LIGHT_KIND_COLOR, FS_WEAK
+from gui.header import page_header, LightDot, LIGHT_KIND_COLOR, FS_WEAK, Card
 
 SRV_HEADERS = ["线路", "状态", "并发上限", "负载(实时)"]
 LIST_HEADERS = ["线路", "状态", "本机在跑", "并发上限", "空余", "连续失败", "云端负载"]
@@ -286,7 +286,7 @@ class ConsolePage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 12, 24, 16)
+        lay.setContentsMargins(24, 14, 24, 16)
         lay.setSpacing(14)
 
         top = QHBoxLayout()
@@ -353,8 +353,11 @@ class ConsolePage(QWidget):
             lsh.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             self.list_table.setColumnWidth(c, w)
         lsh.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.list_table.setVisible(False)
-        lay.addWidget(self.list_table, 1)
+        # 详细列表包进白卡（与卡片网格视图同一视觉）；显隐由 list_card 统一控制
+        self.list_card = Card(margins=(12, 10, 12, 10))
+        self.list_card.v.addWidget(self.list_table)
+        self.list_card.setVisible(False)
+        lay.addWidget(self.list_card, 1)
 
         from store import app_state
         v = app_state.get("console_view", "grid")
@@ -366,7 +369,9 @@ class ConsolePage(QWidget):
         self._gateway = GATEWAY_MODE
         self.srv_table = None
         if GATEWAY_MODE:
-            lay.addWidget(QLabel("云端线路池（由网关统一调度，仅展示）："))
+            srv_card = Card(margins=(16, 14, 16, 12))
+            srv_card.v.setSpacing(10)
+            srv_card.v.addWidget(QLabel("云端线路池（由网关统一调度，仅展示）："))
             self.srv_table = QTableWidget(0, len(SRV_HEADERS))
             self.srv_table.setHorizontalHeaderLabels(SRV_HEADERS)
             self.srv_table.setAlternatingRowColors(True)
@@ -379,7 +384,8 @@ class ConsolePage(QWidget):
                 self.srv_table.setColumnWidth(c, w)
             sh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             self.srv_table.setMaximumHeight(220)
-            lay.addWidget(self.srv_table)
+            srv_card.v.addWidget(self.srv_table)
+            lay.addWidget(srv_card)
 
         self._cloud = {}   # name -> (负载, 来源) or None
 
@@ -401,7 +407,7 @@ class ConsolePage(QWidget):
         self._b_view.setText("☰ 详细列表" if block else "▦ 卡片网格")
         self._b_view.setToolTip("切成紧凑列表：每线路一行" if block else "切成多列自适应卡片")
         self.scroll.setVisible(block)
-        self.list_table.setVisible(not block)
+        self.list_card.setVisible(not block)
         self._last_cols = None
         self._regrid()
 

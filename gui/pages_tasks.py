@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, Q
                                QMenu, QMessageBox, QFileDialog, QAbstractItemView,
                                QLineEdit, QDateEdit, QCheckBox, QInputDialog, QFrame,
                                QDialog, QDialogButtonBox, QFormLayout,
-                               QGroupBox, QGraphicsOpacityEffect)
+                               QGroupBox, QGraphicsOpacityEffect,
+                               QListWidget, QListWidgetItem, QScrollArea)
 
 from registry.manager import REG, ACCOUNTS, BatchBalancer, is_active
 from core.config import DEFAULT_STEPS, SUBMIT_PACING, BALANCE_RESCAN_EVERY
@@ -29,9 +30,8 @@ from gui.dialogs import (TaskDialog, FindReplaceDialog, ForceRerunDialog,
 from gui.delegates import ProgressDelegate, ProgressRole
 from gui.formatting import secs
 from gui.widgets import VideoPlayerDialog, HoverPreview, Toast, FlowLayout
-from gui.header import page_header
-from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
-                          SecsItem)
+from gui.header import page_header, Card, kpi_row
+from gui.tablekit import apply_field_layout, enable_drag_with_lock, SecsItem
 
 STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
                  "cancelled": "#8F959E", "submitted": "#3370FF", "queued": "#3370FF",
@@ -433,17 +433,191 @@ class FilterPanel(QWidget):
         self._page.refresh()
 
 
+class FieldPanel(QWidget):
+    """⚟ 字段管理：快捷筛选条下方就地展开的内嵌面板（取代旧模态弹窗）。
+
+    左侧＝字段按分类勾选显示/隐藏，右侧＝已显示字段的顺序预览（内部拖拽调序＝
+    表格列的「预计排序」）。任一处改动即时套用到底部表格并持久化，与「更多筛选」
+    同款所见即所得；也可直接回表格上拖表头调序（下次展开面板会同步过来）。"""
+    # 分类 -> 字段名（须与 DATA_HEADERS 一一对应，覆盖全部可管理列）
+    _CATEGORIES = [
+        ("基础信息", ["任务ID", "编号", "品名", "标签", "备注"]),
+        ("文案素材", ["脚本", "提示词", "口播文案", "分镜数"]),
+        ("执行状态", ["状态", "时长", "生成用时", "排队", "账号", "运行", "成功", "取消"]),
+        ("时间输出", ["更新时间", "输出文件"]),
+        ("技术字段", ["job_id", "URL"]),
+    ]
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self._page = page
+        self._syncing = False
+        self._title = {}       # 逻辑列号 -> 字段名
+        self._chips = {}       # 逻辑列号 -> QPushButton
+        self.setObjectName("Card")
+        # 子类不自开 WA_StyledBackground，不补这行 QSS 白底画不出来
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        name2col = {name: i + 1 for i, name in enumerate(DATA_HEADERS)}   # 逻辑 0 是勾选列
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(8)
+        trow = QHBoxLayout()
+        tip = QLabel("左侧勾选要显示的字段 · 右侧拖动调整列顺序 · 改动即时生效（也可直接拖表头）")
+        tip.setObjectName("PageTip")
+        trow.addWidget(tip)
+        trow.addStretch(1)
+        b_reset = QPushButton("↺ 恢复默认")
+        b_reset.setObjectName("GhostBtn")
+        b_reset.setToolTip("列序回到默认、技术字段（job_id/URL）重新收起")
+        b_reset.clicked.connect(self._reset_default)
+        trow.addWidget(b_reset)
+        v.addLayout(trow)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        # ---------- 左：分类勾选（显示 / 隐藏）----------
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
+        for label, names in self._CATEGORIES:
+            box = QGroupBox(label)
+            bv = QVBoxLayout(box)
+            bv.setContentsMargins(8, 6, 8, 8)
+            flow = FlowLayout(hgap=6, vgap=6)
+            for name in names:
+                col = name2col[name]
+                self._title[col] = name
+                b = QPushButton(name)
+                b.setObjectName("ChipBtn")
+                b.setCheckable(True)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setToolTip("点亮＝在表格中显示这一列，再点取消＝隐藏")
+                b.clicked.connect(lambda _c=False, c=col: self._on_toggle(c))
+                flow.addWidget(b)
+                self._chips[col] = b
+            bv.addLayout(flow)
+            lv.addWidget(box)
+        lv.addStretch(1)
+        lscroll = QScrollArea()
+        lscroll.setWidgetResizable(True)
+        lscroll.setFrameShape(QFrame.Shape.NoFrame)
+        lscroll.setWidget(left)
+        lscroll.setFixedWidth(360)
+        lscroll.setMaximumHeight(240)
+        body.addWidget(lscroll)
+        # ---------- 右：顺序预览（拖拽调序 = 表格列的预计排序）----------
+        rbox = QVBoxLayout()
+        rbox.setSpacing(4)
+        rlabel = QLabel("已显示字段 · 上下拖动调整列顺序")
+        rlabel.setObjectName("PageTip")
+        rbox.addWidget(rlabel)
+        self.lst = QListWidget()
+        self.lst.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.lst.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.lst.setMaximumHeight(240)
+        self.lst.setToolTip("这里就是表格列的最终顺序预览：拖动条目即可调整，松手立即生效")
+        self.lst.model().rowsMoved.connect(self._on_reorder)
+        rbox.addWidget(self.lst)
+        body.addLayout(rbox, 1)
+        v.addLayout(body)
+
+    # ---------- 同步 ----------
+    def reload(self):
+        """展开时按当前表格列序/显隐，回勾左侧分类胶囊 + 重建右侧顺序"""
+        table = self._page.table
+        h = table.horizontalHeader()
+        n = table.columnCount()
+        order = [lg for lg in (h.logicalIndex(i) for i in range(1, n))
+                 if lg in self._chips and not table.isColumnHidden(lg)]
+        hidden = {lg for lg in range(1, n) if table.isColumnHidden(lg)}
+        self._syncing = True
+        for col, b in self._chips.items():
+            b.setChecked(col not in hidden)
+        self.lst.clear()
+        for col in order:
+            self._add_item(col)
+        self._syncing = False
+
+    def _add_item(self, col):
+        it = QListWidgetItem(self._title.get(col, str(col)))
+        it.setData(Qt.ItemDataRole.UserRole, col)
+        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsDragEnabled)
+        self.lst.addItem(it)
+
+    def _row_of(self, col):
+        for i in range(self.lst.count()):
+            if self.lst.item(i).data(Qt.ItemDataRole.UserRole) == col:
+                return i
+        return None
+
+    def _on_toggle(self, col):
+        """左侧勾选变化：即时增删右侧条目并套用"""
+        if self._syncing:
+            return
+        vis = self._chips[col].isChecked()
+        row = self._row_of(col)
+        self._syncing = True
+        if vis and row is None:
+            self._add_item(col)
+        elif not vis and row is not None:
+            self.lst.takeItem(row)
+        self._syncing = False
+        self._apply()
+
+    def _on_reorder(self, *_a):
+        """右侧拖拽调序：延迟一帧读最终顺序再套用（避免拖拽过程中重入）"""
+        if self._syncing:
+            return
+        QTimer.singleShot(0, self._apply)
+
+    def _current_layout(self):
+        order = [self.lst.item(i).data(Qt.ItemDataRole.UserRole)
+                 for i in range(self.lst.count())]
+        hidden = {c for c in self._chips if c not in order}
+        return order, hidden
+
+    def _apply(self):
+        """把右侧顺序 + 左侧显隐落到表格并持久化（所见即所得）"""
+        order, hidden = self._current_layout()
+        apply_field_layout(self._page.table, order, hidden, first_locked=1)
+        app_state.set_value("tasks_fields",
+                            {"order": list(order), "hidden": sorted(hidden)})
+
+    def _reset_default(self):
+        """恢复默认：自然列序、技术字段（job_id/URL）重新收起"""
+        order = list(range(1, len(DATA_HEADERS) + 1))
+        hidden = set(DEFAULT_HIDDEN)
+        apply_field_layout(self._page.table, order, hidden, first_locked=1)
+        app_state.set_value("tasks_fields",
+                            {"order": order, "hidden": sorted(hidden)})
+        self.reload()
+
+
 class TasksPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 12, 24, 12)
-        lay.setSpacing(6)
+        lay.setContentsMargins(24, 14, 24, 12)
+        lay.setSpacing(12)
 
-        # 顶部那行长操作提示删了（清爽优先）：点击/快捷键行为在首次引导
-        # 与各按钮 tooltip 里都有；页头右侧改常驻「本次默认参数」淡红概要
+        # 对标数据中台的视觉层次：页头 → 一排 KPI 概览 → 白卡分组的「控制区
+        # + 表格内容区」，而不是把工具条/筛选/表格裸摆在灰底上。
         hdr = page_header("任务中心", icon="📋")
         lay.addWidget(hdr)
+
+        # ---------- 顶部 KPI 概览（总任务/待执行/进行中/成功/失败，随 refresh 更新）----------
+        self._kpi_lay, self._kpi_cards = kpi_row([
+            ("总任务", "📦", "#3370FF"), ("待执行", "🗒", "#8F959E"),
+            ("进行中", "⏳", "#FF8D19"), ("成功", "✓", "#00B96B"),
+            ("失败", "✕", "#F54A45"),
+        ], spacing=12, min_width=118)
+        self.k_total, self.k_pending, self.k_run, self.k_ok, self.k_fail = self._kpi_cards
+        lay.addLayout(self._kpi_lay)
+
+        # ---------- 控制区卡片：工具栏 / 搜索 / 快捷筛选 / 内嵌筛选面板收进一张白卡 ----------
+        ctrl = Card(margins=(14, 12, 14, 12))
+        ctrl.v.setSpacing(10)
 
         # ---------- 工具栏 ----------
         bar = QHBoxLayout()
@@ -458,23 +632,24 @@ class TasksPage(QWidget):
         self._io_menu = self._build_io_menu()
         b_io.clicked.connect(
             lambda: self._io_menu.exec(b_io.mapToGlobal(QPoint(0, b_io.height()))))
-        b_fields = QPushButton("⚟ 字段管理")
-        b_fields.setObjectName("GhostBtn")
-        b_fields.setToolTip("控制显示哪些列，拖动表头可直接调整列顺序")
         # 成品整理（清理不可用 / 清理未批准 / 批量归档）合成一个下拉菜单按钮：
         # 同样避开 setMenu+全局样式的坑，用 clicked 手动 exec
         b_tidy = QPushButton("🧹 成品整理")
         self._tidy_menu = self._build_tidy_menu()
         b_tidy.clicked.connect(
             lambda: self._tidy_menu.exec(b_tidy.mapToGlobal(QPoint(0, b_tidy.height()))))
-        for b in (b_cancel, b_del, b_io, b_fields, b_tidy):
+        # 字幕处理：对勾选成品批量走录屏字幕模块（生成/检测/高亮/烧录）
+        b_sub = QPushButton("🔤 字幕处理")
+        b_sub.setToolTip("给勾选的成品视频批量生成字幕 / 烧录（复用录屏字幕模块）")
+        b_sub.clicked.connect(self._subtitle_batch)
+        for b in (b_cancel, b_del, b_io, b_tidy, b_sub):
             b.setObjectName("GhostBtn")
         for b in (b_new, b_run, b_runall, b_scan, b_cancel, b_del,
-                  b_io, b_fields, b_tidy):
+                  b_io, b_tidy, b_sub):
             bar.addWidget(b)
         # 留存几个引导/快捷键目标（首次上手气泡、顶部待办数量都要用）
         self.b_new, self.b_run, self.b_io = b_new, b_run, b_io
-        self.b_runall, self.b_fields = b_runall, b_fields
+        self.b_runall = b_runall
         bar.addStretch(1)
         # 时长/步数/KOL 收进「⚙ 参数管理」弹窗：工具栏只留入口 + 常驻概要；
         # 三个下拉仍是本页控件（提交/持久化逻辑沿用），只是被 ParamsDialog 收养
@@ -513,7 +688,7 @@ class TasksPage(QWidget):
         self._params_an.setStartValue(0.25)
         self._params_an.setEndValue(1.0)
         self._params_an.setEasingCurve(QEasingCurve.Type.OutCubic)
-        lay.addLayout(bar)
+        ctrl.v.addLayout(bar)
         self._restore_exec_params()          # 沿用上次用过的时长/步数/KOL
 
         # ---------- 搜索 + 已生效筛选概要 ----------
@@ -539,7 +714,7 @@ class TasksPage(QWidget):
         self.lbl_count = QLabel("")
         self.lbl_count.setObjectName("PageTip")
         fbar.addWidget(self.lbl_count)
-        lay.addLayout(fbar)
+        ctrl.v.addLayout(fbar)
 
         # ---------- 快捷筛选标签 + 「更多筛选」展开入口 ----------
         chbar = QHBoxLayout()
@@ -563,17 +738,42 @@ class TasksPage(QWidget):
         self.b_more.clicked.connect(lambda: self._toggle_filter_panel())
         chbar.addWidget(self.b_more)
         chbar.addStretch(1)
-        lay.addLayout(chbar)
+        # 「⚟ 字段管理」挪到快捷筛选这一行的最右端：与「更多筛选」同款胶囊入口，
+        # 点击在下方就地展开「左分类 / 右排序预览」面板（取代原来的模态弹窗）
+        self.b_fields = QPushButton("⚟ 字段管理 ▾")
+        self.b_fields.setObjectName("ChipBtn")
+        self.b_fields.setProperty("accent", "1")
+        self.b_fields.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.b_fields.setToolTip("就地展开：左侧按分类勾选要显示的字段，右侧拖动预览并调整列顺序<br>"
+                                 "改动即时生效，也可直接拖动表头调序（设置会被记住）")
+        self.b_fields.clicked.connect(lambda: self._toggle_field_panel())
+        chbar.addWidget(self.b_fields)
+        ctrl.v.addLayout(chbar)
 
         # ---------- 内嵌筛选面板：默认收起，展开时把表格整体下推 ----------
         self.filter_panel = FilterPanel(self)
         self.filter_panel.setVisible(False)
         self.filter_panel.setMaximumHeight(0)
-        lay.addWidget(self.filter_panel)
+        ctrl.v.addWidget(self.filter_panel)
         self._panel_an = QPropertyAnimation(self.filter_panel, b"maximumHeight", self)
         self._panel_an.setDuration(180)
         self._panel_an.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._panel_an.finished.connect(self._panel_an_done)
+
+        # ---------- 内嵌字段管理面板：默认收起，展开时把表格整体下推 ----------
+        self.field_panel = FieldPanel(self)
+        self.field_panel.setVisible(False)
+        self.field_panel.setMaximumHeight(0)
+        ctrl.v.addWidget(self.field_panel)
+        self._fpanel_an = QPropertyAnimation(self.field_panel, b"maximumHeight", self)
+        self._fpanel_an.setDuration(180)
+        self._fpanel_an.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fpanel_an.finished.connect(self._fpanel_an_done)
+        lay.addWidget(ctrl)
+
+        # ---------- 内容区卡片：表格 + 分页栏收进一张白卡 ----------
+        content = Card(margins=(12, 10, 12, 10))
+        content.v.setSpacing(8)
 
         # ---------- 表格 ----------
         self.table = QTableWidget(0, len(HEADERS))
@@ -615,7 +815,7 @@ class TasksPage(QWidget):
         self.table.viewport().installEventFilter(self)
         self.table.installEventFilter(self)      # 空格键弹全文预览用
         self._tag_editor = None                  # 当前内联标签下拉（非 None 时暂停重建表）
-        lay.addWidget(self.table)
+        content.v.addWidget(self.table, 1)
         self._build_empty_state()        # 空表时盖在表格上的引导层（导入/新建 或 清除筛选）
 
         # ---------- 分页栏 ----------
@@ -648,7 +848,8 @@ class TasksPage(QWidget):
         pbar.addSpacing(12)
         pbar.addWidget(QLabel("每页"))
         pbar.addWidget(self.cb_psize)
-        lay.addLayout(pbar)
+        content.v.addLayout(pbar)
+        lay.addWidget(content, 1)
 
         self.lbl_tip = QLabel("")
         self.lbl_tip.setObjectName("InlineTip")
@@ -674,6 +875,7 @@ class TasksPage(QWidget):
         self._expect_done = False    # 提交后等待完成通知
         self._filters = _empty_filters()   # 筛选条件集（多条件×多选），空=不限
         self._panel_open = False       # 「⚟ 更多筛选」内嵌面板是否展开
+        self._fpanel_open = False      # 「⚟ 字段管理」内嵌面板是否展开
         self._last_view_sig = None   # 上次刷新的视图指纹（未变则跳过重建）
         self._last_data_sig = None   # 上次刷新的数据指纹（库写入 + 内存在途态）
 
@@ -683,7 +885,6 @@ class TasksPage(QWidget):
         b_run.clicked.connect(lambda: self._run(True))
         b_runall.clicked.connect(lambda: self._run(False))
         b_scan.clicked.connect(self._scan_new)
-        b_fields.clicked.connect(self._manage_fields)
         self._restore_field_layout()      # 沿用上次列宽/列序/显隐
         self._setup_shortcuts()           # A4：常用键盘快捷键
         self._arm_first_hints()           # C2：关键按钮首次悬停多讲一句
@@ -822,6 +1023,36 @@ class TasksPage(QWidget):
         p = getattr(self, "filter_panel", None)
         if p is not None and self._panel_open and p.isVisible():
             p.reload()
+
+    def _toggle_field_panel(self, show=None):
+        """「⚟ 字段管理」：在快捷筛选条下方就地展开/收起（取代旧模态弹窗），
+        展开时把表格整体下推；面板内改动即时套用到表格。"""
+        p = self.field_panel
+        on = (not self._fpanel_open) if show is None else show
+        if on == self._fpanel_open:
+            return
+        self._fpanel_open = on
+        if on:
+            p.reload()               # 展开前按当前列布局回勾
+            p.setVisible(True)
+        self._fpanel_an.stop()
+        self._fpanel_an.setStartValue(p.height() if p.maximumHeight() == 16777215
+                                      else p.maximumHeight())
+        self._fpanel_an.setEndValue(max(p.sizeHint().height(), 260) if on else 0)
+        self._fpanel_an.start()
+        self._update_field_label()
+
+    def _fpanel_an_done(self):
+        """字段面板动画收尾：展开后放开高度上限跟随内容，收起则隐藏"""
+        if self._fpanel_open:
+            self.field_panel.setMaximumHeight(16777215)
+        else:
+            self.field_panel.setVisible(False)
+
+    def _update_field_label(self):
+        """刷新「⚟ 字段管理」按钮文字里的展开箭头"""
+        arrow = "▴" if self._fpanel_open else "▾"
+        self.b_fields.setText(f"⚟ 字段管理 {arrow}")
 
     # 快捷标签：一键套用常用条件（与「⚟ 更多筛选」面板共用同一 _filters 状态）
     _QUICK_GROUPS = [("待执行", "pending"), ("进行中", "running"),
@@ -1098,6 +1329,7 @@ class TasksPage(QWidget):
         self.table.itemDelegate().set_anim_enabled(has_bar)
 
         self.lbl_count.setText(f"显示 {len(self._filtered)}/{len(df)} 条")
+        self._update_kpis(df, actives)                  # 顶部 KPI 概览跟全量任务走（不受筛选影响）
         self._update_empty(len(df), len(self._filtered))   # 无任务/无命中时给引导，别让界面一片空白
         self.lbl_page.setText(f"第 {self._page} / {self._page_count()} 页")
         self.b_prev.setEnabled(self._page > 1)
@@ -1335,6 +1567,26 @@ class TasksPage(QWidget):
         self.lbl_params.setText(f"本次默认：{dur}秒 · {steps}步 · {kol}")
         self._params_an.stop()
         self._params_an.start()      # 淡入脉冲：参数一变就把视线拉过来
+
+    def _update_kpis(self, df, actives):
+        """顶部指标带：总任务/待执行/进行中/成功/失败，口径与表格一致。
+
+        吃全量 df（不按当前筛选过滤），否则一筛就“只剩几条”会让人误以
+        为任务变少了；「进行中」用内存 REG 的实时在途数，与状态列改写同口径。"""
+        n_ok = n_fail = n_pending = 0
+        for _, row in df.iterrows():
+            s = str(row["状态"]).strip()
+            if s in ("completed", "succeeded"):
+                n_ok += 1
+            elif s in ("failed", "error", "timeout"):
+                n_fail += 1
+            elif not s:
+                n_pending += 1
+        self.k_total.set_value(len(df))
+        self.k_pending.set_value(n_pending)
+        self.k_run.set_value(len(actives))
+        self.k_ok.set_value(n_ok)
+        self.k_fail.set_value(n_fail)
 
     def _update_run_summary(self, actives):
         # A2：把「执行全部」的口径写成实时数量（当前筛选下填了提示词的）
@@ -1900,6 +2152,46 @@ class TasksPage(QWidget):
             self.lbl_tip.setText(msg)
         self.refresh()
 
+    def _subtitle_batch(self):
+        """字幕处理：对勾选的成品视频批量生成字幕 / 抽帧检测 / 高亮 / 烧录。
+
+        取当前表里勾选行且有成品文件的；先弹字幕选项收参数（默认勾选“检测已有字
+        幕”），再后台 run_subtitle 跑一批，结束汇总“已生成/已跳过/失败”（不静默）。"""
+        rows = [r for r in range(self.table.rowCount())
+                if self.table.item(r, CHECK_COL)
+                and self.table.item(r, CHECK_COL).checkState() == Qt.CheckState.Checked]
+        paths = [self._cell_path(r) for r in rows]
+        paths = [p for p in paths if p and Path(p).is_file()]
+        if not paths:
+            QMessageBox.information(
+                self, "提示", "请先勾选含成品文件的任务行（成品需已下载到本地）")
+            return
+        from gui.dialogs_subtitle import ask_subtitle_options, run_subtitle
+        from video_text_tools.subtitle.models import SubtitleOptions
+        from core.logger import log
+        opts = ask_subtitle_options(self, options=SubtitleOptions(detect=True))
+        if opts is None:
+            return
+        self.lbl_tip.setText(f"🔤 字幕处理中：{len(paths)} 个视频…")
+
+        def done(results):
+            skip = sum(1 for r in results if r.ok and "已含字幕" in str(r.message))
+            fail = [r for r in results if not r.ok]
+            made = sum(1 for r in results if r.ok) - skip
+            msg = (f"🔤 字幕：已生成 {made} / 跳过(已含字幕) {skip} / "
+                   f"失败 {len(fail)}，共 {len(results)}")
+            self.lbl_tip.setText(msg)
+            self.refresh()
+            if fail:
+                detail = "\n".join(f"  · {r.name}：{r.message}" for r in fail[:8])
+                if len(fail) > 8:
+                    detail += f"\n  …… 另外 {len(fail) - 8} 个"
+                QMessageBox.warning(self, "部分字幕处理失败",
+                                    f"{msg}\n\n失败明细：\n{detail}")
+
+        run_subtitle(self, paths, opts, on_done=done,
+                     on_log=lambda m: log.info("[字幕] %s", m))
+
     def _on_context_menu(self, pos):
         """表格右键菜单：播放/定位/复制/标记 · 编辑/备注/检测/删除"""
         idx = self.table.indexAt(pos)
@@ -2020,20 +2312,6 @@ class TasksPage(QWidget):
         else:
             self.lbl_tip.setText(f"⏹ {n_task} 个任务的 {ok} 个执行均已发送取消请求，等待云端确认…")
         self.refresh()
-
-    def _manage_fields(self):
-        """字段管理：所有列表字段都在此显示/隐藏；顺序可在此拖，也可直接拖表头"""
-        h = self.table.horizontalHeader()
-        order = [h.logicalIndex(v) for v in range(1, self.table.columnCount())]
-        hidden = {c for c in order if self.table.isColumnHidden(c)}
-        cols = [(i, DATA_HEADERS[i - 1]) for i in range(1, len(HEADERS))]
-        d = FieldManagerDialog(self, cols, order, hidden)
-        if d.exec():
-            apply_field_layout(self.table, d.order, d.hidden, first_locked=1)
-            # 不存就会踩坑：每次开软件都要重新藏一遍 job_id/URL、重新拖一次列序
-            app_state.set_value("tasks_fields",
-                                {"order": list(d.order),
-                                 "hidden": sorted(d.hidden)})
 
     def _restore_field_layout(self):
         """启动时恢复列布局；没存过时把技术字段（job_id/URL）默认收起。

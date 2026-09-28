@@ -135,7 +135,8 @@ def _trash_osascript(files):
         script = 'tell application "Finder" to delete (POSIX file {} as alias)'.format(
             '"' + str(f).replace('"', '\\"') + '"')
         r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30,
+                           encoding="utf-8", errors="replace")
         if r.returncode == 0:
             ok.append(f)
         else:
@@ -150,7 +151,8 @@ def _trash_linux(files):
             continue
         ok, failed = [], []
         for f in files:
-            r = subprocess.run(cmd + [f], capture_output=True, text=True)
+            r = subprocess.run(cmd + [f], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
             if r.returncode == 0:
                 ok.append(f)
             else:
@@ -234,7 +236,8 @@ def _copy_files_osascript(files):
     script = 'set the clipboard to (POSIX file "{}")'.format(
         str(files[0]).replace('"', '\\"'))
     r = subprocess.run(["osascript", "-e", script],
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, timeout=30,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         return False, ((r.stderr or r.stdout or "osascript 失败").strip()
                        or "系统剪贴板不可用")[:120]
@@ -248,7 +251,8 @@ def _copy_files_xclip(files):
         return False, "本机没装 xclip，无法把文件放进剪贴板"
     uri = "\n".join(Path(f).absolute().as_uri() for f in files) + "\n"
     r = subprocess.run(["xclip", "-selection", "clipboard", "-t", "text/uri-list"],
-                       input=uri.encode("utf-8"), capture_output=True, text=True)
+                       input=uri.encode("utf-8"), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         return False, (r.stderr or "xclip 失败").strip()[:120]
     return True, f"已复制 {len(files)} 个文件到剪贴板"

@@ -111,6 +111,49 @@ class _ComboTweak(QObject):
                       for i in range(combo.count())), default=0)
         # 左右内边距 + 滚动条/边框余量；不小于 combo 本体宽度
         view.setMinimumWidth(max(widest + 40, combo.width()))
+        self._polish_popup(view)
+
+    # 弹层本体级兜底：Windows 深色模式下，app 级 QSS 的 background(-color) 常被
+    # 原生弹层样式盖成黑底（与 QToolTip 同一个坑，见下方 QToolTip 注释）。趁 view
+    # 的 Show 事件给它本体钉一层控件级浅色样式 + 局部 palette——控件自己的样式表
+    # 优先级最高，原生盖不掉，全站下拉弹层一次性拉回浅色。
+    _VIEW_QSS = (
+        "QAbstractItemView{background-color:#FFFFFF; color:#1F2329;"
+        " border:1px solid #E5E7EB; border-radius:8px; outline:none;"
+        " selection-background-color:#EAF1FF; selection-color:#3370FF;}"
+        "QAbstractItemView::item{background-color:transparent; color:#1F2329;"
+        " min-height:30px; padding:2px 12px;}"
+        "QAbstractItemView::item:hover,QAbstractItemView::item:selected"
+        "{background-color:#EAF1FF; color:#3370FF;}")
+
+    def _polish_popup(self, view):
+        if getattr(view, "_aigc_polished", False):
+            return
+        view._aigc_polished = True
+        view.setStyleSheet(self._VIEW_QSS)
+        from PySide6.QtGui import QPalette, QColor
+        pal = view.palette()
+        for role, col in ((QPalette.ColorRole.Base, "#FFFFFF"),
+                          (QPalette.ColorRole.Text, "#1F2329"),
+                          (QPalette.ColorRole.Window, "#FFFFFF"),
+                          (QPalette.ColorRole.WindowText, "#1F2329"),
+                          (QPalette.ColorRole.Highlight, "#3370FF"),
+                          (QPalette.ColorRole.HighlightedText, "#FFFFFF")):
+            pal.setColor(role, QColor(col))
+        view.setPalette(pal)
+        vp = view.viewport()
+        if vp is not None:
+            vp.setPalette(pal)
+        # 弹层容器（QComboBoxPrivateContainer）是独立顶层窗口：view 没铺满的
+        # 边缘/圆角外一圈会按容器自己的 palette 画——一并钉成浅色，免得漏黑边
+        container = view.window()
+        if container is not None and container is not view:
+            cpal = container.palette()
+            for role, col in ((QPalette.ColorRole.Window, "#FFFFFF"),
+                              (QPalette.ColorRole.Base, "#FFFFFF"),
+                              (QPalette.ColorRole.WindowText, "#1F2329")):
+                cpal.setColor(role, QColor(col))
+            container.setPalette(cpal)
 
 
 class _TipPolish(QObject):
@@ -191,14 +234,14 @@ QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center r
     width: 24px; border: none; background: transparent; }
 QComboBox::down-arrow { image: none; width: 0; height: 0; border: none; }
 QComboBox QAbstractItemView {
-    background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px;
-    padding: 0; outline: none;
+    background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px;
+    padding: 0; outline: none; color: #1F2329;
     selection-background-color: #EAF1FF; selection-color: #3370FF; }
 QComboBox QAbstractItemView::item {
     min-height: 30px; padding: 2px 12px;
-    background: transparent; color: #1F2329; }
+    background-color: transparent; color: #1F2329; }
 QComboBox QAbstractItemView::item:hover,
-QComboBox QAbstractItemView::item:selected { background: #EAF1FF; color: #3370FF; }
+QComboBox QAbstractItemView::item:selected { background-color: #EAF1FF; color: #3370FF; }
 
 /* 数字/日期编辑：与 QLineEdit 同款外观；原生的方形箭头按钮换成
    无边框小按钮 + 矢量小箭头（image 由 @UP@/@DOWN@ 注入）。

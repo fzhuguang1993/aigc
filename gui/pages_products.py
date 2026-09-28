@@ -4,14 +4,16 @@ gui/pages_products.py —— 产品中心（树状素材库）
 右侧详情：三类素材以相册式手风琴分区展示（默认展开参考图，展开一个自动收起其余）。
 提交任务时按品名自动取参考图；KOL 按名称取形象图。
 """
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, Signal
-from PySide6.QtGui import QPixmap, QColor, QIcon
+from PySide6.QtGui import QPixmap, QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTreeWidget, QTreeWidgetItem, QSplitter, QInputDialog,
                                QLineEdit, QMessageBox, QFileDialog, QMenu, QListWidget,
-                               QListWidgetItem, QAbstractItemView)
+                               QListWidgetItem, QAbstractItemView, QApplication)
 
 from store import product_store as ps
 from utils.desktop_utils import open_path, reveal_in_folder
@@ -131,11 +133,11 @@ class ProductsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 12, 24, 12)
+        lay.setContentsMargins(24, 14, 24, 12)
         lay.setSpacing(8)
 
         lay.addWidget(page_header("产品中心",
-                                  "树状管理素材 · 双击预览 · 支持从资源管理器拖拽文件入库",
+                                  "树状管理素材 · 双击预览 · 拖拽入库 · 剪贴板 Ctrl+V 粘贴图片",
                                   icon="🧩"))
 
         bar = QHBoxLayout()
@@ -150,7 +152,10 @@ class ProductsPage(QWidget):
         self.lbl_hint = QLabel("")
         self.lbl_hint.setObjectName("PageTip")
         bar.addWidget(self.lbl_hint)
-        lay.addLayout(bar)
+        # 工具条收进一张白卡（对标数据中台的分区卡），不再裸摆在灰底上
+        ctrl = Card(margins=(14, 10, 14, 10))
+        ctrl.v.addLayout(bar)
+        lay.addWidget(ctrl)
 
         split = QSplitter()
         lay.addWidget(split, 1)
@@ -168,7 +173,11 @@ class ProductsPage(QWidget):
         self.tree.currentItemChanged.connect(self._on_pick)
         self.tree.itemDoubleClicked.connect(self._on_double)
         self.tree.files_dropped.connect(self._on_drop)
-        split.addWidget(self.tree)
+        # 素材树包进白卡：与右侧详情卡对齐，左右两栏都是白底圆角同一层次
+        tree_card = Card(margins=(8, 8, 8, 8))
+        tree_card.v.addWidget(self.tree)
+        tree_card.setMinimumWidth(260)
+        split.addWidget(tree_card)
 
         # ---------- 右：紧凑详情 ----------
         # 顶部内边距压到与左侧素材树首行齐平（两侧均在同一 QSplitter 里，
@@ -215,6 +224,12 @@ class ProductsPage(QWidget):
             b_add.setObjectName("GhostBtn")
             b_add.clicked.connect(lambda _=False, k=kind: self._add_files(k))
             hs.addWidget(b_add)
+            if kind == "image":
+                b_paste = QPushButton("📋 粘贴图片")
+                b_paste.setObjectName("GhostBtn")
+                b_paste.setToolTip("从剪贴板粘贴图片（截图/复制的图片文件都行），等同 Ctrl+V")
+                b_paste.clicked.connect(lambda _=False: self.paste_image())
+                hs.addWidget(b_paste)
             sec.addLayout(hs)
             w = DropList(kind)
             w.setViewMode(QListWidget.ViewMode.IconMode)
@@ -224,7 +239,7 @@ class ProductsPage(QWidget):
             w.setMovement(QListWidget.Movement.Static)
             w.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             w.setWordWrap(True)
-            w.setToolTip("可直接把文件拖到这里登记 · 点上方标题栏向下展开/收起")
+            w.setToolTip("可直接把文件拖到这里登记，图片区支持 Ctrl+V 粘贴剪贴板图片 · 点上方标题栏展开/收起")
             w.files_dropped.connect(lambda paths, k=kind: self._on_drop(paths, ("kind", self._pid, k)))
             w.itemDoubleClicked.connect(lambda it: self._preview_item(it))
             sec.addWidget(w)
@@ -242,6 +257,8 @@ class ProductsPage(QWidget):
         b_p.clicked.connect(lambda: self._create(ps.TYPE_PRODUCT))
         b_k.clicked.connect(lambda: self._create(ps.TYPE_KOL))
         b_del.clicked.connect(self._delete_current)
+        # 页面本体也接受拖放：落在树/宫格以外的空白区时兜底登记到当前选中产品
+        self.setAcceptDrops(True)
         self.rebuild()
 
     # ================= 树 =================
@@ -537,6 +554,71 @@ class ProductsPage(QWidget):
         if unknown:
             msg += f"，{unknown} 个格式不支持已跳过（仅图片/视频/音频）"
         self.lbl_hint.setText(msg)
+
+    # ================= 剪贴板粘贴图片 =================
+    def paste_image(self, pid=None):
+        """把剪贴板里的图片粘进当前产品的参考图：
+        - 资源管理器里复制的图片文件 → 直接登记
+        - 截图 / 图片软件复制的位图 → 落成 PNG 再入库"""
+        pid = pid if pid is not None else self.current_id()
+        p = ps.get_product(pid) if pid is not None else None
+        if not p:
+            QMessageBox.information(self, "提示", "请先在左侧选择一个产品/KOL，再粘贴图片")
+            return
+        cb = QApplication.clipboard()
+        mime = cb.mimeData()
+        img_paths = [u.toLocalFile() for u in mime.urls()
+                     if u.isLocalFile() and _kind_by_ext(u.toLocalFile()) == "image"]
+        if img_paths:
+            saved = ps.add_files(p["id"], "image", img_paths)
+        elif mime.hasImage():
+            img = cb.image()
+            if img.isNull():
+                self.lbl_hint.setText("剪贴板里的图片是空的")
+                return
+            tmp = Path(tempfile.gettempdir()) / (
+                f"aigc_paste_{datetime.now():%Y%m%d_%H%M%S_%f}.png")
+            if not img.save(str(tmp), "PNG"):
+                self.lbl_hint.setText("剪贴板图片保存失败")
+                return
+            saved = ps.add_files(p["id"], "image", [str(tmp)])
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        else:
+            QMessageBox.information(
+                self, "没有图片",
+                "剪贴板里没有图片。\n\n先复制一张图片文件，或截屏（Win+Shift+S），再按 Ctrl+V。")
+            return
+        if not saved:
+            self.lbl_hint.setText("粘贴失败：图片没能入库")
+            return
+        self.rebuild(keep=p["id"])
+        self._sig = None
+        self.lbl_hint.setText(f"已粘贴 {len(saved)} 张图片到「{p['name']}」")
+
+    # ---- 页面级拖放兜底（子控件已各自处理，这里只接空白区） ----
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self._on_drop(_drop_paths(e), None)
+
+    def keyPressEvent(self, e):
+        # Ctrl+V 粘贴图片：备注框等文本控件会把 Ctrl+V 吃下自己粘文本，
+        # 不会传到这层；树/宫格/按钮不吃这个键，才会递上来触发图片粘贴
+        if e.matches(QKeySequence.StandardKey.Paste):
+            self.paste_image()
+            return
+        super().keyPressEvent(e)
 
     # ================= 右键菜单 =================
     def _tree_menu(self, pos):

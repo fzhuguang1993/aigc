@@ -4,9 +4,11 @@ REM build.bat —— Windows 一键打包脚本（在 Windows 上运行）
 REM 优先使用项目虚拟环境 .venv（和日常开发同一套依赖），
 REM 没有 .venv 时自动回退全局 python。
 REM 产物：
-REM   dist\AIGC视频助手.exe        桌面 GUI 版（发给同事，无黑窗口）
-REM   dist\AIGC视频助手-命令行.exe  控制台版（自己调试用，有黑窗口）
-REM 两个 exe 共用同一个 data\aigc.db，在哪边跑都一样
+REM   dist\AIGC视频助手.exe            桌面 GUI 精简版（发同事，无黑窗口，不含 whisper，<300MB）
+REM   dist\AIGC视频助手-创作版.exe     桌面 GUI 创作版（内置 faster-whisper：录屏字幕/爆款拆解开箱即用）
+REM   dist\AIGC视频助手-命令行.exe      控制台版（自己调试用，有黑窗口）
+REM 三个 exe 共用同一个 data\aigc.db，在哪边跑都一样。
+REM 创作版需要打机 .venv 里装了 faster-whisper；没装则自动跳过（见下方 :skip_creator）。
 REM ============================================================
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -35,6 +37,7 @@ if not defined FFMPEG_DATA (
     echo [WARN] on the user's PATH. Drop ffmpeg.exe into assets\ and rebuild.
 )
 
+REM 精简版剪掉 whisper 及其编译型大件，守 onefile <300MB；字幕/拆解在精简版里走降级提示。
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
     --hidden-import=openpyxl --hidden-import=core.config_local ^
@@ -42,7 +45,28 @@ if not defined FFMPEG_DATA (
     --hidden-import=volcengine.ApiInfo ^
     --hidden-import=volcengine.Credentials ^
     --hidden-import=volcengine.ServiceInfo ^
+    --exclude-module=faster_whisper --exclude-module=ctranslate2 ^
+    --exclude-module=tokenizers --exclude-module=av ^
     %FFMPEG_DATA% desktop.py || goto :error
+
+REM ---------- 创作版（内置 faster-whisper） ----------
+REM 不排除 whisper 大件；依赖打机 .venv 已装 faster-whisper（装模型/转写都靠它）。
+%PY% -c "import faster_whisper" 2>nul
+if errorlevel 1 (
+    echo [WARN] faster-whisper NOT installed - skipping the Creator build.
+    echo [WARN] Install it then re-run:  .venv\Scripts\pip install -r requirements-breakdown.txt
+    goto :skip_creator
+)
+%PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手-创作版" ^
+    --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
+    --hidden-import=openpyxl --hidden-import=core.config_local ^
+    --hidden-import=volcengine.base.Service ^
+    --hidden-import=volcengine.ApiInfo ^
+    --hidden-import=volcengine.Credentials ^
+    --hidden-import=volcengine.ServiceInfo ^
+    --collect-all=ctranslate2 --collect-all=faster_whisper ^
+    %FFMPEG_DATA% desktop.py || goto :error
+:skip_creator
 
 %PY% -m PyInstaller --noconfirm --onefile --console --name "AIGC视频助手-命令行" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
@@ -56,8 +80,9 @@ if not defined FFMPEG_DATA (
 echo.
 echo ============================================================
 echo  BUILD OK. Outputs in dist\ :
-echo    AIGC*-GUI exe   (no console window)
-echo    AIGC* CLI exe   (console version)
+echo    slim GUI exe       (no console, NO whisper)
+echo    creator GUI exe    (whisper built-in: subtitle/breakdown work offline; missing dep = skipped)
+echo    console exe        (CLI version)
 echo  To distribute: put the exe together with a material\ folder.
 echo  First run opens a setup dialog (name + API addresses).
 echo  CREDENTIALS (config.json / ui_state.json / api_text) are saved to the

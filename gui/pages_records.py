@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 from store import task_store
 from gui import log_sink
 from gui.formatting import secs
-from gui.header import page_header
+from gui.header import page_header, Card
 from gui.widgets import LoadingOverlay
 from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
                           SecsItem)
@@ -36,8 +36,8 @@ class RecordsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 12, 24, 12)
-        lay.setSpacing(6)
+        lay.setContentsMargins(24, 14, 24, 12)
+        lay.setSpacing(10)
 
         top = QHBoxLayout()
         top.addWidget(page_header("执行记录",
@@ -88,9 +88,14 @@ class RecordsPage(QWidget):
         self.lbl_count = QLabel("")
         self.lbl_count.setObjectName("PageTip")
         fbar.addWidget(self.lbl_count)
-        lay.addLayout(fbar)
+        # 筛选栏收进一张白卡（对标数据中台的分区卡），不再裸摆在灰底上
+        ctrl = Card(margins=(14, 10, 14, 10))
+        ctrl.v.addLayout(fbar)
+        lay.addWidget(ctrl)
 
         # ---------- 表格 ----------
+        content = Card(margins=(12, 10, 12, 10))
+        content.v.setSpacing(8)
         self.table = QTableWidget(0, len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
         self.table.setAlternatingRowColors(True)
@@ -111,13 +116,14 @@ class RecordsPage(QWidget):
         self.table.itemChanged.connect(self._on_item_changed)
         # 默认「最新在前」：按开始时间倒序，与任务中心口径一致（点表头可改列/方向）
         self.table.horizontalHeader().setSortIndicator(COL_START, Qt.SortOrder.DescendingOrder)
-        lay.addWidget(self.table, 3)
+        content.v.addWidget(self.table, 3)
 
-        lay.addWidget(QLabel("实时日志"))
+        content.v.addWidget(QLabel("实时日志"))
         self.log = QPlainTextEdit()
         self.log.setObjectName("LogBox")
         self.log.setReadOnly(True)
-        lay.addWidget(self.log, 1)
+        content.v.addWidget(self.log, 1)
+        lay.addWidget(content, 1)
 
         self._checked_rows = {}     # {run行数据id: row dict} 勾选保留
         self._loading = LoadingOverlay(self)

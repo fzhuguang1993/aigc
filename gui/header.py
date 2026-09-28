@@ -226,3 +226,20 @@ class KpiCard(Card):
         p.setPen(QPen(QColor(self.color), 3))
         p.drawLine(11, 2, self.width() - 12, 2)
         p.end()
+
+
+def kpi_row(specs, spacing=14, min_width=125):
+    """一排统一口径的 KpiCard（对标数据中台顶部的指标带）。
+
+    specs = [(名称, 图标, 颜色), ...]；返回 (QHBoxLayout, [KpiCard, ...])，
+    调用方把 layout 塞进页面布局、拿 cards 去 set_value。抽出来是为了让
+    任务中心等非看板页也能一眼摆出同款的「顶部概览」，不必每页手抄一遍。"""
+    lay = QHBoxLayout()
+    lay.setSpacing(spacing)
+    cards = []
+    for name, icon, color in specs:
+        k = KpiCard(name, icon, color)
+        k.setMinimumWidth(min_width)
+        lay.addWidget(k)
+        cards.append(k)
+    return lay, cards

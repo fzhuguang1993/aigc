@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 
 from core.config import DOWNLOAD_DIR, MATERIAL_DIR
 from gui.header import page_header
+from gui.maintainer import Gate, app_has_unlocked
 from utils.desktop_utils import open_path
 
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv"}
@@ -957,8 +958,10 @@ class MaterialPanel(BasePanel):
                                         " background:transparent;")
         outer.addWidget(self.lbl_api_host)
 
-        # ---- 接口配置：默认整组隐藏，需 Alt+W（Mac ⌘+W）口令解锁；输入全程密文 ----
-        self._base_unlocked = False
+        # ---- 接口配置：默认整组隐藏，需 Alt+W（Mac ⌘+W）口令解锁；同一功能当天
+        # 验过一次就不再问（跨天才重新验），输入全程密文 ----
+        self._gate_api = Gate("material_api")
+        self._base_unlocked = app_has_unlocked("material_api")
         self.api_cfg_box = QGroupBox("🔧 维护人 · 接口配置")
         form2 = QFormLayout(self.api_cfg_box)
         form2.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
@@ -989,6 +992,9 @@ class MaterialPanel(BasePanel):
 
         self._load_api()                            # 生效值 = api_config.json > 程序默认
         self._refresh_wl()
+        if self._base_unlocked:                     # 当天已验过：配置区直接展开
+            self.api_cfg_box.setVisible(True)
+            self.ed_api_base.setText(self._api_cfg().get("base") or "")
 
         self.make_log_box(outer, height=120)
         self.make_run_row(outer, "▶ 开始提取")
@@ -1000,19 +1006,13 @@ class MaterialPanel(BasePanel):
 
     # ---- 维护人入口：快捷键 → 密文口令框 → 校验通过才展开接口配置 ----
     def _summon_maintainer(self):
-        """按 Alt+W（macOS ⌘+W）：弹密文口令框，输对才进入接口配置"""
+        """按 Alt+W（macOS ⌘+W）：弹密文口令框，输对才进入接口配置；
+        同一功能当天只验一次，验过后再按直接聚焦"""
         if self._base_unlocked:               # 已展开则直接聚焦，不必重复输口令
             self.ed_api_base.setFocus()
             return
-        code, ok = QInputDialog.getText(
-            self, "维护人验证", "请输入维护人口令：",
-            QLineEdit.EchoMode.Password)      # 口令输入本身也是密文
-        if not ok:
-            return
-        if code == API_MAINTAINER_CODE:
+        if self._gate_api.ask(self):
             self._unlock_api_config()
-        else:
-            QMessageBox.warning(self, "口令错误", "维护人口令不正确")
 
     def _unlock_api_config(self):
         """口令命中：展开整组接口配置并聚焦地址框（日志不打印任何凭证明文）"""
@@ -1071,10 +1071,9 @@ class MaterialPanel(BasePanel):
             QMessageBox.warning(self, "保存失败", str(e))
             return
         self._load_api()
-        # 保存完立即收回整组配置：下次再改还得重新按快捷键输口令
-        if self._base_unlocked:
-            self._relock_api_config()
-        self._append_log("✓ 接口配置已保存，下次提取立即生效（配置区已重新隐藏）"
+        # 保存后不再立刻上锁：同一功能当天验过一次就不再问（跨天才重新验），
+        # 配置区保持展开方便继续改
+        self._append_log("✓ 接口配置已保存，下次提取立即生效"
                          + ("" if USER_NAME else "　⚠ 未配置使用人姓名，接口地址按明文存储"))
 
     def _relock_api_config(self):
@@ -1229,6 +1228,27 @@ def _build_recording_panel(parent=None):
     return RecordingPanel(parent)
 
 
+def _build_breakdown_panel(parent=None):
+    """爆款拆解面板在 dialogs_breakdown 里；同样延迟导入断循环
+    （dialogs_breakdown 要从本模块拿 BasePanel/ToolWorker）"""
+    from gui.dialogs_breakdown import BreakdownPanel
+    return BreakdownPanel(parent)
+
+
+def _build_asr_panel(parent=None):
+    """语音识别面板在 dialogs_asr 里；同样延迟导入断循环
+    （dialogs_asr 要从本模块拿 BasePanel/FileListWidget）"""
+    from gui.dialogs_asr import AsrPanel
+    return AsrPanel(parent)
+
+
+def _build_publish_panel(parent=None):
+    """一键发布面板在 dialogs_publish 里；延迟导入断循环
+    （dialogs_publish 要从本模块拿 BasePanel/ToolWorker/FileListWidget）"""
+    from gui.dialogs_publish import PublishPanel
+    return PublishPanel(parent)
+
+
 PANEL_FACTORIES = {
     "视频水印": _safe_factory(WatermarkPanel),
     "批量改名": _safe_factory(RenamePanel),
@@ -1238,4 +1258,7 @@ PANEL_FACTORIES = {
     "视频溯源": _safe_factory(TracePanel),
     "素材提取": _safe_factory(MaterialPanel),
     "屏幕录制": _safe_factory(_build_recording_panel),
+    "语音识别": _safe_factory(_build_asr_panel),
+    "爆款拆解": _safe_factory(_build_breakdown_panel),
+    "一键发布": _safe_factory(_build_publish_panel),
 }

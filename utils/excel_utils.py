@@ -11,7 +11,11 @@ from core.config import (
     EXCEL_PATH, SHEET_TASK, SHEET_NAME_RULE,
     COL_ID, COL_PRODUCT, COL_PROMPT, COL_SCRIPT, COL_STATUS, COL_ACCOUNT,
     COL_JOB_ID, COL_OUTPUT, COL_URL, COL_RUNS, COL_SUCCESS, COL_CANCEL,
-    COL_SCRIPT_TEXT, COL_NAME, ASSET_DIR, USER_NAME
+    COL_SCRIPT_TEXT, COL_NAME, ASSET_DIR, USER_NAME,
+    COL_BK_LINK, COL_BK_HOOK, COL_BK_SHOTS, COL_BK_SCRIPT,
+    COL_BK_PROMPT_VISUAL, COL_BK_PROMPT_COPY, COL_BK_PROMPT_SHOOT,
+    COL_BK_HOOK_SCORE, COL_BK_FACTORS, COL_BK_EMOTION, COL_BK_FORMULA,
+    COL_BK_BLUEPRINT, BREAKDOWN_COLUMNS
 )
 from core.logger import raw_info, raw_warning, raw_error
 
@@ -24,7 +28,7 @@ def load_tasks():
         for col in [COL_ID, COL_PRODUCT, COL_PROMPT, COL_SCRIPT,
                     COL_STATUS, COL_ACCOUNT, COL_JOB_ID,
                     COL_OUTPUT, COL_URL, COL_RUNS, COL_SUCCESS, COL_CANCEL,
-                    COL_SCRIPT_TEXT]:
+                    COL_SCRIPT_TEXT] + BREAKDOWN_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
         for col in [COL_ID, COL_PRODUCT, COL_PROMPT, COL_SCRIPT,
@@ -123,3 +127,91 @@ def scan_new_rows():
                 "提示词": row.get(COL_PROMPT, ""),
             }))
     return out
+
+
+# ====================================================================
+# 爆款拆解回写：BreakdownResult → 12 列（多行文本原样保留，失败阶段显式标注）
+#   不复用 update_row：它会把 \n 折成空格，分镜/提示词这类多行内容会被压成一行。
+# ====================================================================
+def _fmt_ts(sec):
+    return f"{int(sec // 60):02d}:{int(sec % 60):02d}"
+
+
+def _fmt_shots(result):
+    """分镜表：每帧一行【时间】景别/运镜/构图/转场/文字/情绪；解析不出字段就退回原始文本。"""
+    lines = []
+    for a in result.frame_analyses:
+        bits = []
+        for label, val in (("景别", a.shot_size), ("运镜", a.camera),
+                           ("构图", a.composition), ("转场", a.transition),
+                           ("文字", a.on_screen_text), ("情绪", a.emotion)):
+            if val:
+                bits.append(f"{label}:{val}")
+        if not bits:
+            bits.append(a.raw or "")
+        lines.append(f"【{_fmt_ts(a.ts)}】" + " ".join(bits))
+    return "\n".join(lines)
+
+
+def _fmt_prompts(result, attr):
+    return "\n".join(f"【{s.time_range}】{getattr(s, attr)}"
+                     for s in result.segments if getattr(s, attr, ""))
+
+
+def breakdown_cells(result):
+    """把 BreakdownResult 映射成 12 列文本 dict。失败阶段写“XX失败：原因”，不静默。"""
+    from video_text_tools.breakdown.models import (
+        STAGE_ACQUIRE, STAGE_TRANSCRIBE, STAGE_VISION, STAGE_PROMPTS)
+
+    def fail(stage):
+        v = str(result.stage_status.get(stage, ""))
+        return v[5:] if v.startswith("fail:") else ""
+
+    ov = result.overall
+    cells = {COL_BK_LINK: result.link}
+    # 拆解钩子 / 整体分析字段
+    cells[COL_BK_HOOK] = ov.hook_desc
+    cells[COL_BK_HOOK_SCORE] = ov.hook_score
+    cells[COL_BK_FACTORS] = ov.factors
+    cells[COL_BK_EMOTION] = ov.emotion_curve
+    cells[COL_BK_FORMULA] = ov.formula
+    cells[COL_BK_BLUEPRINT] = ov.blueprint
+    # 分镜（视觉分析）/口播（转写）：失败就在对应列标注
+    vf = fail(STAGE_VISION)
+    cells[COL_BK_SHOTS] = f"画面分析失败：{vf}" if vf else _fmt_shots(result)
+    tf = fail(STAGE_TRANSCRIBE)
+    cells[COL_BK_SCRIPT] = f"口播转写失败：{tf}" if tf else result.transcript_text
+    pf = fail(STAGE_PROMPTS)
+    if pf:
+        msg = f"提示词生成失败：{pf}"
+        cells[COL_BK_PROMPT_VISUAL] = msg
+        cells[COL_BK_PROMPT_COPY] = msg
+        cells[COL_BK_PROMPT_SHOOT] = msg
+    else:
+        cells[COL_BK_PROMPT_VISUAL] = _fmt_prompts(result, "visual_prompt")
+        cells[COL_BK_PROMPT_COPY] = _fmt_prompts(result, "copy_prompt")
+        cells[COL_BK_PROMPT_SHOOT] = _fmt_prompts(result, "shoot_prompt")
+    # 解析下载失败：整表以“失败”落第一列，其余留空（半成品本就不该写，GUI 已拦）
+    af = fail(STAGE_ACQUIRE)
+    if af:
+        cells = {c: "" for c in BREAKDOWN_COLUMNS}
+        cells[COL_BK_LINK] = f"解析下载失败：{af}"
+    return cells
+
+
+def write_breakdown(row_idx, result):
+    """把一条拆解结果写进任务表的 12 列并保存（保留换行）。
+
+    row_idx 为 None/负数/越界 → 追加新行。返回实际落位的行号。"""
+    cells = breakdown_cells(result)
+    with _excel_lock:
+        df = load_tasks()
+        if row_idx is None or row_idx < 0 or row_idx >= len(df):
+            df.loc[len(df)] = {c: "" for c in df.columns}
+            row_idx = len(df) - 1
+        for k, v in cells.items():
+            if k not in df.columns:
+                df[k] = ""
+            df.at[row_idx, k] = v if isinstance(v, str) else str(v)
+        save_tasks(df)
+    return row_idx

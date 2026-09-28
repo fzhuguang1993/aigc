@@ -5,7 +5,7 @@ import html
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QRect, QTimer, Signal, QKeyCombination
+from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QRect, QRectF, QTimer, Signal, QKeyCombination
 from PySide6.QtGui import (QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor,
                            QRegion, QPainterPath, QTransform, QKeySequence)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -13,9 +13,11 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
                                QPushButton, QLabel, QWidget, QMessageBox,
                                QComboBox, QSizeGrip, QSizePolicy, QLineEdit,
-                               QInputDialog, QLayout)
+                               QInputDialog, QLayout, QApplication,
+                               QGraphicsView, QGraphicsScene, QFrame)
 
 from core import translate
+from gui.maintainer import Gate, app_has_unlocked
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
 from store import app_state
 from utils.desktop_utils import open_path, reveal_in_folder
@@ -269,6 +271,9 @@ class VideoPlayerDialog(QDialog):
         self.btn_full.setCheckable(True)
         self.btn_full.setToolTip("全屏 / 退出全屏（F 或双击画面）")
         self.btn_full.toggled.connect(self._set_fullscreen)
+        self.btn_asr = QPushButton("🎤 识别字幕")
+        self.btn_asr.setToolTip("边播边识别口播：弹一个浮窗，识别一句就往下追加一句（看识别效果用）")
+        self.btn_asr.clicked.connect(self._do_asr)
         b_min = QPushButton("―")
         b_min.setToolTip("最小化")
         b_min.clicked.connect(self.showMinimized)
@@ -276,7 +281,7 @@ class VideoPlayerDialog(QDialog):
         b_close.setObjectName("CloseBtn")
         b_close.setToolTip("关闭（Esc）")
         b_close.clicked.connect(self.close)
-        for b in (self.btn_reveal, self.btn_full, b_min, b_close):
+        for b in (self.btn_asr, self.btn_reveal, self.btn_full, b_min, b_close):
             bar.addWidget(b)
         lay.addLayout(bar)
 
@@ -427,6 +432,15 @@ class VideoPlayerDialog(QDialog):
             self.player.pause()
         else:
             self.player.play()
+
+    def _do_asr(self):
+        """🎤 识别字幕：弹实时字幕浮窗，后台流式转写当前视频。"""
+        p = self._path
+        if not p or not Path(p).exists():
+            self._say("当前文件不存在或已被移动，无法识别", True)
+            return
+        from gui.asr_live import show_asr_live
+        show_asr_live(self, p)
 
     def _seek_rel(self, ms):
         self.player.setPosition(max(0, self.player.position() + int(ms)))
@@ -785,41 +799,245 @@ class VideoPlayerDialog(QDialog):
         self.marked.emit(new_path, target)
 
 
+class _ImageView(QGraphicsView):
+    """可缩放图片画布：滚轮以光标为锚点缩放，左键按住拖拽平移，默认 100% 原图。
+
+    用 QGraphicsView 而不是旧的 QScrollArea+缩放 QLabel：后者只能整块重
+    绘，做不到“围着鼠标位置缩放”与平滑大图平移；Scene/View 自带滚动条与
+    ScrollHandDrag 拖拽，缩放用 QTransform 累积、不重新采样原图。
+    """
+    scaleChanged = Signal(float)
+
+    MIN_SCALE = 0.02
+    MAX_SCALE = 40.0
+    STEP = 1.25
+
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self._scale = 1.0
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setMouseTracking(True)
+
+    def wheelEvent(self, e):
+        dy = e.angleDelta().y()
+        if dy == 0:
+            e.ignore()
+            return
+        self.zoom(self.STEP if dy > 0 else 1 / self.STEP)
+        e.accept()
+
+    def zoom(self, factor):
+        target = max(self.MIN_SCALE, min(self.MAX_SCALE, self._scale * factor))
+        if abs(target - self._scale) < 1e-6:
+            return
+        self.scale(target / self._scale, target / self._scale)
+        self._scale = target
+        self.scaleChanged.emit(self._scale)
+
+    def to_original(self):
+        """100%：按原始像素显示（变换矩阵归一）"""
+        self.resetTransform()
+        self._scale = 1.0
+        self.scaleChanged.emit(1.0)
+
+    def fit_window(self):
+        r = self.scene().sceneRect()
+        if r.isEmpty():
+            return
+        self.fitInView(r, Qt.AspectRatioMode.KeepAspectRatio)
+        self._scale = float(self.transform().m11())
+        self.scaleChanged.emit(self._scale)
+
+
+class _FloatBar(QWidget):
+    """图片预览的半透明浮动控制条：直接压在图片之上，圆角深底 + 白色图标按钮。
+
+    无边框预览窗没有标题栏，这条浮具承担全部操作；按住它的空白处（信息文字 /
+    按钮之间）可拖动整个窗口。用 paintEvent 画带 alpha 的圆角矩形而不是走 QSS
+    背景，保证半透明能真正透出下面的图片（子控件走逐像素 alpha 合成）。
+    """
+    RADIUS = 14
+
+    def __init__(self, dlg):
+        super().__init__(dlg)
+        self._dlg = dlg
+        self._drag = None
+        self.setObjectName("ImgFloatBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("""
+            #ImgFloatBar QPushButton { background:transparent; color:#E6EAF2;
+                border:0; border-radius:7px; padding:3px 9px; font-size:12px; }
+            #ImgFloatBar QPushButton:hover { background:#3A4250; color:#FFFFFF; }
+            #ImgFloatBar QPushButton:checked { background:#3370FF; color:#FFFFFF; }
+            #ImgFloatBar QPushButton#ImgClose:hover { background:#D94A43; color:#FFFFFF; }
+            #ImgFloatBar QLabel { color:#C9CFDA; background:transparent; font-size:12px; }
+        """)
+        self.lay = QHBoxLayout(self)
+        self.lay.setContentsMargins(12, 6, 12, 6)
+        self.lay.setSpacing(4)
+
+    def add(self, widget):
+        self.lay.addWidget(widget)
+
+    def _btn(self, text, tip, slot, obj=""):
+        b = QPushButton(text)
+        b.setToolTip(tip)
+        b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        if obj:
+            b.setObjectName(obj)
+        b.clicked.connect(slot)
+        return b
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.setBrush(QColor(21, 23, 28, 170))
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.drawRoundedRect(r, self.RADIUS, self.RADIUS)
+        p.end()
+
+    # 按住浮条空白处拖动窗口（按钮 / 标签之外的区域）
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag = e.globalPosition().toPoint() - self._dlg.frameGeometry().topLeft()
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.MouseButton.LeftButton:
+            self._dlg.move(e.globalPosition().toPoint() - self._drag)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+
+
 class ImagePreviewDialog(QDialog):
-    """图片预览：等比缩放显示，超大图可滚动查看"""
+    """无边框图片预览：图片铺满整窗，滚轮缩放、左键拖拽平移；操作按钮做成
+    压在图片上的半透明浮条（内置），不再有一圈粗边框 / 标题栏。
+
+    产品中心双击参考图唤起（也供其它页面复用）。Esc 或浮条 ✕ 关闭。
+    """
 
     def __init__(self, parent, file_path):
         super().__init__(parent)
+        self._path = str(file_path)
         self.setWindowTitle(f"图片预览 - {Path(file_path).name}")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         screen = QGuiApplication.primaryScreen().availableGeometry()
-        self.resize(min(int(screen.width() * 0.6), 1100),
-                    min(int(screen.height() * 0.7), 800))
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 8, 8, 8)
-        pm = QPixmap(str(file_path))
-        if pm.isNull():
-            QMessageBox.warning(self, "无法打开", f"图片无法显示：\n{file_path}")
+        self.resize(min(int(screen.width() * 0.8), 1400),
+                    min(int(screen.height() * 0.86), 980))
+        self._pm = QPixmap(self._path)
+        if self._pm.isNull():
+            QMessageBox.warning(self, "无法打开", f"图片无法显示：\n{self._path}")
             self.reject()
             return
-        area = QScrollArea()
-        area.setWidgetResizable(True)
-        lbl = QLabel()
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setPixmap(pm.scaled(area.size().width() - 20, area.size().height() - 20,
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation))
-        area.setWidget(lbl)
-        lay.addWidget(area)
-        bar = QHBoxLayout()
-        bar.addStretch(1)
-        b_open = QPushButton("📂 用系统默认程序打开")
-        b_open.setObjectName("GhostBtn")
-        b_open.clicked.connect(lambda: open_path(file_path))
-        bar.addWidget(b_open)
-        b_close = QPushButton("关闭")
-        b_close.clicked.connect(self.accept)
-        bar.addWidget(b_close)
-        lay.addLayout(bar)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self._scene = QGraphicsScene(self)
+        self._scene.addPixmap(self._pm)
+        self.view = _ImageView(self._scene, self)
+        self.view.setFrameShape(QFrame.Shape.NoFrame)
+        self.view.setBackgroundBrush(QColor("#15171C"))
+        # 关掉滚动条：无边框铺满靠拖拽平移看局部，留滚动条会破坏“无边框”观感
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.scaleChanged.connect(self._on_scale)
+        lay.addWidget(self.view)
+
+        # ---------- 半透明浮动控制条（内置在图片之上）----------
+        self.bar = _FloatBar(self)
+        self.lbl_info = QLabel(f"{self._pm.width()} × {self._pm.height()} px")
+        self.bar.add(self.lbl_info)
+        self.lbl_zoom = QLabel("100%")
+        self.lbl_zoom.setMinimumWidth(46)
+        self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.bar.add(self.lbl_zoom)
+        self.bar.add(self.bar._btn("－", "缩小（滚轮向下 / 键盘 -）",
+                                   lambda: self.view.zoom(1 / _ImageView.STEP)))
+        self.bar.add(self.bar._btn("＋", "放大（滚轮向上 / 键盘 +）",
+                                   lambda: self.view.zoom(_ImageView.STEP)))
+        self.bar.add(self.bar._btn("100%", "按原图像素显示（键盘 0）", self.view.to_original))
+        self.bar.add(self.bar._btn("适应", "缩放到刚好铺满窗口（键盘 F）", self.view.fit_window))
+        self.bar.add(self.bar._btn("📋", "把原图复制到剪贴板", self._copy))
+        self.bar.add(self.bar._btn("🖨", "打印原图（按页面等比缩放居中）", self._print))
+        self.bar.add(self.bar._btn("📂", "用系统默认程序打开", lambda: open_path(self._path)))
+        self.bar.add(self.bar._btn("✕", "关闭（Esc）", self.reject, "ImgClose"))
+
+        # 右下角缩放把手（无边框也能拉大拉小）
+        self._grip = QSizeGrip(self)
+        self._grip.setFixedSize(14, 14)
+
+        # 默认贴合原图：100% 像素铺上，图比窗大就拖拽看，小就居中
+        self.view.to_original()
+        self.view.centerOn(self._scene.sceneRect().center())
+
+    def _relocate(self):
+        """把浮条底部居中、右下角放缩放把手（窗口尺寸一变就要重新定位）"""
+        if not hasattr(self, "bar"):
+            return
+        self.bar.adjustSize()
+        bw = min(self.bar.sizeHint().width(), max(self.width() - 16, 0))
+        bh = self.bar.sizeHint().height()
+        self.bar.resize(max(bw, 1), bh)
+        self.bar.move(max(8, (self.width() - bw) // 2),
+                      max(8, self.height() - bh - 16))
+        self.bar.raise_()
+        self._grip.move(self.width() - 16, self.height() - 16)
+        self._grip.raise_()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._relocate()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relocate()
+
+    def _on_scale(self, s):
+        self.lbl_zoom.setText(f"{round(s * 100)}%")
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k in (Qt.Key.Key_Plus, Qt.Key.Key_Add, Qt.Key.Key_Equal):
+            self.view.zoom(_ImageView.STEP)
+        elif k in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+            self.view.zoom(1 / _ImageView.STEP)
+        elif k == Qt.Key.Key_0:
+            self.view.to_original()
+        elif k == Qt.Key.Key_F:
+            self.view.fit_window()
+        else:
+            super().keyPressEvent(e)
+
+    def _copy(self):
+        QApplication.clipboard().setPixmap(self._pm)
+        self.lbl_info.setText("已复制原图到剪贴板")
+
+    def _print(self):
+        try:
+            from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+        except Exception:
+            QMessageBox.information(self, "打印不可用", "当前环境缺少打印组件")
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        dlg.setWindowTitle("打印图片")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        p = QPainter(printer)
+        rect = p.viewport()
+        pm = self._pm.scaled(rect.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        p.drawPixmap((rect.width() - pm.width()) // 2,
+                     (rect.height() - pm.height()) // 2, pm)
+        p.end()
+        self.lbl_info.setText("已发送到打印机")
 
 
 # 中文（含中文标点）连续片段：悬停预览时整段高亮，与英文镜头描述区分开
@@ -893,7 +1111,8 @@ class HoverPreview(QScrollArea):
         self._zh = ""                     # 当前内容的中文对照
         self._zh_src = ""                 # 对照对应的原文（内容换了就得重翻）
         self._showing_zh = False
-        self._unlocked = False            # 口令验过一次就不再问（本会话内）
+        self._gate_pin = Gate("prompt_translate")
+        self._unlocked = app_has_unlocked("prompt_translate")   # 当天验过就不过问
         self._busy = False
         self._tip = ""                    # 一次性提示（无需翻译之类）
         self._err = ""
@@ -1032,20 +1251,16 @@ class HoverPreview(QScrollArea):
             self._translate()
 
     def _unlock(self):
-        """口令框是模态窗，会把 Popup 的键盘抓取顶掉：先收窗再问，问完原样钉回来"""
+        """口令框是模态窗，会把 Popup 的键盘抓取顶掉：先收窗再问，问完原样钉回来；
+        同一功能当天只验一次（跨天才重新问）"""
         text, rich, pos = self._pin_text, self._pin_rich, self.pos()
         self.hide()
-        host = self._host or self
-        code, ok = QInputDialog.getText(host, "维护人验证", "请输入维护人口令：",
-                                        QLineEdit.EchoMode.Password)
-        if ok and code == API_MAINTAINER_CODE:
+        if self._gate_pin.ask(self._host or self):
             self._unlocked = True
             self.show_pinned(text, pos, rich)
             self._translate()
             return
         self.show_pinned(text, pos, rich)       # 没通过也别把人正在看的内容弄丢
-        if ok:
-            QMessageBox.warning(host, "口令错误", "维护人口令不正确")
 
     def _translate(self):
         if self._busy:

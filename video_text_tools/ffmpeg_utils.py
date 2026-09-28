@@ -16,9 +16,16 @@ from .config import (
 
 
 def _run_subprocess(cmd, **kwargs):
-    """跨平台 subprocess.run，Windows 下隐藏控制台窗口"""
+    """跨平台 subprocess.run，Windows 下隐藏控制台窗口。
+
+    ffmpeg/ffprobe 写到管道的是 UTF-8 字节；不显式指定 encoding 时 Windows 会拿
+    locale（GBK）解码，中文文件名/报错里的非 GBK 字节会触发 UnicodeDecodeError，
+    把读取线程炸掉且 stdout 变 None。统一按 UTF-8 + replace 解码。
+    """
     kwargs.setdefault('capture_output', True)
     kwargs.setdefault('text', True)
+    kwargs.setdefault('encoding', 'utf-8')
+    kwargs.setdefault('errors', 'replace')
     if sys.platform == 'win32':
         kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
     return subprocess.run(cmd, **kwargs)
