@@ -650,6 +650,13 @@ class TasksPage(QWidget):
         # 留存几个引导/快捷键目标（首次上手气泡、顶部待办数量都要用）
         self.b_new, self.b_run, self.b_io = b_new, b_run, b_io
         self.b_runall = b_runall
+        # 一次性「清除演示数据」：仅当库里存在演示任务且尚未清除过时才显示
+        self.b_demo = QPushButton("🧹 清除演示数据")
+        self.b_demo.setObjectName("GhostBtn")
+        self.b_demo.setToolTip("打包自带的看板演示任务；确认后清除，本按钮不再出现，真实任务不受影响")
+        self.b_demo.clicked.connect(self._clear_demo_tasks)
+        bar.addWidget(self.b_demo)
+        self._update_demo_btn()
         bar.addStretch(1)
         # 时长/步数/KOL 收进「⚙ 参数管理」弹窗：工具栏只留入口 + 常驻概要；
         # 三个下拉仍是本页控件（提交/持久化逻辑沿用），只是被 ParamsDialog 收养
@@ -1241,6 +1248,34 @@ class TasksPage(QWidget):
                 self.ed_search.text(), filt,
                 tuple(sorted(self._gather_ids)),
                 tuple(sorted(self._failed_ids)))
+
+    def _update_demo_btn(self):
+        """「清除演示数据」按钮可见性：仅当库里真有演示任务、且尚未清除过时显示。"""
+        try:
+            from store import demo_seed
+            show = bool(demo_seed.demo_present()) and not app_state.get("demo_cleared")
+        except Exception:
+            show = False
+        self.b_demo.setVisible(show)
+
+    def _clear_demo_tasks(self):
+        """确认后删除全部演示任务（demo=1）；置 demo_cleared 标、隐藏按钮，以后不再出现。"""
+        if QMessageBox.question(
+                self, "清除演示数据",
+                "将删除打包自带的全部演示任务（真实任务不受影响）。\n"
+                "清除后本按钮不再出现，确定继续吗？"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from store import demo_seed
+            n = demo_seed.clear_demo()
+        except Exception as e:
+            QMessageBox.warning(self, "清除失败", str(e))
+            return
+        app_state.set_value("demo_cleared", True)
+        self.b_demo.setVisible(False)
+        self.refresh(force=True)
+        QMessageBox.information(self, "已清除", f"已删除 {n} 条演示任务。")
 
     def refresh(self, force=False):
         """刷新表格（定时器每 2 秒调用；force=True 是 F5 手动强制）

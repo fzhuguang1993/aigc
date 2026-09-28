@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
 from gui.header import page_header
 from gui.asr_widgets import FixToggle
 from gui.maintainer import Gate, app_has_unlocked
-from gui.tool_panels import BasePanel, ToolWorker
+from gui.tool_panels import BasePanel, ToolWorker, remind_api_page
 from utils.desktop_utils import open_path
 
 # 豆包配置引导文案（火山方舟：新用户额度 / 协作奖励 / 选视觉模型 / 填 ep-id）
@@ -250,10 +250,9 @@ class BreakdownPanel(BasePanel):
     # 去「接口管理」页统一维护（模型下载 / 豆包 / DeepSeek / 词库）
     # ------------------------------------------------------------------
     def _goto_api_page(self):
-        """直接跳到主窗口的「接口管理」页（不需任何口令/快捷键提示）。"""
-        w = self.window()
-        if hasattr(w, "reveal_api_page"):
-            w.reveal_api_page()
+        """模型下载 / 豆包等接口配置已收进隐藏的「接口管理」页：本按钮不再
+        代用户解锁跳转，只弹提醒告诉他去哪唤醒（保持接口管理页的隐藏属性）。"""
+        remind_api_page(self)
 
     # ------------------------------------------------------------------
     # 输出目录

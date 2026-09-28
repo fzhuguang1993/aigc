@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   script TEXT DEFAULT '', storyboard INTEGER DEFAULT 0,
   remark TEXT DEFAULT '',
   tag TEXT DEFAULT '',
-  prompt_zh TEXT DEFAULT ''
+  prompt_zh TEXT DEFAULT '',
+  demo INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS runs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +125,9 @@ _MIGRATIONS = (
     # 内容标签：给任务归一个内容类型（开场钩子/活动促销/情景剧…），
     # 词库在设置里维护；批量归档时就按它把成品归进「日期/产品/标签」子目录。
     "ALTER TABLE tasks ADD COLUMN tag TEXT DEFAULT ''",
+    # 演示数据标记：打包给新用户播种的看板样例任务 demo=1，真实任务恒为 0；
+    # 「清除演示数据」只删除 demo=1 的行，绝不碰真实数据。
+    "ALTER TABLE tasks ADD COLUMN demo INTEGER DEFAULT 0",
 )
 
 

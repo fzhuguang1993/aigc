@@ -32,6 +32,11 @@ def main():
     if icon:
         app.setWindowIcon(QIcon(icon))   # 任务栏/对话框统一图标
 
+    # 用户协议：首次运行（或条款大版本变更后）10 秒倒计时读完才能同意，拒绝即退出
+    from gui.dialogs_eula import ensure_accepted
+    if not ensure_accepted():
+        sys.exit(0)
+
     # 无配置 → 先弹首配窗口；registry 在 import 时读取 ACCOUNTS，因此必须延后导入
     if not config.CONFIG_JSON.exists():
         from gui.first_run import FirstRunDialog

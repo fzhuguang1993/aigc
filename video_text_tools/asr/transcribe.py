@@ -82,13 +82,35 @@ def _plain_ready(size):
         return False
 
 
+_WHISPER_OK = None          # 导入探测结果缓存：避免每次 model_ready 都重复 import
+
+
+def whisper_available():
+    """faster_whisper 是否可用（精简版打包 --exclude-module 掉了它，返回 False）。
+
+    与「有没有权重文件」分开判：库不在，再全的模型也跑不动，界面不应谎报就绪。
+    """
+    global _WHISPER_OK
+    if _WHISPER_OK is None:
+        try:
+            import faster_whisper  # noqa: F401
+            _WHISPER_OK = True
+        except Exception:
+            _WHISPER_OK = False
+    return _WHISPER_OK
+
+
 def model_ready(size=DEFAULT_SIZE):
-    """该 size 模型是否可用：HF 缓存已下完，或本地平铺目录就绪（二者其一）。
+    """该 size 模型是否可用：库能加载（whisper_available）且权重已下完。
+
+    「就绪」不能只看 MODELS_DIR 里有没有权重文件——精简版打包把 faster_whisper
+    整块 --exclude 了，此时即便维护机上残留模型文件也根本加载不了，只看文件会
+    误报「已就绪」。所以必须 `库可用 且 文件就绪` 同时成立。
 
     平铺目录这条同时支持「直链下载器」产物和「用户手动放置」——不必去凑 HF 的
     blobs/snapshots 那套复杂布局。
     """
-    return _plain_ready(size) or _blobs_ready(size)
+    return whisper_available() and (_plain_ready(size) or _blobs_ready(size))
 
 
 def resolve_model_path(size=DEFAULT_SIZE):

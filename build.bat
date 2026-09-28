@@ -38,15 +38,18 @@ if not defined FFMPEG_DATA (
 )
 
 REM 精简版剪掉 whisper 及其编译型大件，守 onefile <300MB；字幕/拆解在精简版里走降级提示。
+REM 标准版对外分发：连 core.config_local 一并抹除（收费接口地址/key 不随包外泄），
+REM 装好即全新未配置态，首跑走引导自填地址。创作版/命令行版仍内置，方便维护人自用。
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
-    --hidden-import=openpyxl --hidden-import=core.config_local ^
+    --hidden-import=openpyxl ^
     --hidden-import=volcengine.base.Service ^
     --hidden-import=volcengine.ApiInfo ^
     --hidden-import=volcengine.Credentials ^
     --hidden-import=volcengine.ServiceInfo ^
     --exclude-module=faster_whisper --exclude-module=ctranslate2 ^
     --exclude-module=tokenizers --exclude-module=av ^
+    --exclude-module=core.config_local ^
     %FFMPEG_DATA% desktop.py || goto :error
 
 REM ---------- 创作版（内置 faster-whisper） ----------

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                                QCheckBox, QSpinBox, QColorDialog, QFileDialog,
                                QGroupBox, QMessageBox, QApplication)
 
-from gui.tool_panels import ToolWorker
+from gui.tool_panels import ToolWorker, remind_api_page
 
 # faster-whisper 可选大件的安装命令（开发版直接可用；打包版随包内置或手动放置）
 _INSTALL_CMD = "pip install -r requirements-breakdown.txt"
@@ -80,7 +80,7 @@ class SubtitleOptionsDialog(QDialog):
         self.lbl_model.setObjectName("PageTip")
         b_dl = QPushButton("⬇ 下载模型")
         b_dl.setObjectName("GhostBtn")
-        b_dl.clicked.connect(self._download_model)
+        b_dl.clicked.connect(self._goto_api_page)
         self.ck_mirror = QCheckBox("用国内镜像")
         mrow.addWidget(self.lbl_model, 1)
         mrow.addWidget(self.ck_mirror)
@@ -237,7 +237,11 @@ class SubtitleOptionsDialog(QDialog):
             ready = False
         self.lbl_model.setText(
             f"✓ 「{self._size()}」模型已就绪" if ready
-            else f"⚠ 「{self._size()}」模型未下载，点右侧下载")
+            else f"⚠ 「{self._size()}」模型未下载，点右侧去接口管理页下载")
+
+    def _goto_api_page(self, *_):
+        """模型下载已收进隐藏的「接口管理」页：本按钮不就地下载，只弹提醒。"""
+        remind_api_page(self)
 
     def _download_model(self, *_):
         from core.config import MODELS_DIR
@@ -409,13 +413,14 @@ def whisper_missing_guidance(parent, err, on_log=None):
             install_breakdown_deps(parent, on_log=on_log, mirror=True)
         return
 
-    # ModelNotReady（及其兜底）：指向下载入口
+    # ModelNotReady（及其兜底）：指向隐藏的接口管理页
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Information)
     box.setWindowTitle("Whisper 模型未下载")
     box.setText(
         "faster-whisper 已就绪，但对应模型还没下载到本机。\n\n"
-        "打开字幕选项，点「⬇ 下载模型」（首次较慢，连不上官方源就勾「用国内镜像」）。")
+        "模型下载已收进隐藏的「🔌 接口管理」页：到「⚙️ 设置」按 Alt+W 输入维护口令"
+        "唤醒后，在接口管理页选档下载（首次较慢，连不上官方源可勾国内镜像）。")
     if msg:
         box.setInformativeText(msg)
     box.exec()

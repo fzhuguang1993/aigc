@@ -33,6 +33,20 @@ API_MAINTAINER_CODE = "whosyourdaddy"
 MAINTAINER_SHORTCUT = "Meta+W" if sys.platform == "darwin" else "Alt+W"
 
 
+def remind_api_page(parent):
+    """所有接口/模型配置入口的统一提醒。
+
+    设计：接口管理是一个隐藏页（默认不进导航），各功能面板不再就地配置、
+    也不代跳过去，只提醒用户“有个隐藏的接口管理页、去哪唤醒”——避免
+    将收费接口的配置入口曝在每张工具面板上。"""
+    QMessageBox.information(
+        parent, "接口管理",
+        "接口、模型、豆包 / DeepSeek 接入点、领域词库、素材接口等配置，"
+        "已统一收进隐藏的「🔌 接口管理」页。\n\n"
+        "唤醒方式：进入「⚙️ 设置」页，按 Alt+W（macOS ⌘+W）输入维护口令，"
+        "验证通过后左侧导航会出现「🔌 接口管理」，在那集中配置即可。")
+
+
 # ====================================================================
 # 通用：后台工作线程
 # ====================================================================
@@ -981,8 +995,10 @@ class MaterialPanel(BasePanel):
         form2.addRow("UID：", self.ed_api_uid)
         form2.addRow("Key：", r3)
         form2.addRow("", self.ed_api_key)
+        # 素材接口配置已收进隐藏的「接口管理」页：这里不再内联摆一个可编辑的配置区
+        # （api_cfg_box 仍构建以兼容 _load_api/_save_api 的引用，但从不加入布局、从不 show，
+        # 避免无父控件 setVisible(True) 变成漂浮窗）。Alt+W 只做“去接口管理页”提醒。
         self.api_cfg_box.setVisible(False)
-        outer.addWidget(self.api_cfg_box)
 
         tip = QLabel("直链域名白名单变更无需重新打包：重新导入名单即生效；文案每提取一条"
                      "追加一行到「文案样本库.csv」（只追加不覆盖，换输出目录也不影响）")
@@ -992,9 +1008,6 @@ class MaterialPanel(BasePanel):
 
         self._load_api()                            # 生效值 = api_config.json > 程序默认
         self._refresh_wl()
-        if self._base_unlocked:                     # 当天已验过：配置区直接展开
-            self.api_cfg_box.setVisible(True)
-            self.ed_api_base.setText(self._api_cfg().get("base") or "")
 
         self.make_log_box(outer, height=120)
         self.make_run_row(outer, "▶ 开始提取")
@@ -1004,15 +1017,11 @@ class MaterialPanel(BasePanel):
         self._sc_maintainer.setContext(Qt.ShortcutContext.WindowShortcut)
         self._sc_maintainer.activated.connect(self._summon_maintainer)
 
-    # ---- 维护人入口：快捷键 → 密文口令框 → 校验通过才展开接口配置 ----
+    # ---- 维护人入口：Alt+W 不再就地展开内联配置，只提醒去隐藏的接口管理页 ----
     def _summon_maintainer(self):
-        """按 Alt+W（macOS ⌘+W）：弹密文口令框，输对才进入接口配置；
-        同一功能当天只验一次，验过后再按直接聚焦"""
-        if self._base_unlocked:               # 已展开则直接聚焦，不必重复输口令
-            self.ed_api_base.setFocus()
-            return
-        if self._gate_api.ask(self):
-            self._unlock_api_config()
+        """按 Alt+W（macOS ⌘+W）：素材接口配置已收进隐藏的「接口管理」页，
+        这里只弹提醒告诉用户去那里集中维护（不在本面板内联编辑）。"""
+        remind_api_page(self)
 
     def _unlock_api_config(self):
         """口令命中：展开整组接口配置并聚焦地址框（日志不打印任何凭证明文）"""

@@ -318,6 +318,40 @@ class ToolsPage(QWidget):
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+        # 首次打开该工具：面板布局稳定后尝试起分步引导（看过则自动跳过）
+        QTimer.singleShot(600, lambda: self._maybe_tool_guide(name, dlg))
+
+    def _maybe_tool_guide(self, name, dlg):
+        """为首次打开的重点工具（爆款拆解/素材提取/屏幕录制）起高亮向导。
+
+        面板可能为依赖缺失占位窗，getattr 取不到控件时该步自动退化跳过。"""
+        from gui import onboarding
+        panel = getattr(dlg, "panel", None)
+        if panel is None:
+            return
+        g = lambda attr: (lambda: getattr(panel, attr, None))
+        specs = {
+            "爆款拆解": ("tool_爆款拆解", [
+                (g("ed_input"), "粘贴爆款链接", "一行一个分享链接，支持拆多个；拆完自动入库可在「拆解任务」回看。"),
+                (g("cb_model"), "选拆解模型", "选择用于分镜/口播拆解的模型（需先在隐藏接口管理页配好豆包/DeepSeek）。"),
+                (g("b_run"), "开始拆解", "点开始后会后台跑，完成时自动写入拆解历史库。"),
+            ]),
+            "素材提取": ("tool_素材提取", [
+                (g("ed_input"), "粘贴分享链接", "支持抖音/快手等分享链接，一行一个，提取去水印视频/图集/文案。"),
+                (g("ck_video"), "选提取内容", "勾选要提取的部分：去水印视频 / 文案 / 图集。"),
+                (g("ed_out"), "保存目录", "提取结果的存放位置；文案会额外追加进样本库。"),
+            ]),
+            "屏幕录制": ("tool_屏幕录制", [
+                (g("cb_screen"), "选录制区域", "全屏 / 框选区域 / 指定窗口三种录制方式在此选择。"),
+                (g("cb_fps"), "帧率与码率", "选帧率与码率；越高越清晰但文件越大。"),
+                (g("ck_subtitle"), "录完生成字幕", "勾选后录完可顺带用 Whisper 生成字幕（需先在隐藏接口管理页下好模型）。"),
+                (g("b_run"), "开始录制", "点击开始录制，倒计时后正式录制；录制期间可暂停/停止。"),
+            ]),
+        }
+        spec = specs.get(name)
+        if spec:
+            feature, steps = spec
+            onboarding.maybe_run(dlg, feature, steps)
 
     def refresh(self):
         pass

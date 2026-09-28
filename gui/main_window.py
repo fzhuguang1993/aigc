@@ -52,6 +52,7 @@ _NAV_PAGES = [("📊  数据中台", 0), ("📋  任务中心", 1), ("🧩  产�
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._seed_demo_once()          # 首运行看板没内容时播一批演示任务（一次性）
         self.setWindowTitle("AIGC 工厂")
         self._setup_geometry()
         icon = resource_path("assets/app.ico")
@@ -189,6 +190,9 @@ class MainWindow(QMainWindow):
         # 整窗改无边框圆角：标题栏上面已自备，故 add_titlebar=False
         apply_rounded(self, add_titlebar=False, resizable=True)
 
+        # 默认停在数据中台：启动布局稳定后尝试起一次页面向导（看过则自动跳过）
+        QTimer.singleShot(700, lambda: self._maybe_page_guide(self.pages.currentIndex()))
+
     # ---------- 鼠标手势：同一命令在不同上下文映射到不同行为 ----------
     def _active_tool_dialog(self):
         """当前活动窗口往上找最近的 ToolDialog（工具窗口开着时手势认它的面板）"""
@@ -300,6 +304,7 @@ class MainWindow(QMainWindow):
         if kind == "page":
             self._page_row = row
             self.pages.setCurrentIndex(val)
+            QTimer.singleShot(500, lambda: self._maybe_page_guide(val))
             return
         # 固定工具：弹工具窗口、不切页，选中行退回原页面
         self.nav.blockSignals(True)
@@ -365,6 +370,42 @@ class MainWindow(QMainWindow):
         if hasattr(page, "refresh"):
             page.refresh()
         self._update_side_status()
+
+    # ---------- 首次使用引导（分步高亮）与看板演示数据 ----------
+    def _seed_demo_once(self):
+        """新用户首装且库里没有任何真实任务时，播一批演示任务丰富看板（一次性）。
+
+        开发/维护机已有真实数据→demo_seed 内部自动跳过；播过也不重复。
+        任何异常都吞掉，不能让播种影响启动。"""
+        if app_state.get("demo_seeded"):
+            return
+        try:
+            from store import demo_seed
+            demo_seed.seed_demo()
+            app_state.set_value("demo_seeded", True)
+        except Exception:
+            pass
+
+    def _maybe_page_guide(self, index):
+        """切到指定页且此前未看过时，起一个分步高亮向导（任务中心自带向导，不在此列）。"""
+        from gui import onboarding
+        if index == 0:
+            d = self.page_dashboard
+            steps = [
+                (lambda: d.cb_range, "时间范围", "切换统计窗口：今日 / 近 7 天 / 近 30 天……下方所有图表随此联动。"),
+                (lambda: d.k_total, "关键指标", "顶部 KPI 卡是执行总条数/成功/失败/成功率等概览，一眼看全局产能与健康度。"),
+                (lambda: d.tabs, "多页视图", "总览与其他图表分页存放；点「＋ 新建视图」可自建画布，右键添加组件、拖拽布局。"),
+                (lambda: d.trend, "图表可下钻", "点任意图表弹出明细窗，看逐日趋势/占比背后每一笔执行记录。"),
+            ]
+            onboarding.maybe_run(self, "dashboard", steps)
+        elif index == 9:
+            p = self.page_breakdown
+            steps = [
+                (lambda: p.ed_search, "搜索拆解任务", "按标题或关联产品名搜索历史拆解记录。"),
+                (lambda: p._area, "三屏联动卡片", "每张卡片对应一次爆款拆解：点开即图集 / 播放器 / 文档三屏联动。"),
+                (None, "关联产品与右键", "右键卡片可「关联产品」归类、删除；先到「工具中心 → 爆款拆解」跑一条即自动入库。"),
+            ]
+            onboarding.maybe_run(self, "breakdown_page", steps)
 
     def _update_side_status(self):
         if self._checking:                # 检测中不被 2 秒定时刷打断

@@ -58,7 +58,7 @@ class ModelBar(QWidget):
         row.addWidget(self.ck_mirror)
         self.b_dl = QPushButton("⬇ 下载模型")
         self.b_dl.setObjectName("GhostBtn")
-        self.b_dl.clicked.connect(self._download)
+        self.b_dl.clicked.connect(self._goto_api_page)
         row.addWidget(self.b_dl)
         lay.addLayout(row)
 
@@ -92,10 +92,15 @@ class ModelBar(QWidget):
         else:
             hint = f"（已就绪的最佳档：{best}，可直接改选）" if best else "（尚无就绪模型）"
             self.lbl_status.setText(
-                f"⚠ 「{size}」未下载{hint}；点右侧「⬇ 下载模型」就地下载，无需去别处配置")
+                f"⚠ 「{size}」未下载{hint}；模型下载已收进隐藏的「接口管理」页")
             self.lbl_status.setStyleSheet(
                 "font-size:12px; color:#D83931; background:transparent;")
             self.b_dl.setEnabled(True)
+
+    # ---- 模型下载已收到隐藏的接口管理页：本控件不再就地下载，只弹提醒 ----
+    def _goto_api_page(self, *_):
+        from gui.tool_panels import remind_api_page
+        remind_api_page(self)
 
     # ---- 就地下载（后台 ToolWorker，进度走悬浮球）----
     def _download(self, *_):

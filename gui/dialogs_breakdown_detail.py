@@ -591,13 +591,24 @@ class BreakdownDetailDialog(QDialog):
         self.thumbs.blockSignals(False)
 
     # ------------------------------------------------------------------
-    def closeEvent(self, e):
-        """关窗即停播，避免对话框关闭后音频/视频仍在后台继续。"""
+    def _stop_play(self):
+        """停播（幂等）：任何隐藏路径都调它，杜绝关窗后音频/视频仍在后台跑。"""
         try:
             self.player.stop()
         except Exception:
             pass
+
+    def closeEvent(self, e):
+        """close() 路径（顶部「✕ 关闭」）：关窗即停播。"""
+        self._stop_play()
         super().closeEvent(e)
+
+    def hideEvent(self, e):
+        """标题栏右上角「✕」对 QDialog 走的是 reject()→done()→hide()，
+        不触发 closeEvent；这里补一刀，保证那条路径也停播。stop() 幂等，
+        与 closeEvent 并存不会重复出问题。"""
+        self._stop_play()
+        super().hideEvent(e)
 
     def _open_video_dir(self):
         vp = getattr(self, "_video_path", "")
