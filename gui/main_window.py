@@ -1,16 +1,15 @@
 """
 gui/main_window.py —— 主窗口：左侧导航 + 页面栈 + 状态栏，2 秒自动刷新
 """
-import subprocess
 import sys
 import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QIcon, QCursor, QShortcut, QKeySequence
+from PySide6.QtGui import QIcon, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                                QListWidget, QStackedWidget, QLabel, QPushButton,
-                               QMessageBox, QMenu)
+                               QMessageBox)
 
 from utils.desktop_utils import open_path
 from gui.window_frame import TitleBar, apply_rounded
@@ -24,6 +23,12 @@ from gui.pages_guide import GuidePage
 from gui.pages_api import ApiManagerPage
 from gui.pages_org import OrgPage
 from gui.pages_breakdown import BreakdownTasksPage
+from gui.pages_material import MaterialPage
+from gui.pages_output_lib import OutputLibPage
+from gui.pages_remix import RemixPage
+from gui.pages_local_build import LocalBuildPage
+from gui.pages_ui_kit import UiKitPage
+from gui.menus import StyledMenu
 from store import app_state
 
 
@@ -44,9 +49,17 @@ def resource_path(rel):
 # 导航基础项：(文本, 页栈索引)。页栈顺序固定不变；导航行号与索引不再
 # 一一对应——「固定在左侧」的工具项插在「⚙️ 设置」之前，由 _nav_rows 映射表桥接
 # 「🔥 拆解任务」页常驻页栈末尾（索引 9），显示位在「工具中心」之后、「设置」仍在末位
+# 「🎛 UI 组件库」是维护/联调用的视觉画廊（索引 14），先摆在侧栏便于整体核对，后续可改口令呼出
 _NAV_PAGES = [("📊  数据中台", 0), ("📋  任务中心", 1), ("🧩  产品中心", 2),
-              ("📡  线路负载", 3), ("🧰  工具中心", 4), ("🔥  拆解任务", 9),
-              ("📖  新手入门", 5), ("⚙️  设置", 6)]
+              ("📡  线路负载", 3), ("🧰  工具中心", 4), ("🏗  批量基建", 13),
+              ("🔥  拆解任务", 9), ("📖  新手入门", 5), ("🎛  UI 组件库", 14),
+              ("⚙️  设置", 6)]
+
+# 素材工坊折叠分组：素材库/成品库/AI 混剪三项收进一个可折叠组行，点击组行
+# 展开/收起（状态持久化到 ui_state）；页栈索引 10/11/12 与三个页面本体都不动。
+_WORKSHOP_KEY = "nav_workshop_open"
+_WORKSHOP_PAGES = [("🎞  素材库", 10), ("📦  成品库", 11), ("🎬  AI 混剪", 12)]
+_WORKSHOP_INDEXES = {idx for _t, idx in _WORKSHOP_PAGES}
 
 
 class MainWindow(QMainWindow):
@@ -67,16 +80,6 @@ class MainWindow(QMainWindow):
         # 无边框圆角窗口没有系统标题栏：自绘一条（拖动移动 + 最小/最大/关闭）
         self._titlebar = TitleBar(self, "🎬 AIGC 工厂")
         root.insertWidget(0, self._titlebar)
-        # 顶栏身份区：登录后显示「姓名 · 角色（部门）」+ 切换用户；
-        # 挤在标题文字（stretch=1）与窗控按钮之间，单机模式自动隐藏
-        self.lbl_ident = QLabel()
-        self.lbl_ident.setObjectName("AppTitleText")
-        self.btn_switch = QPushButton("🔄 切换用户")
-        self.btn_switch.setObjectName("AppTitleBtn")
-        self.btn_switch.clicked.connect(self._switch_user)
-        tl = self._titlebar.layout()
-        tl.insertWidget(1, self.lbl_ident)
-        tl.insertWidget(2, self.btn_switch)
         body = QHBoxLayout()
         root.addLayout(body)
 
@@ -101,18 +104,6 @@ class MainWindow(QMainWindow):
         self.nav.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.nav.customContextMenuRequested.connect(self._nav_menu)
         slay.addWidget(self.nav, 1)
-        self.lbl_health = QLabel()
-        self.lbl_health.setObjectName("SideStatus")
-        self.lbl_health.setWordWrap(True)
-        # 灯不是只读装饰：点一下立刻逐条真实探活（后台线程，不卡界面）
-        self.lbl_health.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_health.setToolTip(
-            "点击重新检测全部线路（后台线程，几秒后刷新）\n"
-            "🟢 探活接口已应答　🟡 服务在线但探活路径未实现（照样能提交）\n"
-            "🔴 连不上/5xx（选线跳过它）　⚪ 还没测过")
-        self.lbl_health.mousePressEvent = lambda e: self._recheck_health()
-        self._checking = False
-        slay.addWidget(self.lbl_health)
         body.addWidget(sidebar)
 
         # ----- 右侧页面 -----
@@ -132,12 +123,22 @@ class MainWindow(QMainWindow):
         self.page_org = OrgPage()
         # 拆解任务：爆款拆解历史库管理页，常驻页栈末尾（索引 9）
         self.page_breakdown = BreakdownTasksPage()
+        # 素材库：板块切割片段索引页（索引 10），随拆解「切割入素材库」产出
+        self.page_material = MaterialPage()
+        # 成品库（索引 11）/ AI 混剪（索引 12）：产物集中审阅与拼接
+        self.page_output_lib = OutputLibPage()
+        self.page_remix = RemixPage()
+        # 批量基建：三级组织（客户/执照/账户）+ 搭建独立页，常驻页栈末尾（索引 13）
+        self.page_local_build = LocalBuildPage()
+        # UI 组件库（索引 14）：全站视觉令牌/组件画廊，维护/联调用，不吃业务数据
+        self.page_ui_kit = UiKitPage()
         # 页栈顺序固定：数据中台(0)、任务、产品、线路负载、工具、新手、
         # 设置、接口管理(7)、组织结构(8)、拆解任务(9)，与 _NAV_PAGES 的索引对应
         for p in (self.page_dashboard, self.page_tasks, self.page_products,
                   self.page_console, self.page_tools, self.page_guide,
                   self.page_settings, self.page_api, self.page_org,
-                  self.page_breakdown):
+                  self.page_breakdown, self.page_material, self.page_output_lib,
+                  self.page_remix, self.page_local_build, self.page_ui_kit):
             self.pages.addWidget(p)
         body.addWidget(self.pages, 1)
 
@@ -145,28 +146,30 @@ class MainWindow(QMainWindow):
         self.nav.currentRowChanged.connect(self._on_nav_row)
         self._rebuild_nav()
 
-        # ----- 侧栏底部：输出文件夹 + 命令行模式入口 -----
+        # ----- 侧栏底部：只留两个按钮——输出文件夹 + 登录/当前用户 -----
+        # 登录按账号定身份：点按钮弹框输成员姓名+密码，登上来是什么角色就是什么角色；
+        # 按钮文字即状态——未登录显示「未登录」，已登录显示当前用户（见 _update_identity）。
+        # 单机模式（未启用组织）没有登录概念，登录按钮隐藏，只剩输出文件夹。
         b_out = QPushButton("📂 输出文件夹")
         b_out.setObjectName("SideBtn")
         b_out.setToolTip("打开生成视频的存放目录（运行目录下 outputs/）")
         b_out.clicked.connect(self.open_output_dir)
         slay.addWidget(b_out)
 
-        b_console = QPushButton("🖥 打开命令行窗口")
-        b_console.setObjectName("SideBtn")
-        b_console.setToolTip("在新窗口打开黑窗口模式（与界面共用同一数据库）")
-        b_console.clicked.connect(self.open_console_mode)
-        slay.addWidget(b_console)
+        self.btn_switch = QPushButton("未登录")
+        self.btn_switch.setObjectName("SideBtn")
+        self.btn_switch.clicked.connect(self._switch_user)
+        slay.addWidget(self.btn_switch)
 
         self.statusBar().showMessage("就绪 — 完成的视频会自动保存到运行目录 outputs/ 下")
 
         # ----- 商用网关模式属性：必须在首次 _refresh() 之前就位 -----
-        # （_update_side_status 会读 _gateway_mode 画侧栏授权行）
+        # （GATEWAY_MODE 决定是否起联网复核定时器 _license_tick）
         self._lic_checking = False
         from core.config import GATEWAY_MODE
         self._gateway_mode = GATEWAY_MODE
 
-        # ----- 定时刷新（当前页 + 侧栏健康状态）-----
+        # ----- 定时刷新（当前页）-----
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh)
         self.timer.start(2000)
@@ -252,16 +255,24 @@ class MainWindow(QMainWindow):
 
     def _sync_nav_to_page(self, page):
         """手势切页后把左侧选中行也跟过去（否则高亮还停在旧项）"""
-        idx = self.pages.currentIndex()
+        row = self._row_for_page(self.pages.currentIndex())
+        self.nav.blockSignals(True)
+        self.nav.setCurrentRow(row)
+        self._page_row = row
+        self.nav.blockSignals(False)
+
+    def _row_for_page(self, idx):
+        """页栈索引 → 导航行号：精确匹配优先；素材工坊折叠时其子页落到分组行"""
         for row, (kind, val) in enumerate(self._nav_rows):
             if kind == "page" and val == idx:
-                self.nav.blockSignals(True)
-                self.nav.setCurrentRow(row)
-                self._page_row = row
-                self.nav.blockSignals(False)
-                return
+                return row
+        if idx in _WORKSHOP_INDEXES:
+            for row, (kind, _v) in enumerate(self._nav_rows):
+                if kind == "group":
+                    return row
+        return 0
 
-    # ---------- 导航：基础 7 页 + 组织结构(admin) + 固定工具（插到「设置」前面）+ 接口管理 ----------
+    # ---------- 导航：基础 7 页 + 素材工坊折叠组 + 组织结构(admin) + 固定工具（插到「设置」前面）+ 接口管理 ----------
     def _rebuild_nav(self):
         """按 app_state 里的固定列表重拼导航；选中页不变（行号可能因插入而顺移）"""
         from gui.pages_tools import TOOLS
@@ -270,6 +281,7 @@ class MainWindow(QMainWindow):
         rows = []
         items = []
         tail = len(_NAV_PAGES) - 1                # 「⚙️ 设置」是基础项最后一位
+        ws_open = bool(app_state.get(_WORKSHOP_KEY))
         for i, (text, idx) in enumerate(_NAV_PAGES):
             if i == tail:                         # 固定工具默认排在设置前一位
                 # 组织结构只给管理员看（未启用组织时 is_admin=True，要能进来建首个成员）
@@ -279,6 +291,13 @@ class MainWindow(QMainWindow):
                 for name in load_pinned():
                     rows.append(("tool", name))
                     items.append(f"{icons.get(name, '🧰')}  {name}")
+            if idx == 5:                          # 「素材工坊」分组插在「新手入门」前一位
+                rows.append(("group", "workshop"))
+                items.append(f"🗂  素材工坊 {'▾' if ws_open else '▸'}")
+                if ws_open:
+                    for ctext, cidx in _WORKSHOP_PAGES:
+                        rows.append(("page", cidx))
+                        items.append(f"　　└ {ctext}")
             rows.append(("page", idx))
             items.append(text)
         if self._api_revealed:
@@ -289,10 +308,10 @@ class MainWindow(QMainWindow):
         self.nav.blockSignals(True)
         self.nav.clear()
         self.nav.addItems(items)
-        try:
-            row = next(r for r, (k, v) in enumerate(rows) if k == "page" and v == want)
-        except StopIteration:
-            row = 0
+        for r, (kind, _v) in enumerate(rows):
+            if kind == "group":
+                self.nav.item(r).setToolTip("点击展开/收起：素材库 · 成品库 · AI 混剪")
+        row = self._row_for_page(want)
         self._page_row = row
         self.nav.setCurrentRow(row)
         self.nav.blockSignals(False)
@@ -305,6 +324,11 @@ class MainWindow(QMainWindow):
             self._page_row = row
             self.pages.setCurrentIndex(val)
             QTimer.singleShot(500, lambda: self._maybe_page_guide(val))
+            return
+        if kind == "group":
+            # 素材工坊：点击只展开/收起分组，不切页（高亮行由 _rebuild_nav 归位）
+            app_state.set_value(_WORKSHOP_KEY, not bool(app_state.get(_WORKSHOP_KEY)))
+            self._rebuild_nav()
             return
         # 固定工具：弹工具窗口、不切页，选中行退回原页面
         self.nav.blockSignals(True)
@@ -323,7 +347,7 @@ class MainWindow(QMainWindow):
         kind, val = self._nav_rows[row]
         if kind != "tool":
             return
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("📌 从左侧导航取消", lambda n=val: self._unpin_tool(n))
         m.exec(self.nav.mapToGlobal(pos))
 
@@ -369,7 +393,6 @@ class MainWindow(QMainWindow):
         page = self.pages.currentWidget()
         if hasattr(page, "refresh"):
             page.refresh()
-        self._update_side_status()
 
     # ---------- 首次使用引导（分步高亮）与看板演示数据 ----------
     def _seed_demo_once(self):
@@ -407,28 +430,6 @@ class MainWindow(QMainWindow):
             ]
             onboarding.maybe_run(self, "breakdown_page", steps)
 
-    def _update_side_status(self):
-        if self._checking:                # 检测中不被 2 秒定时刷打断
-            return
-        from registry.manager import ACCOUNTS, first_check_done
-        from core.config import USER_NAME
-        if not first_check_done():
-            # 首轮探活还没回来：此刻的 healthy 只是默认值，不能当结果画成绿灯
-            dots = "检测中…" if ACCOUNTS else "无线路"
-        else:
-            # 🟢 探活接口正常应答；🟡 服务有话回但探活路径未实现（能提交，但不谎称
-            # “已测正常”）；🔴 连不上/5xx —— 三档共用 gui.header.line_light
-            from gui.header import line_light
-            dots = "  ".join(line_light(a, True)[0] for a in ACCOUNTS)
-        text = f"服务：{dots}\n当前用户：{USER_NAME or '未配置'}"
-        if self._gateway_mode:
-            # 剩余天数只读本地缓存（不联网）；到期前 3 天黄标提醒续费
-            from core import license as lic
-            left = lic.days_remaining()
-            mark = "🟢" if left > 3 else ("🟡" if left > 0 else "🔴")
-            text += f"\n授权：{mark} 剩余 {left} 天"
-        self.lbl_health.setText(text)
-
     def _license_tick(self):
         """后台联网复核：24h 一次；过期/封禁/超离线宽限 → 弹激活窗"""
         if self._lic_checking:
@@ -458,48 +459,32 @@ class MainWindow(QMainWindow):
                 != QDialog.DialogCode.Accepted:
             QApplication.quit()               # 放弃续费：直接退出程序
 
-    def _recheck_health(self):
-        """手动触发一轮真实检测：绿灯必须是测出来的，不是默认值"""
-        if self._checking:
-            return
-        self._checking = True
-        self.lbl_health.setText("服务：检测中…")
-
-        def run():
-            from registry.manager import check_all_accounts
-            try:
-                check_all_accounts()
-            finally:
-                # 回主线程复位（QTimer.singleShot 线程安全）
-                QTimer.singleShot(0, self._recheck_done)
-        threading.Thread(target=run, daemon=True, name="recheck").start()
-
-    def _recheck_done(self):
-        self._checking = False
-        self._update_side_status()
-
     # ---------- 登录身份 / 切换用户 ----------
     def _update_identity(self):
-        """顶栏身份区：只有登录了（org 启用且有会话）才显示；单机模式整块隐藏"""
+        """左下角登录按钮文字即身份：
+        - 已登录→「👤 姓名 · 角色（部门）」；
+        - 组织已启用但没登录→「未登录」；
+        - 单机模式（组织未启用）没有登录概念，隐藏该按钮。"""
         from store import org_store
         cur = org_store.current()
-        if not cur:
-            self.lbl_ident.setVisible(False)
+        if cur:
+            role = org_store.ROLES.get(cur["role"], cur["role"])
+            dept = f"（{cur['dept']}）" if cur.get("dept") else ""
+            self.btn_switch.setText(f"👤 {cur['name']} · {role}{dept}")
+        elif org_store.org_enabled():
+            self.btn_switch.setText("未登录")
+        else:
             self.btn_switch.setVisible(False)
             return
-        role = org_store.ROLES.get(cur["role"], cur["role"])
-        dept = f"（{cur['dept']}）" if cur.get("dept") else ""
-        self.lbl_ident.setText(f"👤 {cur['name']} · {role}{dept}")
-        self.lbl_ident.setVisible(True)
         self.btn_switch.setVisible(True)
 
     def _switch_user(self):
-        """弹登录框换人：成功→重建导航+刷新全部页；取消→维持原会话"""
+        """弹登录框（按账号定身份）：成功→重建导航+刷新全部页；取消→维持原会话"""
         from PySide6.QtWidgets import QDialog
         from gui.dialogs_login import LoginDialog
         from store import org_store
-        dlg = LoginDialog(self, title="🔄 切换用户")
-        dlg.b_cancel.setText("取消")          # 这里取消不退出，只是不换人
+        title = "🔑 登录" if org_store.current() is None else "🔄 切换用户"
+        dlg = LoginDialog(self, title=title)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._rebuild_nav()
@@ -529,29 +514,3 @@ class MainWindow(QMainWindow):
             open_path(d)
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
-
-    def open_console_mode(self):
-        """启动命令行（黑窗口）模式，与 GUI 共用 data/aigc.db"""
-        from core.config import RUNTIME_DIR
-        try:
-            if getattr(sys, "frozen", False):
-                exe = Path(sys.executable).with_name("AIGC视频助手-命令行.exe")
-                if not exe.exists():
-                    QMessageBox.information(
-                        self, "提示",
-                        "未找到「AIGC视频助手-命令行.exe」，\n"
-                        "请把它与本程序放在同一目录（运行 build.bat 可同时打包两个版本）")
-                    return
-                cmd = [str(exe)]
-            else:
-                py = Path(sys.executable)
-                python = py.with_name("python.exe")
-                cmd = [str(python if python.exists() else py), "main.py"]
-            kwargs = {}
-            if sys.platform.startswith("win"):
-                kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-            else:
-                kwargs["start_new_session"] = True   # 脱离 GUI 终端，独立运行
-            subprocess.Popen(cmd, cwd=str(RUNTIME_DIR), **kwargs)
-        except Exception as e:
-            QMessageBox.critical(self, "启动失败", str(e))

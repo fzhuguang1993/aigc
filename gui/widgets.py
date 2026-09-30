@@ -21,6 +21,7 @@ from gui.maintainer import Gate, app_has_unlocked
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
 from store import app_state
 from utils.desktop_utils import open_path, reveal_in_folder
+from gui.theme import tokenize
 
 
 class FlowLayout(QLayout):
@@ -867,14 +868,14 @@ class _FloatBar(QWidget):
         self._drag = None
         self.setObjectName("ImgFloatBar")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("""
+        self.setStyleSheet(tokenize("""
             #ImgFloatBar QPushButton { background:transparent; color:#E6EAF2;
                 border:0; border-radius:7px; padding:3px 9px; font-size:12px; }
             #ImgFloatBar QPushButton:hover { background:#3A4250; color:#FFFFFF; }
             #ImgFloatBar QPushButton:checked { background:#3370FF; color:#FFFFFF; }
             #ImgFloatBar QPushButton#ImgClose:hover { background:#D94A43; color:#FFFFFF; }
             #ImgFloatBar QLabel { color:#C9CFDA; background:transparent; font-size:12px; }
-        """)
+        """))
         self.lay = QHBoxLayout(self)
         self.lay.setContentsMargins(12, 6, 12, 6)
         self.lay.setSpacing(4)
@@ -1080,12 +1081,12 @@ class HoverPreview(QScrollArea):
         self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setWindowOpacity(0.98)
-        self.setStyleSheet("""
+        self.setStyleSheet(tokenize("""
             QScrollArea { background:#FFFFFF; border:1px solid #C6CFDD; border-radius:8px; }
             QLabel { background:transparent; color:#2B3441; font-size:12px; padding:10px; }
             QScrollBar:vertical { width:8px; background:transparent; }
             QScrollBar::handle:vertical { background:#C6CFDD; border-radius:4px; }
-        """)
+        """))
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1325,18 +1326,18 @@ class Toast(QWidget):
         box.setObjectName("ToastBox")
         box.setTextFormat(Qt.TextFormat.RichText)
         box.setStyleSheet(
-            f"QLabel#ToastBox{{background:#FFFFFF;color:#1F2329;"
+            tokenize(f"QLabel#ToastBox{{background:#FFFFFF;color:#1F2329;"
             f"border:1px solid {color};border-left:4px solid {color};"
-            f"border-radius:8px;padding:10px 14px;}}")
+            f"border-radius:8px;padding:10px 14px;}}"))
         lay.addWidget(box)
         if action_text:
             btn = QPushButton(action_text)
             btn.setObjectName("ToastBtn")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet(
-                "QPushButton#ToastBtn{background:#FFFFFF;color:#3370FF;"
+                tokenize("QPushButton#ToastBtn{background:#FFFFFF;color:#3370FF;"
                 "border:1px solid #DEE0E3;border-radius:8px;padding:8px 12px;}"
-                "QPushButton#ToastBtn:hover{border-color:#3370FF;}")
+                "QPushButton#ToastBtn:hover{border-color:#3370FF;}"))
             btn.clicked.connect(self._do_action)
             lay.addWidget(btn)
         self.adjustSize()
@@ -1427,7 +1428,7 @@ class LoadingOverlay(QWidget):
         self.spinner = _Spinner(self)
         lay.addWidget(self.spinner)
         lbl = QLabel("加载中，请稍候…")
-        lbl.setStyleSheet("color:#646A73; font-size:13px; background:transparent;")
+        lbl.setStyleSheet(tokenize("color:#646A73; font-size:13px; background:transparent;"))
         lay.addWidget(lbl)
         lay.addStretch(1)
         self.hide()

@@ -21,6 +21,8 @@ from gui.asr_widgets import FixToggle
 from gui.maintainer import Gate, app_has_unlocked
 from gui.tool_panels import BasePanel, ToolWorker, remind_api_page
 from utils.desktop_utils import open_path
+from core import special  # [特供版 special] 测试特供版裁剪总入口（逻辑全在 core/special.py）
+from gui.theme import tokenize
 
 # 豆包配置引导文案（火山方舟：新用户额度 / 协作奖励 / 选视觉模型 / 填 ep-id）
 _DOUBAO_GUIDE = (
@@ -76,6 +78,11 @@ class BreakdownPanel(BasePanel):
         except Exception:
             _def = None
         self.cb_model.setCurrentText(_def or "medium")
+        # 互斥开关：是否用 Whisper 本地转写口播。关掉后整条“转写 + DeepSeek 纠错”
+        # 都跳过（大字报/纯 BGM 素材本就没口播，口播稿也可由素材提取提供）；
+        # 画面拆解与分镜/图集时间轴联动不依赖 Whisper，照常产出。
+        self.ck_whisper = QCheckBox("使用 Whisper 本地转写口播（逐字稿与口播轴需要；关掉仅做画面拆解）")
+        self.ck_whisper.setChecked(True)
         self.sp_interval = QSpinBox()
         self.sp_interval.setRange(1, 15)
         self.sp_interval.setValue(3)
@@ -107,11 +114,6 @@ class BreakdownPanel(BasePanel):
         r_out = QHBoxLayout()
         r_out.addWidget(self.ed_out, 1)
         r_out.addWidget(b_pick)
-        form.addRow("Whisper 模型：", self.cb_model)
-        form.addRow("视觉方式：", self.cb_vmode)
-        form.addRow("抽帧密度：", self.dsb_fps)
-        form.addRow("抽帧间隔：", self.sp_interval)
-        form.addRow("视觉并发：", self.sp_conc)
 
         def _sync_vmode(*_):
             """直连模式：fps 生效、抽帧间隔/并发置灰；逐帧模式反之。"""
@@ -122,9 +124,37 @@ class BreakdownPanel(BasePanel):
         self.cb_vmode.currentIndexChanged.connect(_sync_vmode)
         _sync_vmode()
         self.ck_fix = FixToggle("✨ DeepSeek 语义纠错（先改同音字再送豆包拆解，需已配置）")
+        special.hook_disable_deepseek(self.ck_fix)   # [特供版 special] 强制不走 DeepSeek：勾选即弹窗告知并取消
+        # 强制重跑：忽略该链接的阶段缓存与「已完成任务」，逐阶段重算并覆盖写缓存。
+        self.ck_force = QCheckBox("强制重跑（忽略缓存与已完成任务，重新调用接口）")
+        # 板块拆分：让豆包按营销板块切时间轴（供后续素材切割），默认开；类型白名单取配置。
+        self.ck_blocks = QCheckBox("板块拆分（按钩子/痛点/行动号召等切时间轴，供素材切割）")
+        self.ck_blocks.setChecked(True)
+        self._block_types = list(_bd.get("blocks_types") or [])
+
+        def _sync_whisper(*_):
+            """Whisper 互斥：不启用时置灰模型下拉与 DeepSeek 纠错（纠错依于转写），
+            并刷引导区 Whisper 状态提示。"""
+            on = self.ck_whisper.isChecked()
+            self.cb_model.setEnabled(on)
+            self.ck_fix.setEnabled(on)
+            # 引导区控件在 _build_guide() 才创建：首屏 _sync_whisper() 跑在其之前，
+            # 未建好时跳过刷状态（后面 make_run_row 前会再显式 _refresh_status 一次）。
+            if hasattr(self, "lbl_whisper"):
+                self._refresh_status()
+        self.ck_whisper.toggled.connect(_sync_whisper)
+        form.addRow("口播识别：", self.ck_whisper)
+        form.addRow("Whisper 模型：", self.cb_model)
+        form.addRow("视觉方式：", self.cb_vmode)
+        form.addRow("抽帧密度：", self.dsb_fps)
+        form.addRow("抽帧间隔：", self.sp_interval)
+        form.addRow("视觉并发：", self.sp_conc)
         form.addRow("识别后：", self.ck_fix)
+        form.addRow("板块：", self.ck_blocks)
+        form.addRow("重跑：", self.ck_force)
         form.addRow("视频存到：", r_out)
         outer.addLayout(form)
+        _sync_whisper()
 
         # ---- 首次引导：Whisper + 豆包 ----
         outer.addWidget(self._build_guide())
@@ -208,14 +238,20 @@ class BreakdownPanel(BasePanel):
         from video_text_tools.asr import transcribe as tr
         from core.config import doubao_vision_ready
         size = self.cb_model.currentText()
-        if tr.model_ready(size):
-            self.lbl_whisper.setText(f"✅ Whisper「{size}」模型已就绪")
+        if not self.ck_whisper.isChecked():
+            self.lbl_whisper.setText("⏭ 未启用 Whisper：本次仅做画面拆解（分镜/图集联动不受影响）")
             self.lbl_whisper.setStyleSheet(_OK_QSS)
+            self.b_whisper_cfg.setEnabled(False)
         else:
-            best = tr.best_ready_size()
-            hint = f"（已就绪的最佳档：{best}，可改选）" if best else ""
-            self.lbl_whisper.setText(f"⚠ Whisper「{size}」未下载{hint}；下载请到接口管理页")
-            self.lbl_whisper.setStyleSheet(_WARN_QSS)
+            self.b_whisper_cfg.setEnabled(True)
+            if tr.model_ready(size):
+                self.lbl_whisper.setText(f"✅ Whisper「{size}」模型已就绪")
+                self.lbl_whisper.setStyleSheet(_OK_QSS)
+            else:
+                best = tr.best_ready_size()
+                hint = f"（已就绪的最佳档：{best}，可改选）" if best else ""
+                self.lbl_whisper.setText(f"⚠ Whisper「{size}」未下载{hint}；下载请到接口管理页")
+                self.lbl_whisper.setStyleSheet(_WARN_QSS)
         if doubao_vision_ready():
             self.lbl_doubao.setText("✅ 豆包 Vision 已配置")
             self.lbl_doubao.setStyleSheet(_OK_QSS)
@@ -270,12 +306,25 @@ class BreakdownPanel(BasePanel):
         if not text:
             QMessageBox.information(self, "提示", "请先粘贴要拆解的分享链接")
             return None
+        # 命中「已完成任务」短路：同链接已拆过且产物文件仍在→直接载入详情，不进 worker、不调接口。
+        if not self.ck_force.isChecked():
+            hit = self._find_done(text)
+            if hit is not None:
+                self.on_result(hit)
+                self._append_log("⏭ 命中已完成任务（同链接），已直接载入详情、未调用接口；"
+                                 "如需重新拆解请勾选「强制重跑」。")
+                return None
+        # [特供版 special] 爆款拆解额度闸门：真正要新起一次拆解时才拦（命中缓存短路已在上面返回）
+        if not special.guard_breakdown_run(self):
+            return None
         self._refresh_parse_api()   # 开始前刷新一遍，确保显示的 uid/key 是当前生效值
         from core.config import doubao_vision_config
         from video_text_tools.material_extract import load_allowed_hosts
         from core.config import API_TEXT_DIR
+        _use_whisper = self.ck_whisper.isChecked()
         opts = {
             "model_size": self.cb_model.currentText(),
+            "use_whisper": _use_whisper,
             "vision_mode": self.cb_vmode.currentData(),
             "fps": self.dsb_fps.value(),
             "interval": self.sp_interval.value(),
@@ -284,7 +333,14 @@ class BreakdownPanel(BasePanel):
             "out_dir": self.ed_out.text().strip(),
             "doubao_cfg": doubao_vision_config(),
             "hosts_video": load_allowed_hosts(Path(API_TEXT_DIR) / "video.txt"),
-            "asr_fix": self.ck_fix.isChecked(),
+            # 纠错依赖转写：未启用 Whisper 时自然不带 DeepSeek 纠错
+            "asr_fix": _use_whisper and self.ck_fix.isChecked(),
+            # 阶段缓存 + 断点续跑：同链接缺哪阶段只补跑那阶段；强制重跑则全重算。
+            "cache": True,
+            "force": self.ck_force.isChecked(),
+            # 板块拆分：可选阶段，类型白名单来自 config 的 breakdown.blocks_types
+            "use_blocks": self.ck_blocks.isChecked(),
+            "block_types": self._block_types,
         }
 
         def fn(log, progress, should_stop):
@@ -295,6 +351,17 @@ class BreakdownPanel(BasePanel):
             self._post_process(res, opts.get("out_dir", ""), log)
             return res
         return fn
+
+    def _find_done(self, text):
+        """查同链接是否已有「完整且在盘」的拆解任务；有则返回可展示的 BreakdownResult。"""
+        try:
+            from store import breakdown_store
+            row = breakdown_store.find_complete(text)
+            if not row:
+                return None
+            return breakdown_store.load_result(int(row["id"]))
+        except Exception:
+            return None
 
     def _post_process(self, res, out_dir, log):
         """拆解跑完的落盘三步（worker 线程里跑）：只碰文件与库，不碰任何控件。
@@ -331,6 +398,8 @@ class BreakdownPanel(BasePanel):
             breakdown_store.save(res, gallery_dir=gal_dir, log=log)
         except Exception as e:
             log(f"✗ 拆解任务入库失败：{e}")
+        # [特供版 special] 走到这里＝本次完整成功（半成品已在上面提前返回）→ 记一次额度
+        special.note_breakdown_success()
 
     def on_result(self, res):
         self._last_result = res
@@ -391,7 +460,7 @@ class BreakdownPanel(BasePanel):
         v.setSpacing(6)
         head = QHBoxLayout()
         t = QLabel("拆解任务")
-        t.setStyleSheet("font-size:13px; font-weight:700; color:#1F2329; background:transparent;")
+        t.setStyleSheet(tokenize("font-size:13px; font-weight:700; color:#1F2329; background:transparent;"))
         head.addWidget(t)
         head.addStretch(1)
         b_mgr = QPushButton("🗂 管理")

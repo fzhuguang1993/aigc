@@ -519,7 +519,9 @@ def save_doubao_vision(api_key, endpoint, base_url=None):
 #     fps：video_url 直连时模型内部抽帧频率（方舟范围 [0.2,5]，默认 0.5）。
 #     GUI 面板初值从这里读；要改直接编辑 config.json 的 breakdown 段。
 # ============================================================
-BREAKDOWN_DEFAULTS = {"vision_mode": "video_url", "fps": 0.5}
+BREAKDOWN_DEFAULTS = {"vision_mode": "video_url", "fps": 0.5,
+                      "blocks_types": ["钩子", "痛点", "产品介绍",
+                                        "权威背书", "使用场景", "行动号召"]}
 
 
 def breakdown_config():
@@ -530,8 +532,35 @@ def breakdown_config():
         fps = float(sec.get("fps", 0.5))
     except (TypeError, ValueError):
         fps = 0.5
+    types = sec.get("blocks_types")
+    types = [str(t).strip() for t in types if str(t or "").strip()] \
+        if isinstance(types, list) else []
     return {"vision_mode": mode if mode in ("video_url", "frames") else "video_url",
-            "fps": min(5.0, max(0.2, fps))}
+            "fps": min(5.0, max(0.2, fps)),
+            "blocks_types": types or list(BREAKDOWN_DEFAULTS["blocks_types"])}
+
+
+# ============================================================
+# 17.7 存储后端（素材库/成品库）：本轮仅本地实现，SMB/OSS 预留
+#      storage 段：backend = local/smb/oss（默认 local）；
+#      material_root/output_root 留空回退 DOWNLOAD_DIR 下的默认子目录。
+#      路径改后重启生效（与既有 paths 项一致）；core/storage.py 据此选实例。
+# ============================================================
+STORAGE_DEFAULTS = {"backend": "local", "material_root": "", "output_root": ""}
+
+
+def storage_config():
+    """生效的存储配置：backend 只认 local/smb/oss，根目录留空回退本地默认。"""
+    sec = read_section("storage", STORAGE_DEFAULTS)
+    backend = str(sec.get("backend") or "local").strip().lower()
+    if backend not in ("local", "smb", "oss"):
+        backend = "local"
+    material_root = str(sec.get("material_root") or "").strip() \
+        or str(Path(DOWNLOAD_DIR) / "素材库")
+    output_root = str(sec.get("output_root") or "").strip() \
+        or str(Path(DOWNLOAD_DIR) / "成品库")
+    return {"backend": backend, "material_root": material_root,
+            "output_root": output_root}
 
 
 # ============================================================
@@ -815,3 +844,141 @@ def subtitle_config():
         else:
             out[k] = v
     return out
+
+
+# ============================================================
+# 20. 批量基建：抖音本地推端点 + 账户/计划方案（对标 §18 一键发布的结构）
+#     local_push 段：本地推开放平台端点/附加请求头等**可变项**（端点真实值后期
+#       填；占位 <...> 会被适配器判为“未配置”，明确报错不假成功）。
+#     local_accounts 段：一个列表，每条一个本地推账户；access_token 等凭证以
+#       USER_NAME 为盐 Fernet 加密存 secret_enc（与 publish_accounts 同构、互不影响）。
+#     local_plans 段：批量搭建用的“计划方案”模板（无敏感信息，明文列表存放），
+#       一个方案 = 项目/营销层参数 + 素材清单，执行时按 方案 × 账户 批量下发。
+# ============================================================
+LOCAL_PUSH_DEFAULTS = {
+    "douyin": {
+        # 巨量引擎开放平台端点：路径按官方 v3.0 惯例预置，真实值后期填
+        "api_base": "https://open.oceanengine.com",
+        "advertiser_info_url": "",   # 授权校验（查询广告主信息）
+        "asset_upload_url": "",      # 素材上传（视频 → video_id）
+        "project_create_url": "",    # 创建项目（预算/出价/定向）
+        "marketing_create_url": "",  # 创建营销（绑定素材/门店或商品）
+        "headers": {},               # 附加请求头（缺省只带 access_token）
+    },
+}
+
+
+def local_push_config():
+    """批量基建的平台可变配置（config.json 的 local_push 段，缺省回退内置默认）。"""
+    sec = read_section("local_push", {})
+    out = {k: dict(v) for k, v in LOCAL_PUSH_DEFAULTS.items()}
+    for plat, vals in (sec or {}).items():
+        if isinstance(vals, dict):
+            out.setdefault(plat, {}).update(vals)
+    return out
+
+
+def _local_accounts_raw():
+    v = _json_data().get("local_accounts")
+    return v if isinstance(v, list) else []
+
+
+def list_local_accounts():
+    """（已废弃 DEPRECATED：账户已迁 SQLite local_ad_accounts，此处仅作一次性
+    迁移源被 local_org_store.migrate_from_config() 读取，新代码勿再调用。）
+
+    全部本地推账户，secret 已解密回明文 dict（供 local_push.accounts 组装）。
+
+    每条：{id, platform, label, advertiser_id, auth_type, secret(dict), extra(dict)}。
+    secret_enc 解不开（姓名不符/损坏）时该条 secret 置空，按未配置处理，不抛。"""
+    from video_text_tools.material_extract import decrypt_value
+    out = []
+    for e in _local_accounts_raw():
+        if not isinstance(e, dict):
+            continue
+        enc = str(e.get("secret_enc") or "")
+        plain = decrypt_value(enc, USER_NAME) if enc else ""
+        try:
+            secret = _json.loads(plain) if plain else {}
+        except ValueError:
+            secret = {}
+        if not isinstance(secret, dict):
+            secret = {}
+        out.append({
+            "id": str(e.get("id") or ""),
+            "platform": str(e.get("platform") or ""),
+            "label": str(e.get("label") or ""),
+            "advertiser_id": str(e.get("advertiser_id") or ""),
+            "auth_type": str(e.get("auth_type") or "oauth"),
+            "secret": secret,
+            "extra": e.get("extra") if isinstance(e.get("extra"), dict) else {},
+        })
+    return out
+
+
+def save_local_account(acct):
+    """（已废弃 DEPRECATED：账户写路径改走 local_org_store 落 SQLite，此处仅保留
+    兼容，迁移后不再被调用。）
+
+    按 id upsert 一个本地推账户（acct 为 dict：id/platform/label/
+    advertiser_id/auth_type/secret/extra）。凭证加密口径与一键发布完全一致，
+    返回最终 id。"""
+    from video_text_tools.material_extract import encrypt_value
+    import uuid
+    acct_id = str(acct.get("id") or "") or uuid.uuid4().hex[:12]
+    secret = acct.get("secret") or {}
+    blob = _json.dumps(secret, ensure_ascii=False)
+    entry = {
+        "id": acct_id,
+        "platform": str(acct.get("platform") or ""),
+        "label": str(acct.get("label") or ""),
+        "advertiser_id": str(acct.get("advertiser_id") or ""),
+        "auth_type": str(acct.get("auth_type") or "oauth"),
+        "secret_enc": encrypt_value(blob, USER_NAME),
+        "extra": acct.get("extra") if isinstance(acct.get("extra"), dict) else {},
+    }
+    items = [e for e in _local_accounts_raw() if isinstance(e, dict)]
+    items = [e for e in items if str(e.get("id") or "") != acct_id]
+    items.append(entry)
+    write_section("local_accounts", items)
+    return acct_id
+
+
+def delete_local_account(acc_id):
+    """（已废弃 DEPRECATED：账户删除改走 local_org_store 落 SQLite，此处仅保留兼容。）
+
+    按 id 删除一个本地推账户；返回是否删掉了。"""
+    items = [e for e in _local_accounts_raw() if isinstance(e, dict)]
+    kept = [e for e in items if str(e.get("id") or "") != str(acc_id)]
+    if len(kept) == len(items):
+        return False
+    write_section("local_accounts", kept)
+    return True
+
+
+def list_local_plans():
+    """全部计划方案模板（明文列表，无敏感信息）。"""
+    v = _json_data().get("local_plans")
+    return [e for e in v if isinstance(e, dict)] if isinstance(v, list) else []
+
+
+def save_local_plan(plan):
+    """按 id upsert 一个计划方案；返回最终 id。"""
+    import uuid
+    plan_id = str(plan.get("id") or "") or uuid.uuid4().hex[:12]
+    entry = dict(plan)
+    entry["id"] = plan_id
+    items = [e for e in list_local_plans() if str(e.get("id") or "") != plan_id]
+    items.append(entry)
+    write_section("local_plans", items)
+    return plan_id
+
+
+def delete_local_plan(plan_id):
+    """按 id 删除一个计划方案；返回是否删掉了。"""
+    items = list_local_plans()
+    kept = [e for e in items if str(e.get("id") or "") != str(plan_id)]
+    if len(kept) == len(items):
+        return False
+    write_section("local_plans", kept)
+    return True

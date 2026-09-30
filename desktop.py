@@ -6,7 +6,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from PySide6.QtGui import QIcon
 
 import core.config as config
@@ -50,14 +50,23 @@ def main():
     if not ensure_valid():
         sys.exit(0)
 
+    # 试用版限时锁定：仅当打包时写了 TRIAL_HOURS 才生效（正式版=0 整体放行，零影响）。
+    # 口径是「首次运行起 N 小时」的自然日历，到期弹窗退出；trial.json + 注册表双锚点
+    # 防手改 / 防删，见过最大时间戳单调不回退防改系统时间续命。详见 core/trial.py。
+    from core import trial
+    if trial.trial_enabled():
+        ok, msg, _remain = trial.check_and_persist()
+        if not ok:
+            QMessageBox.warning(None, "试用已结束", msg)
+            sys.exit(0)
+
     from store import db
     db.init()
 
-    # 组织结构启用后必须先登录（org 表要等 db.init() 建好才能查）；
-    # 关闭/取消登录框＝退出应用，登录态不落盘——每次启动都要登录
-    from gui.dialogs_login import require_login
-    if not require_login():
-        sys.exit(0)
+    # 默认不再强制登录框：直接进主窗口。顶栏右侧显示当前用户，没登录就显示
+    # 「未登录」，需要登录/换人时点「🔄 切换用户」现场登录（登录态仍不落盘）。
+    # 未登录时数据按「不限」处理（等同 admin 可见范围），登录后再按角色圈定；
+    # 单机模式（未启用组织）本就没有登录概念。
 
     from registry.manager import health_monitor_worker
     from workers.poll import start_poll_threads

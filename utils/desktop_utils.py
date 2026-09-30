@@ -104,7 +104,7 @@ def _trash_windows(files):
                     ("wFunc", wintypes.UINT),
                     ("pFrom", wintypes.LPCWSTR),
                     ("pTo", wintypes.LPCWSTR),
-                    ("fFlags", ctypes.c_uint16),
+                    ("fFlags", wintypes.UINT),
                     ("fAnyOperationsAborted", wintypes.BOOL),
                     ("hNameMappings", ctypes.c_void_p),
                     ("lpszProgressTitle", wintypes.LPCWSTR)]
@@ -113,10 +113,16 @@ def _trash_windows(files):
     FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_ALLOWUNDO = 0x4, 0x10, 0x400, 0x40
     shell = ctypes.windll.shell32
     for f in files:
+        # 双 \0 结尾：SHFileOperation 用 "path\0\0" 表示单元素列表的结束
         buf = ctypes.create_unicode_buffer(f + "\x00\x00")
-        op = _SHFILEOPSTRUCTW(None, FO_DELETE, buf, None,
-                              FOF_ALLOWUNDO | FOF_SILENT | FOF_NOCONFIRMATION
-                              | FOF_NOERRORUI, False, None, None)
+        op = _SHFILEOPSTRUCTW()
+        op.wFunc = FO_DELETE
+        # ⚠ pFrom 是 LPCWSTR（指针字段），不能直接把 create_unicode_buffer 的
+        # 字符数组塞进去（ctypes 报 incompatible types，异常被 Qt 槽吞掉后表现为
+        # “点了确认但没删”）——cast 成 c_wchar_p 指进 buf，且 buf 须存活到调用返回。
+        op.pFrom = ctypes.cast(buf, ctypes.c_wchar_p)
+        op.fFlags = (FOF_ALLOWUNDO | FOF_SILENT | FOF_NOCONFIRMATION
+                     | FOF_NOERRORUI)
         try:
             code = shell.SHFileOperationW(ctypes.byref(op))
         except Exception as e:

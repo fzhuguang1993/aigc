@@ -166,10 +166,14 @@ def test_model_not_ready(monkeypatch):
 
 
 def test_model_ready_checks_completed_weight(tmp_path, monkeypatch):
-    """只认「非 .incomplete 且足够大的权重块」才算就绪；只有小 config 不算。"""
+    """只认「非 .incomplete 且足够大的权重块」才算就绪；只有小 config 不算。
+
+    本用例只验「权重文件探测」这一段逻辑，与 faster_whisper 是否安装无关，
+    故把 whisper_available 钉成 True 隔离掉可选重依赖（没装库的开发机也能跑）。"""
     import core.config as cfg
     from pathlib import Path
     monkeypatch.setattr(cfg, "MODELS_DIR", str(tmp_path / "models"))
+    monkeypatch.setattr(tr, "whisper_available", lambda: True)
     root = Path(cfg.MODELS_DIR) / tr._model_dir_name("tiny")
     (root / "blobs").mkdir(parents=True, exist_ok=True)
     (root / "blobs" / "cfg.json").write_bytes(b"{}")       # 只有小文件
@@ -339,9 +343,12 @@ def test_resume_get_keeps_part_when_incomplete(tmp_path):
 
 
 def test_plain_dir_model_ready_and_resolve(tmp_path, monkeypatch):
-    """平铺目录里有下完的 model.bin → 就绪，且 resolve 指回该目录；没下完→用 HF 档名。"""
+    """平铺目录里有下完的 model.bin → 就绪，且 resolve 指回该目录；没下完→用 HF 档名。
+
+    同 weight 用例：只验文件探测，whisper_available 钉 True 隔离可选依赖。"""
     import core.config as cfg
     monkeypatch.setattr(cfg, "MODELS_DIR", str(tmp_path / "models"))
+    monkeypatch.setattr(tr, "whisper_available", lambda: True)
     d = tr._plain_dir("small")
     d.mkdir(parents=True)
     assert tr.model_ready("small") is False

@@ -10,13 +10,15 @@ from PySide6.QtCore import Qt, QTimer, QPoint, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QScrollArea, QSizePolicy, QDialog, QGridLayout,
-                               QGraphicsDropShadowEffect, QMenu, QKeySequenceEdit,
+                               QGraphicsDropShadowEffect, QKeySequenceEdit,
                                QDialogButtonBox)
 
 from gui.header import page_header
 from gui.tool_panels import PANEL_FACTORIES
 from gui.window_frame import apply_rounded
+from gui.menus import StyledMenu
 from store import app_state
+from gui.theme import tokenize
 
 # 工具登记表：名称 / 图标 / 简介 / factory 名（None = 规划中）
 TOOLS = [
@@ -28,6 +30,7 @@ TOOLS = [
     ("视频溯源", "🔎", "溯源码池取码、按规则重命名并入库（需内网 MySQL）", "视频溯源"),
     ("素材提取", "🧲", "粘贴唞喑/筷手分享链接：提取去水印视频、图集、文案", "素材提取"),
     ("屏幕录制", "🎥", "全屏/框选区域/指定窗口录制，选帧率码率保存 MP4", "屏幕录制"),
+    ("录屏测试Demo", "🎬", "极简：一键录全屏，可选系统声音与画面混成单个 MP4（测试用）", "录屏测试Demo"),
     ("语音识别", "🎙", "选视频→Whisper 转口播逐字稿，导出 TXT/SRT 字幕、DeepSeek 纠错、可烧录", "语音识别"),
     ("爆款拆解", "🔥", "粘贴爆款链接：拆分镜/口播，产出画面/文案/复刻 3 类提示词与整体分析", "爆款拆解"),
     ("一键发布", "🚀", "选成品视频与平台账号，一键分发到抖音/快手/小红书/视频号", "一键发布"),
@@ -106,13 +109,13 @@ class ToolCard(QWidget):
         badge = QLabel(icon)
         badge.setFixedSize(34, 34)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setStyleSheet("background:#EAF1FF; border-radius:9px; font-size:17px;")
+        badge.setStyleSheet(tokenize("background:#EAF1FF; border-radius:9px; font-size:17px;"))
         self._badge = badge
         t = QLabel(name)
-        t.setStyleSheet("font-size:14px; font-weight:700; color:#1F2329; background:transparent;")
+        t.setStyleSheet(tokenize("font-size:14px; font-weight:700; color:#1F2329; background:transparent;"))
         self._title_lbl = t
         sc = QLabel("")
-        sc.setStyleSheet("font-size:12px; font-weight:600; color:#8F959E; background:transparent;")
+        sc.setStyleSheet(tokenize("font-size:12px; font-weight:600; color:#8F959E; background:transparent;"))
         self._sc_lbl = sc
         h.addWidget(badge)
         h.addWidget(t)
@@ -121,7 +124,7 @@ class ToolCard(QWidget):
         lay.addLayout(h)
         d = QLabel(desc)
         d.setWordWrap(True)
-        d.setStyleSheet("font-size:12px; color:#646A73; background:transparent;")
+        d.setStyleSheet(tokenize("font-size:12px; color:#646A73; background:transparent;"))
         lay.addWidget(d)
         lay.addStretch(1)
         state = QLabel("✓ 可用 · 点击打开" if factory else "🚧 规划中")
@@ -153,7 +156,7 @@ class ToolCard(QWidget):
             return
         pinned = self.tool_name in load_pinned()
         cur = (app_state.get("tool_shortcuts") or {}).get(self.tool_name, "")
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("📌 从左侧导航取消" if pinned else "📌 固定在左侧导航",
                     self._toggle_pin)
         m.addAction("⌨ 更改快捷键…" if cur else "⌨ 设置快捷键…", self._set_shortcut)

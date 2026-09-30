@@ -107,8 +107,12 @@ def is_admin():
     return bool(_CURRENT) and _CURRENT["role"] == "admin"
 
 
-def visible_accounts():
-    """当前会话可看的线路名列表；None＝不限制，[]=一条都不许看。"""
+def visible_owners():
+    """当前会话允许的「负责人名字」集合；None＝不限制（admin/单机/未登录），
+    list＝只有这些成员负责的才可见。
+
+    批量基建三级组织（客户/执照/账户）与线路数据权限共用同一套角色语义：
+    member 只看自己、manager 看本部门 active 成员并集、admin/单机不限。"""
     if not org_enabled() or _CURRENT is None:
         return None
     role = _CURRENT["role"]
@@ -116,11 +120,19 @@ def visible_accounts():
         return None
     who = [_CURRENT["name"]]
     if role == "manager" and _CURRENT.get("dept"):
-        # 主管＝本部门全部 active 成员名下线路的并集（含自己）
+        # 主管＝本部门全部 active 成员（含自己）
         rows = db.query(
             "SELECT name FROM org_members WHERE dept=? AND active=1",
             (_CURRENT["dept"],))
         who = list(dict.fromkeys([r["name"] for r in rows] + who))
+    return who
+
+
+def visible_accounts():
+    """当前会话可看的线路名列表；None＝不限制，[]=一条都不许看。"""
+    who = visible_owners()
+    if who is None:
+        return None
     ph = ",".join("?" * len(who))
     rows = db.query(
         f"SELECT account FROM org_line_owners WHERE owner IN ({ph})", who)

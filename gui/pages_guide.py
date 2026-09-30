@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QTextBrowser
 
 from gui.header import page_header
+from gui.theme import tokenize
 
 HTML_STYLE = """"""
 
@@ -466,8 +467,8 @@ class GuidePage(QWidget):
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
-        self.view.setStyleSheet("QTextBrowser { background:#FFFFFF; border:1px solid #E5E7EB;"
-                                " border-radius:10px; }")
+        self.view.setStyleSheet(tokenize("QTextBrowser { background:#FFFFFF; border:1px solid #E5E7EB;"
+                                " border-radius:10px; }"))
         body.addWidget(self.view, 1)
         lay.addLayout(body, 1)
         self.nav.setCurrentRow(0)

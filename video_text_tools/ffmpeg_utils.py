@@ -230,3 +230,91 @@ def generate_output_filename(input_path: str, position_mode: int) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     mode_name = mode_names.get(position_mode, '水印')
     return f"{today}_{base_name}_水印_{mode_name}.mp4"
+
+
+# ----------------------------------------------------------------------
+# 片段切割 / 拼接（爆款拆解→素材库→混剪共用）
+#   build_* 只拼命令不执行（便于单测断言）；cut_segment/concat_clips 负责落盘与回因。
+# ----------------------------------------------------------------------
+def build_cut_command(src, start, end, dst, reencode=False, ffmpeg=None):
+    """拼一条切割命令：默认 -ss/-to 输入侧定位 + -c copy（快、无损、按关键帧）。
+
+    reencode=True 走精确切（解码重编，不受关键帧间距限制，但慢）。"""
+    ffmpeg = ffmpeg or get_ffmpeg_path()
+    cmd = [ffmpeg, '-y', '-ss', f'{float(start):.3f}', '-to', f'{float(end):.3f}',
+           '-i', str(src)]
+    if reencode:
+        cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac']
+    else:
+        cmd += ['-c', 'copy']
+    cmd.append(str(dst))
+    return cmd
+
+
+def cut_segment(src, start, end, dst, reencode=False, timeout=600):
+    """从 src 切 [start,end] 秒到 dst。返回 (ok, 原因)；参数非法/执行失败都给可读原因。"""
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError):
+        return False, '起止时间非法'
+    if end <= start or start < 0:
+        return False, f'区间非法（{start}~{end}）'
+    if not Path(src).exists():
+        return False, f'源视频不存在：{src}'
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    cmd = build_cut_command(src, start, end, dst, reencode=reencode)
+    try:
+        result = _run_subprocess(cmd, timeout=timeout)
+    except Exception as e:
+        return False, f'ffmpeg 执行异常：{e}'
+    if result.returncode != 0 or not Path(dst).exists():
+        err = (result.stderr or result.stdout or '').strip()[-200:]
+        return False, f'切割失败：{err or result.returncode}'
+    return True, ''
+
+
+def write_concat_list(clips, list_path):
+    """把片段列表写成 concat 清单文件（单引号转义），返回清单路径。"""
+    lines = []
+    for p in clips:
+        safe = Path(p).as_posix().replace("'", "'\\''")
+        lines.append(f"file '{safe}'")
+    Path(list_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(list_path).write_text('\n'.join(lines), encoding='utf-8')
+    return list_path
+
+
+def build_concat_command(list_path, dst, reencode=False, ffmpeg=None):
+    """用 concat 封装器拼拼接命令（清单走 -f concat -safe 0）。reencode=True 时重编统一规格。"""
+    ffmpeg = ffmpeg or get_ffmpeg_path()
+    cmd = [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', str(list_path)]
+    if reencode:
+        cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac']
+    else:
+        cmd += ['-c', 'copy']
+    cmd.append(str(dst))
+    return cmd
+
+
+def concat_clips(clips, dst, reencode=False, timeout=1800):
+    """把多个片段按序拼成 dst（临时清单跑完即删）。返回 (ok, 原因)。"""
+    clips = [c for c in (clips or []) if Path(c).exists()]
+    if not clips:
+        return False, '无可拼接片段'
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    fd, list_path = tempfile.mkstemp(suffix='.txt', prefix='concat_')
+    os.close(fd)
+    try:
+        write_concat_list(clips, list_path)
+        cmd = build_concat_command(list_path, dst, reencode=reencode)
+        try:
+            result = _run_subprocess(cmd, timeout=timeout)
+        except Exception as e:
+            return False, f'ffmpeg 执行异常：{e}'
+        if result.returncode != 0 or not Path(dst).exists():
+            err = (result.stderr or result.stdout or '').strip()[-200:]
+            return False, f'拼接失败：{err or result.returncode}'
+        return True, ''
+    finally:
+        Path(list_path).unlink(missing_ok=True)

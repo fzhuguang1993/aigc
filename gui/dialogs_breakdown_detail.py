@@ -22,11 +22,15 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QWidget, QScrollArea, QListWidget,
-                               QListWidgetItem, QFrame, QSizePolicy, QStackedLayout)
+                               QListWidgetItem, QFrame, QSizePolicy, QStackedLayout,
+                               QComboBox, QRadioButton, QButtonGroup, QDoubleSpinBox,
+                               QLineEdit, QFormLayout, QDialogButtonBox, QPlainTextEdit,
+                               QCheckBox)
 
 from gui.header import page_header, FS_BLUE, FS_SUB, FS_WEAK
 from gui.widgets import _SeekSlider
 from utils.desktop_utils import open_path, reveal_in_folder
+from gui.theme import tokenize
 
 _OPEN = {}   # task_id -> 弹窗实例：防被 GC，重复打开同一任务只前置
 
@@ -115,7 +119,7 @@ class ClickableCover(QLabel):
         super().__init__(text)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet(
-            "background:#15171C; color:#8F959E; font-size:14px; border-radius:8px;")
+            tokenize("background:#15171C; color:#8F959E; font-size:14px; border-radius:8px;"))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def mousePressEvent(self, e):
@@ -132,8 +136,9 @@ class BreakdownDetailDialog(QDialog):
         self.task_id = int(task_id)
         self._result = None
         self._shots, self._lines, self._gal = [], [], []
-        self._shot_items, self._line_items = [], []
-        self._cur_shot = self._cur_line = self._cur_gal = -1
+        self._blocks = []
+        self._shot_items, self._line_items, self._block_items = [], [], []
+        self._cur_shot = self._cur_line = self._cur_gal = self._cur_block = -1
         self._mute = False
         self._last_pos_ms = 0
 
@@ -194,7 +199,7 @@ class BreakdownDetailDialog(QDialog):
         self.big.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.big.setMinimumHeight(280)
         self.big.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.big.setStyleSheet("color:#8F959E; background:#F2F3F5; border-radius:8px;")
+        self.big.setStyleSheet(tokenize("color:#8F959E; background:#F2F3F5; border-radius:8px;"))
         v.addWidget(self.big, 3)
         self.thumbs = QListWidget()
         self.thumbs.setViewMode(QListWidget.ViewMode.IconMode)
@@ -234,7 +239,7 @@ class BreakdownDetailDialog(QDialog):
         self.video_placeholder = QLabel("视频文件不存在或已被移动，无法播放")
         self.video_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_placeholder.setStyleSheet(
-            "color:#8F959E; background:#15171C; border-radius:8px;")
+            tokenize("color:#8F959E; background:#15171C; border-radius:8px;"))
         self.video_placeholder.setMinimumHeight(360)
         self.video_placeholder.setVisible(False)
         v.addWidget(self.video_placeholder)
@@ -304,6 +309,22 @@ class BreakdownDetailDialog(QDialog):
         self._lines_v.setContentsMargins(0, 0, 0, 0)
         self._lines_v.setSpacing(4)
         self.doc_v.addWidget(self._lines_host)
+        # 板块标题行右侧挂「✂ 切割入素材库」：把板块/手选区间切成片段归档
+        blk_head = QHBoxLayout()
+        blk_head.setContentsMargins(0, 0, 0, 0)
+        blk_head.addWidget(self._section("营销板块（点跳板块起点）"))
+        blk_head.addStretch(1)
+        self.btn_cut = QPushButton("✂ 切割入素材库")
+        self.btn_cut.setObjectName("GhostBtn")
+        self.btn_cut.setToolTip("按板块（自动）或手选区间切成片段，归档进素材库，为 AI 混剪备料")
+        self.btn_cut.clicked.connect(self._open_cut)
+        blk_head.addWidget(self.btn_cut)
+        self.doc_v.addLayout(blk_head)
+        self._blocks_host = QWidget()
+        self._blocks_v = QVBoxLayout(self._blocks_host)
+        self._blocks_v.setContentsMargins(0, 0, 0, 0)
+        self._blocks_v.setSpacing(4)
+        self.doc_v.addWidget(self._blocks_host)
         self.doc_v.addStretch(1)
         self.doc_scroll.setWidget(inner)
         v.addWidget(self.doc_scroll, 1)
@@ -330,6 +351,7 @@ class BreakdownDetailDialog(QDialog):
         self._result = res
         tl = build_timeline(res)
         self._shots, self._lines = tl["shots"], tl["lines"]
+        self._blocks = tl.get("blocks", [])
         self._gal = list(res.gallery or [])
 
         tag = "（未完成）" if res.is_partial() else ""
@@ -341,6 +363,7 @@ class BreakdownDetailDialog(QDialog):
         self._fill_overall()
         self._fill_shots()
         self._fill_lines()
+        self._fill_blocks()
         self._fill_thumbs()
         self._show_first_frame()
         self._set_source(res.video_path)
@@ -363,21 +386,21 @@ class BreakdownDetailDialog(QDialog):
         """整体分析：每条一张带彩色左描边 + 关键词色块的卡片，重点一眼可辨。"""
         card = QFrame()
         card.setStyleSheet(
-            "QFrame{background:#FFFFFF; border:1px solid #E5E6EB;"
-            f"border-left:3px solid {accent}; border-radius:8px;}}")
+            tokenize("QFrame{background:#FFFFFF; border:1px solid #E5E6EB;"
+            f"border-left:3px solid {accent}; border-radius:8px;}}"))
         h = QHBoxLayout(card)
         h.setContentsMargins(10, 8, 12, 8)
         h.setSpacing(10)
         pill = QLabel(key)
         pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         pill.setStyleSheet(
-            f"background:{accent}; color:#FFFFFF; font-size:12px; font-weight:700;"
-            "border-radius:9px; padding:3px 9px;")
+            tokenize(f"background:{accent}; color:#FFFFFF; font-size:12px; font-weight:700;"
+            "border-radius:9px; padding:3px 9px;"))
         h.addWidget(pill, 0, Qt.AlignmentFlag.AlignTop)
         body = QLabel(_highlight_terms(val))
         body.setWordWrap(True)
         body.setTextFormat(Qt.TextFormat.RichText)
-        body.setStyleSheet("background:transparent; color:#1F2329; font-size:13px;")
+        body.setStyleSheet(tokenize("background:transparent; color:#1F2329; font-size:13px;"))
         h.addWidget(body, 1)
         return card
 
@@ -401,7 +424,7 @@ class BreakdownDetailDialog(QDialog):
         lbl = QLabel(html_text)
         lbl.setWordWrap(True)
         lbl.setTextFormat(Qt.TextFormat.RichText)
-        lbl.setStyleSheet("background:transparent; color:#1F2329; font-size:12px;")
+        lbl.setStyleSheet(tokenize("background:transparent; color:#1F2329; font-size:12px;"))
         return lbl
 
     def _fill_shots(self):
@@ -443,6 +466,34 @@ class BreakdownDetailDialog(QDialog):
             self._line_items.append(item)
             self._lines_v.addWidget(item)
 
+    # 板块类型 → 配色（按类型名哈希取色，同类型同色，一眼可辨）
+    _BLOCK_COLORS = ("#F5722C", "#7C5CFF", "#00A870", "#2F6BFF", "#D83931",
+                     "#0FC6C2", "#EB5DA0", "#FAAD14")
+
+    def _block_color(self, btype):
+        idx = sum(ord(c) for c in (btype or "")) % len(self._BLOCK_COLORS)
+        return self._BLOCK_COLORS[idx]
+
+    def _fill_blocks(self):
+        if not self._blocks:
+            self._blocks_v.addWidget(self._plain("（无板块拆分数据）"))
+            return
+        for i, b in enumerate(self._blocks):
+            item = _PickItem("block", i, b["start"])
+            color = self._block_color(b.get("type", ""))
+            head = QLabel(
+                f"<span style='color:{color}; font-weight:700;'>●</span>　"
+                f"{html.escape(b.get('type', '') or '板块')}　"
+                f"{_fmt_sec(b['start'])}–{_fmt_sec(b['end'])}")
+            head.setTextFormat(Qt.TextFormat.RichText)
+            head.setObjectName("ItemHead")
+            item.v.addWidget(head)
+            if (b.get("summary") or "").strip():
+                item.v.addWidget(self._muted(b["summary"].strip()))
+            item.clicked.connect(self._on_pick)
+            self._block_items.append(item)
+            self._blocks_v.addWidget(item)
+
     def _muted(self, t):
         lbl = QLabel(t)
         lbl.setWordWrap(True)
@@ -454,7 +505,7 @@ class BreakdownDetailDialog(QDialog):
         lbl = QLabel(html_text)
         lbl.setWordWrap(True)
         lbl.setTextFormat(Qt.TextFormat.RichText)
-        lbl.setStyleSheet("color:#1F2329; font-size:12px; background:transparent;")
+        lbl.setStyleSheet(tokenize("color:#1F2329; font-size:12px; background:transparent;"))
         return lbl
 
     def _fill_thumbs(self):
@@ -543,10 +594,15 @@ class BreakdownDetailDialog(QDialog):
         shots_ts = [s["ts"] for s in self._shots]
         lines_ts = [ln["start"] for ln in self._lines]
         gal_ts = [g.get("ts", 0) for g in self._gal]
+        # 板块轴：按 start 升序定位当前段（落在 [start,end) 内的那一块）
+        block_starts = [b["start"] for b in self._blocks]
 
         si = index_at(shots_ts, sec)
         li = index_at(lines_ts, sec)
         gi = index_at(gal_ts, sec)
+        bi = index_at(block_starts, sec)
+        if bi >= 0 and sec >= self._blocks[bi]["end"]:
+            bi = -1                       # 超出当前板块尾→不点亮（空隙不亮）
         if gi >= 0:
             self._set_big(self._gal[gi].get("path", ""))
         if si != self._cur_shot:
@@ -559,6 +615,11 @@ class BreakdownDetailDialog(QDialog):
             if li >= 0 and (from_user or self._cur_line >= 0):
                 self._scroll_to(self._line_items[li])
             self._cur_line = li
+        if bi != self._cur_block:
+            self._highlight(self._block_items, bi)
+            if bi >= 0 and (from_user or self._cur_block >= 0):
+                self._scroll_to(self._block_items[bi])
+            self._cur_block = bi
         if from_user and self._gal:
             self._select_thumb(max(gi, 0))
 
@@ -621,6 +682,213 @@ class BreakdownDetailDialog(QDialog):
         rep = getattr(self._result, "report_path", "") if self._result else ""
         if rep and Path(rep).exists():
             open_path(rep)
+
+    def _open_cut(self):
+        """弹出「切割入素材库」：选自动/手动 + 归属产品 → 后台 ToolWorker 跑 run_cuts。"""
+        if self._result is None:
+            return
+        if not (self._result.video_path and Path(self._result.video_path).exists()):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "提示", "源视频不存在或已被移动，无法切割")
+            return
+        dlg = _CutDialog(self, self._result)
+        dlg.exec()
+
+
+# ==================================================================
+# 板块/手选区间 → 切割 → 归档素材库
+class _CutDialog(QDialog):
+    """从拆解详情弹出的切割归档面板。
+
+    自动：取 result.blocks 逐块；手动：在轴上点选区间（也可手填起止）。
+    切割在后台线程跑（不卡界面），实时写日志；完成后素材库页即可看到片段。"""
+
+    def __init__(self, host, result, parent=None):
+        super().__init__(parent or host)
+        self._host = host
+        self._result = result
+        self._manual = []          # [{type,start,end,summary}]
+        self._worker = None
+        self.setWindowTitle("✂ 切割入素材库")
+        self.resize(560, 520)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        # 归属产品（可下拉选已有，也可直接输入新产品名）
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("归属产品："))
+        self.cb_product = QComboBox()
+        self.cb_product.setEditable(True)
+        try:
+            from store import product_store as ps
+            self.cb_product.addItems([""] + ps.product_names())
+        except Exception:
+            self.cb_product.addItem("")
+        self.cb_product.setCurrentText("")
+        prow.addWidget(self.cb_product, 1)
+        root.addLayout(prow)
+
+        # 模式：自动 / 手动
+        mode = QHBoxLayout()
+        self.rb_auto = QRadioButton("自动（全部板块）")
+        self.rb_manual = QRadioButton("手动（自选区间）")
+        self.rb_auto.setChecked(bool(getattr(result, "blocks", None)))
+        if not getattr(result, "blocks", None):
+            self.rb_manual.setChecked(True)
+        grp = QButtonGroup(self)
+        grp.addButton(self.rb_auto)
+        grp.addButton(self.rb_manual)
+        self.rb_auto.toggled.connect(self._sync_manual_enabled)
+        mode.addWidget(self.rb_auto)
+        mode.addWidget(self.rb_manual)
+        mode.addStretch(1)
+        root.addLayout(mode)
+
+        n = len(getattr(result, "blocks", None) or [])
+        self.lbl_blocks = QLabel(f"识别到 {n} 个板块 · 自动将逐块切片段")
+        self.lbl_blocks.setStyleSheet(f"color:{FS_WEAK}; font-size:12px;")
+        root.addWidget(self.lbl_blocks)
+
+        # 手动区间编辑器
+        self.manual_box = QWidget()
+        mv = QVBoxLayout(self.manual_box)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.setSpacing(6)
+        editor = QHBoxLayout()
+        self.cb_type = QComboBox()
+        self.cb_type.setEditable(True)
+        self.cb_type.addItems(self._block_types())
+        self.sp_start = QDoubleSpinBox()
+        self.sp_start.setRange(0, 99999)
+        self.sp_start.setDecimals(1)
+        self.sp_start.setSuffix(" 秒")
+        self.sp_end = QDoubleSpinBox()
+        self.sp_end.setRange(0, 99999)
+        self.sp_end.setDecimals(1)
+        self.sp_end.setSuffix(" 秒")
+        b_use_pos = QPushButton("⏱ 取当前位置")
+        b_use_pos.setObjectName("GhostBtn")
+        b_use_pos.setToolTip("把播放器当前时间填入起点（再手动调终点）")
+        b_use_pos.clicked.connect(self._use_playhead)
+        b_add = QPushButton("＋ 加入清单")
+        b_add.clicked.connect(self._add_manual)
+        for w in (self.cb_type, self.sp_start, self.sp_end, b_use_pos, b_add):
+            editor.addWidget(w)
+        mv.addLayout(editor)
+        self.list_manual = QListWidget()
+        self.list_manual.setMinimumHeight(96)
+        mv.addWidget(self.list_manual)
+        b_del = QPushButton("－ 移除选中")
+        b_del.setObjectName("GhostBtn")
+        b_del.clicked.connect(self._del_manual)
+        mv.addWidget(b_del, 0, Qt.AlignmentFlag.AlignLeft)
+        root.addWidget(self.manual_box)
+
+        # 精确度：快切(copy) / 重编码（边界更准但慢）
+        prec = QHBoxLayout()
+        self.ck_reencode = QCheckBox("精确切割（重编码，帧准但较慢；默认按关键帧快切）")
+        prec.addWidget(self.ck_reencode)
+        prec.addStretch(1)
+        root.addLayout(prec)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("font-size:12px;")
+        root.addWidget(self.log, 1)
+
+        btns = QDialogButtonBox()
+        self.b_run = btns.addButton("✂ 开始切割", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.b_close = btns.addButton("关闭", QDialogButtonBox.ButtonRole.RejectRole)
+        self.b_run.clicked.connect(self._run)
+        btns.rejected.connect(self.close)
+        root.addWidget(btns)
+
+        self._sync_manual_enabled()
+
+    # ---------- 手动清单 ----------
+    @staticmethod
+    def _block_types():
+        try:
+            from core import block_categories
+            return block_categories.load()
+        except Exception:
+            return []
+
+    def _sync_manual_enabled(self):
+        self.manual_box.setVisible(self.rb_manual.isChecked())
+        self.lbl_blocks.setVisible(self.rb_auto.isChecked())
+
+    def _use_playhead(self):
+        sec = getattr(self._host, "_last_pos_ms", 0) / 1000.0
+        self.sp_start.setValue(sec)
+        if self.sp_end.value() <= sec:
+            self.sp_end.setValue(sec + 3.0)
+
+    def _add_manual(self):
+        btype = (self.cb_type.currentText() or "").strip() or "片段"
+        start, end = float(self.sp_start.value()), float(self.sp_end.value())
+        if end <= start:
+            self._append_log("⚠ 终点需大于起点")
+            return
+        self._manual.append({"type": btype, "start": start, "end": end})
+        self.list_manual.addItem(f"{btype}  {start:.1f}–{end:.1f} 秒")
+
+    def _del_manual(self):
+        row = self.list_manual.currentRow()
+        if row < 0:
+            return
+        self.list_manual.takeItem(row)
+        del self._manual[row]
+
+    def _append_log(self, text):
+        self.log.appendPlainText(str(text))
+
+    # ---------- 执行 ----------
+    def _run(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        from video_text_tools.breakdown import splitter
+        mode = "manual" if self.rb_manual.isChecked() else "auto"
+        product = (self.cb_product.currentText() or "").strip()
+        if mode == "manual" and not self._manual:
+            self._append_log("⚠ 手动模式先至少加入一段区间")
+            return
+        reencode = self.ck_reencode.isChecked()
+        items = splitter.plan_cuts(self._result, mode=mode, manual=self._manual,
+                                   product=product, reencode=reencode)
+        if not items:
+            self._append_log("⚠ 无可切割区间（板块为空或源视频不可用）")
+            return
+        self._append_log(f"计划切割 {len(items)} 段 → 素材库/{product or '未归类'}")
+        self.b_run.setEnabled(False)
+        self.b_run.setText("切割中…")
+
+        def fn(log, progress, should_stop):
+            return splitter.run_cuts(items, log=log)
+
+        from gui.tool_panels import ToolWorker
+        self._worker = ToolWorker(fn, self)
+        self._worker.log.connect(self._append_log)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
+    def _on_done(self, res):
+        self.b_run.setEnabled(True)
+        self.b_run.setText("✂ 开始切割")
+        self._worker = None
+        if isinstance(res, Exception):
+            self._append_log(f"✗ 切割异常：{res}")
+            return
+        self._append_log(
+            f"✓ 完成：成功 {len(res.get('cut', []))}、失败 {len(res.get('failed', []))}")
+
+    def closeEvent(self, e):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(2000)
+        super().closeEvent(e)
 
 
 _DETAIL_QSS = f"""

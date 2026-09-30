@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabe
 
 from core import naming
 from gui.window_frame import apply_rounded
+from gui.theme import tokenize
 
 
 class NamingEditor(QWidget):
@@ -103,8 +104,8 @@ class NamingEditor(QWidget):
         self.lbl_preview = QLabel()
         self.lbl_preview.setTextFormat(Qt.TextFormat.RichText)
         self.lbl_preview.setStyleSheet(
-            "background:#F7F8FA; border:1px dashed #C9CDD4; border-radius:6px;"
-            "padding:10px 12px; color:#1F2329;")
+            tokenize("background:#F7F8FA; border:1px dashed #C9CDD4; border-radius:6px;"
+            "padding:10px 12px; color:#1F2329;"))
         self.lbl_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         lay.addWidget(self.lbl_preview)
         self.lbl_note = QLabel()

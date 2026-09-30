@@ -1,0 +1,1460 @@
+"""
+gui/kit.py —— 全站共享 UI 组件底座（单一真源）
+
+从「UI 组件库」画廊页 gui/pages_ui_kit.py 抽出的、可复用且无页面依赖的成品组件：
+动效按钮 KitButton、交互表格 KitTable + 单元格委托、真圆角弹窗家族
+（_draw_rounded_card / _RoundPopup / _DialogCardPainter / _round_dialog）、多级树下拉
+TreeSelect、日期选择器族（ModernDatePicker / DateRangePicker / ModernDateEdit /
+CompactCalendar）、浮动气泡滑块 KitSlider、可自由拉伸多行文本 ResizableTextEdit、
+定宽 KPI 卡 _FlowKpiCard，以及标题/对比色/取色等小工具。画廊页与后续各业务页都从
+这里复用，保证「同一套组件、同一口径」；颜色 / 字号 / 圆角一律吃 gui/ui_kit 令牌。
+"""
+from PySide6.QtCore import (Qt, QDate, QTimer, QPoint, QRect, QSize, QEvent,
+                            QRectF, QPointF, Property, QPropertyAnimation,
+                            QEasingCurve, QSortFilterProxyModel, QObject)
+from PySide6.QtGui import (QColor, QCursor, QPainter, QPen, QBrush,
+                           QPainterPath, QFont, QPolygonF, QLinearGradient,
+                           QStandardItemModel, QStandardItem, QKeySequence)
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                               QPushButton, QLineEdit, QPlainTextEdit, QComboBox,
+                               QSpinBox, QDoubleSpinBox, QDateEdit, QCheckBox,
+                               QRadioButton, QTabWidget, QProgressBar, QSlider,
+                               QTableWidget, QTableWidgetItem, QHeaderView,
+                               QScrollArea, QFrame, QButtonGroup, QSizePolicy,
+                               QMessageBox, QFormLayout, QSplitter, QCalendarWidget,
+                               QTreeView, QAbstractItemView, QStyle,
+                               QStyleOptionSlider, QDialog, QApplication, QToolTip,
+                               QTableWidgetSelectionRange, QStyledItemDelegate)
+
+from gui import ui_kit
+from gui.header import page_header, Card, KpiCard
+from gui.widgets import FlowLayout
+from gui.menus import StyledMenu
+
+C = ui_kit.COLORS
+
+
+# --------------------------------------------------------------------
+# 小工具（纯展示用）
+# --------------------------------------------------------------------
+def _section_title(text):
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"color:{C['text']}; font-size:15px; font-weight:700; background:transparent;")
+    return lbl
+
+
+def _sub_title(text):
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"color:{C['primary']}; font-size:13px; font-weight:600; background:transparent;")
+    # 允许折行：那些很长的说明标题（如“表格（列标题右键→…）”）若不换行，会把整个
+    # 滚动内容区的 minimumWidth 顶到 ~1560，导致 FlowLayout（如 KPI 带）拿到的宽度永远
+    # 比窗口还宽、怎么都不换行。开折行后内容宽度回落到视口宽，卡片才能按实际窗口宽度排。
+    lbl.setWordWrap(True)
+    return lbl
+
+
+def _hint(text):
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"color:{C['weak']}; font-size:12px; background:transparent;")
+    lbl.setWordWrap(True)
+    return lbl
+
+
+def _contrast_text(hex_color):
+    c = QColor(hex_color)
+    lum = (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue())
+    return C["text"] if lum > 150 else C["on_primary"]
+
+
+def _row(*widgets, gap=10):
+    h = QHBoxLayout()
+    h.setSpacing(gap)
+    for w in widgets:
+        h.addWidget(w)
+    h.addStretch(1)
+    return h
+
+
+def _mix(a, b, t):
+    """两 QColor 按 t（0~1）线性插值。"""
+    return QColor(int(a.red() + (b.red() - a.red()) * t),
+                  int(a.green() + (b.green() - a.green()) * t),
+                  int(a.blue() + (b.blue() - a.blue()) * t))
+
+
+def _lighten(hex_color, f):
+    """把 hex 往白色方向提亮 f（0~1），给渐变胶囊取高光端色。"""
+    return _mix(QColor(hex_color), QColor(255, 255, 255), f).name()
+
+
+def _draw_rounded_card(pr, rect, radius, margin, fill=None, border=None):
+    """在透明顶层上自绘一张圆角白卡 + 向外逐层变淡的软阴影（菜单/弹窗/通知共用）。
+    margin 为四周留白（也是阴影活动带），内容布局需用同宽边距避开圆角。"""
+    card = QRectF(rect).adjusted(margin, margin, -margin, -margin)
+    sc = QColor(C["text"])
+    pr.setPen(Qt.PenStyle.NoPen)
+    steps = 6
+    # 软阴影：整体调淡一档（原 8+28 太重，白底上一眼看出“发灰”），保留最内层一点点
+    # 层次即可——描边已能勾出轮廓，阴影只负责把卡片从背景里轻轻托起来。
+    for i in range(steps, 0, -1):
+        off = i * (margin / steps)
+        alpha = 3 + int(13 * (1 - i / steps))
+        pr.setBrush(QColor(sc.red(), sc.green(), sc.blue(), alpha))
+        pr.drawRoundedRect(card.adjusted(-off, -off, off, off),
+                           radius + off, radius + off)
+    pr.setBrush(QColor(fill or C["card"]))
+    pr.setPen(QPen(QColor(border or C["border_popup"]), 1))
+    pr.drawRoundedRect(card, radius, radius)
+
+
+class _RoundPopup(QWidget):
+    """真圆角顶层浮层基类：无边框 + 半透明背景，自绘一张圆角白卡 + 向外逐层变淡的
+    软阴影。内容加进 self.content，四周阴影带(SHADOW)与卡片内边距(PAD)会自动避开圆角，
+    子控件保持透明背景，让卡片底色透出——浮层四角才会是真圆弧（解决「弹出层圆角没有」）。"""
+    SHADOW = 14
+    PAD = 6
+
+    def __init__(self, parent=None, radius=None):
+        super().__init__(parent, Qt.WindowType.Popup
+                         | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.radius = radius if radius is not None else ui_kit.RADIUS["md"]
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(self.SHADOW, self.SHADOW, self.SHADOW, self.SHADOW)
+        self.content = QVBoxLayout()
+        self.content.setContentsMargins(self.PAD, self.PAD, self.PAD, self.PAD)
+        self.content.setSpacing(6)
+        outer.addLayout(self.content)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        _draw_rounded_card(p, self.rect(), self.radius, self.SHADOW)
+        p.end()
+
+
+_DIALOG_SHADOW = 18   # 无边框对话框四周撑出的阴影带（也是自绘卡片的外边距）
+
+
+class _DialogCardPainter(QObject):
+    """接管对话框自身的 Paint 事件：去原生框后，在透明顶层上自绘一张圆角白卡 +
+    明显描边 + 向外逐层变淡的软阴影——解决“对话框遇到白色背景直接融为一体”。
+    返回 True 只吃掉对话框本体的绘制，子控件（图标 / 文字 / 按钮）照常各自绘制。"""
+
+    def __init__(self, dlg, radius, margin):
+        super().__init__(dlg)
+        self._dlg, self._radius, self._margin = dlg, radius, margin
+
+    def eventFilter(self, obj, ev):
+        if obj is self._dlg and ev.type() == QEvent.Type.Paint:
+            p = QPainter(self._dlg)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # 描边取 border_strong（比弹层的 border_popup 更实），白底上也勾得出轮廓
+            _draw_rounded_card(p, self._dlg.rect(), self._radius, self._margin,
+                               border=C["border_strong"])
+            p.end()
+            return True
+        return False
+
+
+def _round_dialog(dlg, radius=None):
+    """把 QMessageBox / QDialog 变成真圆角浮层：去原生框 + 逐像素透明，再由
+    _DialogCardPainter 自绘圆角白卡 + 描边 + 软阴影。
+    ① 旧版只靠 QSS border-radius，圆角外四角被原生方窗底填满 → 直角；
+    ② 且 1px border_popup(#E5E7EB) 太浅，落在白卡片 / 白色桌面上直接融为一体。
+    这里两件事一起解决：卡片自绘（透明顶层下四角真透明），描边加实 + 补一层软阴影。
+    注意：QMessageBox 会在 show 时把自身布局边距重置成固定值，同步撑出的阴影带会被抹掉
+    （子控件随即溢出到卡片外）。因此把“撑出阴影带”延到 show 落定后的 singleShot(0)。"""
+    dlg.setWindowFlags(dlg.windowFlags()
+                       | Qt.WindowType.FramelessWindowHint
+                       | Qt.WindowType.NoDropShadowWindowHint)
+    dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    dlg.setAutoFillBackground(False)      # 防止自动补背景把阴影带填成白方底
+    r = radius if radius is not None else ui_kit.RADIUS["lg"]
+    cls = dlg.metaObject().className()
+    # 对话框本体背景交给自绘（QSS 置透明，挡住 app 级样式补方底）；子控件样式照旧保留。
+    # 按钮淡化：对话框里的确认/取消不再走 app 级实心主蓝（那样太浓、和白卡抢层次），
+    # 改浅底 + 主蓝字 + 淡描边，悬停才略加深、按下回实心，视觉上“淡一点”。
+    dlg.setStyleSheet(
+        f"{cls}{{background:transparent;}}"
+        f"{cls} QLabel{{background:transparent;border:none;color:{C['text']};}}"
+        f"{cls} QPushButton{{min-width:72px;border-radius:8px;padding:6px 16px;"
+        f" background:{C['primary_bg']};color:{C['primary']};border:1px solid {C['border']};}}"
+        f"{cls} QPushButton:hover{{background:{C['primary_soft']};border-color:{C['primary']};}}"
+        f"{cls} QPushButton:pressed{{background:{C['primary']};color:{C['on_primary']};}}")
+    dlg._card_painter = _DialogCardPainter(dlg, r, _DIALOG_SHADOW)
+    dlg.installEventFilter(dlg._card_painter)
+
+    # 在对话框现有布局外撑出一圈阴影带（原有内边距保留），卡片画进这条带里面。
+    # 幂等：_band_done 只撑一次；延后一帧执行避开 QMessageBox 在 showEvent 里的边距重置。
+    dlg._band_done = False
+
+    def _grow_band():
+        if dlg._band_done:
+            return
+        dlg._band_done = True
+        lay = dlg.layout()
+        if lay is None:
+            return
+        m = lay.contentsMargins()
+        lay.setContentsMargins(m.left() + _DIALOG_SHADOW, m.top() + _DIALOG_SHADOW,
+                               m.right() + _DIALOG_SHADOW, m.bottom() + _DIALOG_SHADOW)
+        lay.activate()
+        dlg.adjustSize()
+
+    QTimer.singleShot(0, _grow_band)
+    return dlg
+
+
+def install_rounded_messagebox():
+    """把 QMessageBox 的四个静态便捷弹窗（information / warning / question /
+    critical）统一接管成 _round_dialog 圆角浮层。
+
+    为什么这样做而不是逐点改写：全站 260+ 处都调的是 `QMessageBox.information(...)
+    这类静态便捷方法，内部自建自 exec、塞不进 _round_dialog。若逐点改成
+    “实例 → _round_dialog → exec” 改动面极大且易错。这里在启动装样式时（
+    theme.apply_theme）把四个静态方法换成同签名实现：构造实例→套 _round_dialog→exec，
+    返回值仍是 StandardButton（与原生同语义），因此 **调用点一行不改**，
+    `== QMessageBox.Yes` 等判断照旧成立（零行为变更）。
+
+    幂等：重复调用只是重新绑定同一组函数，无副作用。"""
+    B = QMessageBox.StandardButton
+    I = QMessageBox.Icon
+
+    def _show(icon, parent, title, text, buttons, default):
+        box = QMessageBox(parent)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(text)
+        if buttons is not None:
+            box.setStandardButtons(buttons)
+        # default 为 NoButton（非 0）时不显式指定，交给 QMessageBox 按角色自动选中
+        if default is not None and default != B.NoButton:
+            box.setDefaultButton(default)
+        _round_dialog(box)
+        return B(box.exec())
+
+    def information(parent, title, text, buttons=B.Ok, default=B.NoButton, *a, **k):
+        return _show(I.Information, parent, title, text, buttons, default)
+
+    def warning(parent, title, text, buttons=B.Ok, default=B.NoButton, *a, **k):
+        return _show(I.Warning, parent, title, text, buttons, default)
+
+    def critical(parent, title, text, buttons=B.Ok, default=B.NoButton, *a, **k):
+        return _show(I.Critical, parent, title, text, buttons, default)
+
+    def question(parent, title, text, buttons=B.Yes | B.No, default=B.NoButton, *a, **k):
+        return _show(I.Question, parent, title, text, buttons, default)
+
+    QMessageBox.information = staticmethod(information)
+    QMessageBox.warning = staticmethod(warning)
+    QMessageBox.critical = staticmethod(critical)
+    QMessageBox.question = staticmethod(question)
+
+
+class _ShowTip(QObject):
+    """“悬停即弹”的 tooltip 加速器：Enter 起 350ms 短延时后直接调 QToolTip.showText，
+    比默认 ~700ms 灵敏，离开/按下即隐——解决画廊里“悬停看 tooltip 没反应”的观感
+    （tooltip 本体配色仍由 _TipPolish 统一兜底，这里只负责“让它确实弹出来”）。"""
+
+    def __init__(self, widget, text):
+        super().__init__(widget)
+        self._w = widget
+        self._text = text
+        self._t = QTimer(widget)
+        self._t.setSingleShot(True)
+        self._t.setInterval(350)
+        self._t.timeout.connect(self._show)
+        widget.installEventFilter(self)
+
+    def _show(self):
+        if self._w.isVisible() and self._w.underMouse():
+            QToolTip.showText(QCursor.pos(), self._text, self._w)
+
+    def eventFilter(self, obj, ev):
+        if obj is self._w:
+            if ev.type() == QEvent.Type.Enter:
+                self._t.start()
+            elif ev.type() in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress):
+                self._t.stop()
+                QToolTip.hideText()
+        return False
+
+
+def hover_tip(widget, text):
+    """给 widget 挂一条悬停即显的 tooltip（QSS 里再快也受默认延时，这里直接接管）。"""
+    return _ShowTip(widget, text)
+
+
+class _TreeFilter(QSortFilterProxyModel):
+    """层级树搜索过滤：开递归过滤后，命中节点会连同祖先链一起保留，
+    输入关键词即把匹配分支拉出来、其余整枝隐藏（解决“三四千条里逐层找”）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRecursiveFilteringEnabled(True)
+        self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.setFilterKeyColumn(0)
+
+
+class KitButton(QPushButton):
+    """画廊示例按钮：自绘以支持真实动效。
+
+    - 悬停：背景色向 hover 态平滑过渡（hoverT 0→1，QPropertyAnimation 驱动）。
+    - 按下：整体轻微回弹缩放（pressT 0→1，绘制时按中心缩放 0.96 + 变暗）。
+    - 点击：弹窗说明这颗是什么变体 / 干什么用 / 吃什么令牌（explain=False 时不弹，
+      交给按钮自己的演示动作，如弹菜单/走进度）。
+    """
+
+    def __init__(self, text, kind="primary", obj_name="", desc="",
+                 explain=True, parent=None):
+        super().__init__(text, parent)
+        self._kind = kind
+        self._desc = desc or text
+        self._explain = explain
+        if obj_name:
+            self.setObjectName(obj_name)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(34)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._hoverT = 0.0
+        self._pressT = 0.0
+        self.clicked.connect(self._on_click)
+
+    # ---- Qt 动态属性：给 QPropertyAnimation 平滑插值用（改动即 update 重绘）----
+    def _gh(self):
+        return self._hoverT
+
+    def _sh(self, v):
+        self._hoverT = v
+        self.update()
+
+    def _gp(self):
+        return self._pressT
+
+    def _sp(self, v):
+        self._pressT = v
+        self.update()
+
+    hoverT = Property(float, _gh, _sh)
+    pressT = Property(float, _gp, _sp)
+
+    # ---- 动效驱动 ----
+    def _anim(self, prop, end, dur, ease):
+        start = self._hoverT if prop == "hoverT" else self._pressT
+        key = "_an_" + prop
+        old = getattr(self, key, None)
+        if old is not None:
+            old.stop()
+        a = QPropertyAnimation(self, prop.encode("utf-8"), self)
+        a.setDuration(dur)
+        a.setStartValue(start)
+        a.setEndValue(end)
+        a.setEasingCurve(ease)
+        setattr(self, key, a)
+        a.start()
+
+    def enterEvent(self, e):
+        self._anim("hoverT", 1.0, 130, QEasingCurve.Type.OutCubic)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._anim("hoverT", 0.0, 220, QEasingCurve.Type.OutCubic)
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._anim("pressT", 1.0, 70, QEasingCurve.Type.OutQuad)
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._anim("pressT", 0.0, 170, QEasingCurve.Type.OutQuad)
+        super().mouseReleaseEvent(e)
+
+    def _style_for(self):
+        # 统一口径（用户定的）：默认颜色深、鼠标移入变浅。所有实心变体都按这个方向。
+        k = self._kind
+        if k == "ghost":
+            # 幽灵钮本体是白底，不变深；悬停只把描边/文字转主蓝（底色保持白）
+            return (C["card"], C["ghost_text"], C["card"], C["primary"],
+                    C["border"], C["primary"])
+        if k == "danger":
+            # 默认实心红（深）→ 悬停变浅红（往白方向提亮）
+            return (C["danger"], C["on_primary"], _lighten(C["danger"], 0.18),
+                    C["on_primary"], None, None)
+        if k == "chip":
+            # 淡蓝胶囊：默认 primary_soft（略深）→ 悬停 primary_bg（更浅）
+            return (C["primary_soft"], C["primary"], C["primary_bg"], C["primary"],
+                    C["chip_border"], C["primary"])
+        if k == "sidebar":
+            # 侧栏深色钮：默认深板底 → 悬停转亮蓝（变浅）
+            return (C["sidebar_item"], C["sidebar_text"], C["primary"], C["on_primary"],
+                    C["sidebar_border"], C["primary"])
+        # primary 默认：深蓝 #3370FF → 悬停浅蓝 #5A8BFF
+        return (C["primary"], C["on_primary"], C["primary_hover"], C["on_primary"],
+                None, None)
+
+    def paintEvent(self, e):
+        bg, fg, hbg, hfg, brd, hbrd = self._style_for()
+        h, p = self._hoverT, self._pressT
+        en = self.isEnabled()
+        checked = self.isCheckable() and self.isChecked()
+        if checked:
+            bg, fg, brd = C["primary"], C["on_primary"], C["primary"]
+        if en:
+            cur = _mix(QColor(bg), QColor(hbg), h)
+            curfg = _mix(QColor(fg), QColor(hfg), h)
+            bcol = QColor(hbrd if h > 0.5 else brd) if brd else None
+        else:
+            cur, curfg = QColor(C["disabled_bg"]), QColor(C["weak"])
+            bcol = QColor(C["disabled_border"])
+        if p > 0:
+            cur = _mix(cur, QColor(int(cur.red() * 0.82), int(cur.green() * 0.82),
+                                   int(cur.blue() * 0.82)), p)
+        pr = QPainter(self)
+        pr.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        s = 1.0 - 0.04 * p
+        if s < 1.0:
+            ctr = QPointF(r.center())
+            pr.translate(ctr)
+            pr.scale(s, s)
+            pr.translate(-ctr)
+        rad = ui_kit.RADIUS["md"]
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(r), rad, rad)
+        pr.fillPath(path, cur)
+        if bcol is not None:
+            pen = QPen(bcol)
+            pen.setWidthF(1.0)
+            pr.setPen(pen)
+            pr.drawPath(path)
+        else:
+            pr.setPen(Qt.PenStyle.NoPen)
+        pr.setFont(self.font())
+        pr.setPen(QColor(curfg))
+        pr.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+        pr.end()
+
+    def _on_click(self):
+        # 危险钮：先弹「确认提示」，用户确认后才算执行（不可逆动作的标准安全范式）。
+        if self._kind == "danger":
+            box = QMessageBox(self.window())
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("危险操作确认")
+            box.setText("这是一个危险操作（示例）。")
+            box.setInformativeText(self._desc + "\n\n确定要执行吗？")
+            yes = box.addButton("确认执行", QMessageBox.ButtonRole.AcceptRole)
+            no = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(no)          # 默认落在「取消」，防误触
+            _round_dialog(box)
+            box.exec()
+            if box.clickedButton() is yes:
+                done = QMessageBox(self.window())
+                done.setIcon(QMessageBox.Icon.Information)
+                done.setWindowTitle("已确认")
+                done.setText("危险操作已执行（示例，仅演示）。")
+                _round_dialog(done)
+                done.exec()
+            return
+        if self._explain:
+            info = QMessageBox(self.window())
+            info.setIcon(QMessageBox.Icon.Information)
+            info.setWindowTitle("这是什么按钮 · " + self.text())
+            info.setText(self._desc)
+            _round_dialog(info)
+            info.exec()
+
+
+# --------------------------------------------------------------------
+# 多级联动地区下拉：省 → 市 → 区/县 → 乡镇 → 村（逐级以实际数据为准）
+# --------------------------------------------------------------------
+REGION_LEVELS = ["省", "市", "区/县", "乡镇", "村"]
+# 样例树（真实项目应接后端区划数据）：每层 dict 的 key 就是该层选项。
+REGION_DATA = {
+    "广东省": {
+        "深圳市": {
+            "福田区": {"南园街道": {"南园社区": {}, "园岭社区": {}},
+                       "华强北街道": {"华强社区": {}}},
+            "南山区": {"粤海街道": {"科技园社区": {}}},
+        },
+        "广州市": {"天河区": {"天园街道": {"东员村": {}}}},
+    },
+    "北京市": {
+        "北京市": {
+            "朝阳区": {"建外街道": {"北神社区": {}}},
+            "海淀区": {"中关村街道": {"科里社区": {}}},
+        },
+    },
+    "四川省": {"成都市": {"武侯区": {"桂溪街道": {"大源村": {}}}}},
+}
+
+
+class _FieldButton(QPushButton):
+    """下拉字段按钮：文字左对齐 + 右侧一个 ▾ 箭头（箭头子控件穿透鼠标，整颗可点）。"""
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._caret = QLabel("▾", self)
+        self._caret.setStyleSheet(f"color:{C['sub']}; background:transparent;")
+        self._caret.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._caret.adjustSize()
+
+    def setText(self, t):
+        super().setText(t)
+        self._place()
+
+    def resizeEvent(self, e):
+        self._place()
+        super().resizeEvent(e)
+
+    def _place(self):
+        self._caret.move(self.width() - self._caret.width() - 10,
+                         (self.height() - self._caret.height()) // 2)
+
+
+class TreeSelect(QWidget):
+    """单个下拉里呈现多级地区树（省→市→区/县→乡镇→村）：点一下弹出一个带层级的
+    树形浮层，逐层展开、选中任一节点即回填完整路径。不是多个下拉框联动——
+    一框装下整个层级（对齐用户「下拉列表里面多层级」的口径）。"""
+
+    def __init__(self, data=None, parent=None, placeholder="请选择所在地区…"):
+        super().__init__(parent)
+        self._data = data or REGION_DATA
+        self._value = ""
+        self._placeholder = placeholder
+        self._btn = _FieldButton(placeholder)
+        self._btn.setObjectName("TreeSelectField")
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 字段宽度限住，不在布局里拉满（之前默认最大宽度就是这个原因）
+        self._btn.setMinimumWidth(220)
+        self._btn.setMaximumWidth(320)
+        self.setMaximumWidth(320)
+        self._btn.setStyleSheet(
+            f"QPushButton#TreeSelectField{{background:{C['card']};color:{C['weak']};"
+            f"border:1px solid {C['border']};border-radius:{ui_kit.RADIUS['md']}px;"
+            f"padding:6px 26px 6px 10px;text-align:left;}}"
+            f"QPushButton#TreeSelectField:hover{{border-color:{C['primary']};}}")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(self._btn)
+        h.addStretch(1)
+        self._pop = None
+        self._btn.clicked.connect(self._toggle)
+
+    # 把数据树灌进 QStandardItemModel：每层 key 是一个节点，有下级则可展开
+    def _fill(self, parent_item, node):
+        for k, v in node.items():
+            it = QStandardItem(k)
+            it.setEditable(False)
+            parent_item.appendRow(it)
+            if isinstance(v, dict) and v:
+                self._fill(it, v)
+
+    def _build_pop(self):
+        # 真圆角浮层：顶部一个搜索框 + 默认全部折叠的层级树（省得三四千条一次展开）。
+        # 点一级展开下一级（级联），点到叶子即回填整条路径；搜索命中会自动拉出所在分支。
+        pop = _RoundPopup(self)
+        search = QLineEdit()
+        search.setPlaceholderText("搜索地区，命中会自动展开所在分支…")
+        search.setClearButtonEnabled(True)
+        search.setStyleSheet(
+            f"QLineEdit{{background:{C['bg_field']};border:1px solid {C['border']};"
+            f"border-radius:{ui_kit.RADIUS['md']}px;padding:6px 8px;}}")
+        pop.content.addWidget(search)
+        tree = QTreeView()
+        tree.setFrameShape(QFrame.Shape.NoFrame)
+        src = QStandardItemModel()
+        self._fill(src.invisibleRootItem(), self._data)
+        proxy = _TreeFilter(pop)
+        proxy.setSourceModel(src)
+        tree.setModel(proxy)
+        tree.setHeaderHidden(True)
+        tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tree.setAnimated(True)
+        tree.setIndentation(18)
+        tree.setRootIsDecorated(True)
+        tree.setExpandsOnDoubleClick(False)   # 单击即逐级展开，对齐“点一个才展开下一个”
+        tree.setStyleSheet(
+            f"QTreeView{{background:transparent;border:none;color:{C['text']};"
+            f"outline:none;}}"
+            f"QTreeView::item{{height:30px;border-radius:6px;}}"
+            f"QTreeView::item:hover{{background:{C['primary_bg']};}}"
+            f"QTreeView::item:selected{{background:{C['primary_soft']};"
+            f"color:{C['primary']};}}"
+            f"QTreeView::branch{{background:transparent;}}")
+        tree.clicked.connect(lambda idx: self._on_tree_click(tree, idx))
+        search.textChanged.connect(lambda t: self._on_search(tree, proxy, t))
+        pop._tree, pop._proxy = tree, proxy
+        pop.content.addWidget(tree)
+        return pop
+
+    def _on_tree_click(self, tree, idx):
+        if not idx.isValid():
+            return
+        m = tree.model()
+        if m.rowCount(idx) > 0:            # 有下级：点一下只展开/收起这一级
+            tree.setExpanded(idx, not tree.isExpanded(idx))
+        else:                              # 叶子：选中、回填完整路径并收起
+            self._pick(tree, idx)
+
+    def _pick(self, tree, idx):
+        parts = []
+        cur = idx
+        while cur.isValid():
+            parts.insert(0, cur.data())
+            cur = cur.parent()
+        self._value = " / ".join(parts)
+        self._btn.setText(self._value)
+        self._btn.setStyleSheet(
+            f"QPushButton#TreeSelectField{{background:{C['card']};color:{C['text']};"
+            f"border:1px solid {C['border']};border-radius:{ui_kit.RADIUS['md']}px;"
+            f"padding:6px 26px 6px 10px;text-align:left;}}"
+            f"QPushButton#TreeSelectField:hover{{border-color:{C['primary']};}}")
+        tree.window().close()
+
+    def _on_search(self, tree, proxy, text):
+        proxy.setFilterFixedString(text.strip())
+        if text.strip():
+            tree.expandAll()             # 搜索时把命中分支整条展开，一眼看到
+        else:
+            tree.collapseAll()           # 清空搜索回到“默认全折叠、逐层点”的原状
+
+    def _toggle(self):
+        if self._pop is None:
+            self._pop = self._build_pop()
+        self._pop.resize(max(self._btn.width(), 320), 340)
+        self._pop.move(self._btn.mapToGlobal(QPoint(0, self._btn.height() + 2)))
+        # 延后一帧再弹：按钮 clicked 后 Qt 会紧接派发一次释放事件，若同步 show
+        # 一个 Qt.Popup，它会被这次释放立即关掉——看着就是“点了没反应”。
+        QTimer.singleShot(0, self._pop.show)
+
+    def path(self):
+        return self._value
+
+
+# --------------------------------------------------------------------
+# 现代化日期选择器：白底字段式按钮 + 点击弹出重新样式的日历浮层
+# --------------------------------------------------------------------
+_CAL_QSS = (
+    f"QCalendarWidget QWidget{{background:{C['card']};color:{C['text']};}}"
+    f"QCalendarWidget QWidget#qt_calendar_navigationbar{{background:{C['card']};"
+    f"border:none;border-bottom:1px solid {C['divider']};}}"
+    f"QCalendarWidget QToolButton{{background:transparent;color:{C['text']};"
+    f"border:none;border-radius:6px;padding:4px 8px;font-weight:600;}}"
+    f"QCalendarWidget QToolButton:hover{{background:{C['primary_soft']};color:{C['primary']};}}"
+    f"QCalendarWidget QToolButton::menu-indicator{{image:none;}}"
+    f"QCalendarWidget QMenu{{background:{C['card']};border:1px solid {C['border_popup']};"
+    f"border-radius:8px;}}"
+    f"QCalendarWidget QSpinBox{{background:{C['card']};border:1px solid {C['border']};"
+    f"border-radius:6px;padding:2px;}}"
+    f"QCalendarWidget QAbstractItemView:enabled{{background:{C['card']};outline:none;"
+    f"selection-background-color:{C['primary']};selection-color:{C['on_primary']};}}"
+    f"QCalendarWidget QAbstractItemView:disabled{{color:{C['weak']};}}")
+
+
+class _DatePickerPopup(_RoundPopup):
+    """真圆角日历浮层：点外部自动收起；选中日期回调宿主。背景由 _RoundPopup 自绘
+    圆角白卡 + 软阴影，左侧一列快捷选项（今天/昨天/近7天/近30天/近90天）。"""
+
+    # (文案, 相对今天的天数偏移)：近 N 天取该窗口起始日（今天-(N-1)）
+    PRESETS = (("今天", 0), ("昨天", -1), ("近7天", -6),
+               ("近30天", -29), ("近90天", -89))
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        # 左侧快捷选项栏
+        side = QVBoxLayout()
+        side.setSpacing(4)
+        for text, off in self.PRESETS:
+            b = QPushButton(text)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{C['primary']};"
+                f"border:none;border-radius:6px;padding:6px 12px;text-align:left;}}"
+                f"QPushButton:hover{{background:{C['primary_soft']};}}")
+            b.clicked.connect(lambda _c, o=off: self._pick_offset(o))
+            side.addWidget(b)
+        side.addStretch(1)
+        side_w = QWidget()
+        side_w.setLayout(side)
+        side_w.setStyleSheet("background:transparent;")
+        side_w.setMinimumWidth(88)
+        row.addWidget(side_w)
+        # 右侧日历
+        self.cal = QCalendarWidget()
+        self.cal.setGridVisible(False)
+        self.cal.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.cal.setHorizontalHeaderFormat(
+            QCalendarWidget.HorizontalHeaderFormat.SingleLetterDayNames)
+        self.cal.setStyleSheet(_CAL_QSS)
+        self.cal.clicked.connect(self._pick)
+        row.addWidget(self.cal)
+        self.content.addLayout(row)
+        self._owner = owner
+
+    def _pick_offset(self, off):
+        self._owner.set_date(QDate.currentDate().addDays(off))
+        self.close()
+
+    def _pick(self, d):
+        self._owner.set_date(d)
+        self.close()
+
+
+class ModernDatePicker(QPushButton):
+    """一个字段式按钮，点开弹出日历浮层选择日期（比原生 QDateEdit 日历现代）。"""
+
+    def __init__(self, date=None, parent=None):
+        super().__init__(parent)
+        self._date = date or QDate.currentDate()
+        self.setObjectName("DateField")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumWidth(180)
+        self.setStyleSheet(
+            f"QPushButton#DateField{{background:{C['card']};color:{C['text']};"
+            f"border:1px solid {C['border']};border-radius:{ui_kit.RADIUS['md']}px;"
+            f"padding:6px 10px;text-align:left;}}"
+            f"QPushButton#DateField:hover{{border-color:{C['primary']};}}"
+            f"QPushButton#DateField:pressed{{background:{C['primary_bg']};}}")
+        self._popup = None
+        self._sync()
+        self.clicked.connect(self._toggle)
+
+    def set_date(self, d):
+        self._date = d
+        self._sync()
+
+    def _sync(self):
+        self.setText("🗓  " + self._date.toString("yyyy 年 MM 月 dd 日"))
+
+    def _toggle(self):
+        if self._popup is None:
+            self._popup = _DatePickerPopup(self)
+        self._popup.cal.setSelectedDate(self._date)
+        self._popup.adjustSize()
+        self._popup.move(self.mapToGlobal(QPoint(0, self.height() + 4)))
+        self._popup.show()
+
+
+# --------------------------------------------------------------------
+# 日期区间选择器：字段式按钮弹出「快捷范围 + 起始/结束两个日历」的圆角浮层
+# --------------------------------------------------------------------
+class _DateRangePopup(_RoundPopup):
+    """区间日历浮层：左侧快捷（近 N 天＝一段范围，不是一天），右侧两个日历分别选
+    “起始 / 结束”。点快捷直接确定；手动选完点“确定”回填。"""
+
+    # (文案, 起始偏移, 结束偏移)：相对今天；结束 0=今天，近 N 天取 今天-(N-1)~今天
+    PRESETS = (("今天", 0, 0), ("昨天", -1, -1), ("近7天", -6, 0),
+               ("近30天", -29, 0), ("近90天", -89, 0))
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self._owner = owner
+        self._start = owner._start
+        self._end = owner._end
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        # 左侧快捷范围
+        side = QVBoxLayout()
+        side.setSpacing(4)
+        for text, so, eo in self.PRESETS:
+            b = QPushButton(text)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{C['primary']};"
+                f"border:none;border-radius:6px;padding:6px 12px;text-align:left;}}"
+                f"QPushButton:hover{{background:{C['primary_soft']};}}")
+            b.clicked.connect(lambda _c, s=so, e=eo: self._apply_preset(s, e))
+            side.addWidget(b)
+        side.addStretch(1)
+        side_w = QWidget()
+        side_w.setLayout(side)
+        side_w.setStyleSheet("background:transparent;")
+        side_w.setMinimumWidth(88)
+        row.addWidget(side_w)
+        # 右侧：起始 / 结束 两个日历
+        self._cal_start = self._mk_cal()
+        self._cal_end = self._mk_cal()
+        self._cal_start.clicked.connect(self._pick_start)
+        self._cal_end.clicked.connect(self._pick_end)
+        for cap, cal in (("起始", self._cal_start), ("结束", self._cal_end)):
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            t = QLabel(cap)
+            t.setStyleSheet(f"color:{C['sub']};font-size:12px;background:transparent;"
+                            "font-weight:600;")
+            col.addWidget(t)
+            col.addWidget(cal)
+            row.addLayout(col)
+        self.content.addLayout(row)
+        # 底部：范围文字 + 确定
+        foot = QHBoxLayout()
+        self._lbl = QLabel()
+        self._lbl.setStyleSheet(f"color:{C['primary']};font-weight:600;"
+                                "background:transparent;")
+        foot.addWidget(self._lbl)
+        foot.addStretch(1)
+        ok = KitButton("确定", kind="primary", explain=False)
+        ok.clicked.connect(self._commit)
+        foot.addWidget(ok)
+        self.content.addLayout(foot)
+        self._refresh()
+
+    def _mk_cal(self):
+        cal = QCalendarWidget()
+        cal.setGridVisible(False)
+        cal.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        cal.setHorizontalHeaderFormat(
+            QCalendarWidget.HorizontalHeaderFormat.SingleLetterDayNames)
+        cal.setStyleSheet(_CAL_QSS)
+        return cal
+
+    def _apply_preset(self, so, eo):
+        today = QDate.currentDate()
+        self._start = today.addDays(so)
+        self._end = today.addDays(eo)
+        self._commit()
+
+    def _pick_start(self, d):
+        self._start = d
+        if self._end < self._start:
+            self._end = d
+        self._refresh()
+
+    def _pick_end(self, d):
+        self._end = d
+        if self._start > self._end:
+            self._start = d
+        self._refresh()
+
+    def _refresh(self):
+        self._cal_start.setSelectedDate(self._start)
+        self._cal_end.setSelectedDate(self._end)
+        n = self._start.daysTo(self._end) + 1
+        self._lbl.setText(f"{self._start.toString('yyyy-MM-dd')} ~ "
+                          f"{self._end.toString('yyyy-MM-dd')}（{n} 天）")
+
+    def _commit(self):
+        self._owner.set_range(self._start, self._end)
+        self.close()
+
+
+class DateRangePicker(QPushButton):
+    """字段式按钮：点开日历浮层选一段日期区间（近 N 天是一个范围）。单选日期
+    用不带快捷的 ModernDateEdit；要区间就用这颗。"""
+
+    def __init__(self, start=None, end=None, parent=None):
+        super().__init__(parent)
+        today = QDate.currentDate()
+        self._end = end or today
+        self._start = start or self._end.addDays(-6)
+        self.setObjectName("DateField")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumWidth(240)
+        self.setStyleSheet(
+            f"QPushButton#DateField{{background:{C['card']};color:{C['text']};"
+            f"border:1px solid {C['border']};border-radius:{ui_kit.RADIUS['md']}px;"
+            f"padding:6px 10px;text-align:left;}}"
+            f"QPushButton#DateField:hover{{border-color:{C['primary']};}}"
+            f"QPushButton#DateField:pressed{{background:{C['primary_bg']};}}")
+        self._popup = None
+        self._sync()
+        self.clicked.connect(self._toggle)
+
+    def set_range(self, s, e):
+        self._start, self._end = (s, e) if s <= e else (e, s)
+        self._sync()
+
+    def _sync(self):
+        n = self._start.daysTo(self._end) + 1
+        self.setText(f"📅  {self._start.toString('yyyy-MM-dd')} ~ "
+                     f"{self._end.toString('yyyy-MM-dd')}（{n} 天）")
+
+    def _toggle(self):
+        if self._popup is None:
+            self._popup = _DateRangePopup(self)
+        self._popup._start = self._start
+        self._popup._end = self._end
+        self._popup._refresh()
+        self._popup.adjustSize()
+        self._popup.move(self.mapToGlobal(QPoint(0, self.height() + 4)))
+        # 同 TreeSelect：延后一帧再弹，避开按钮 clicked 紧接的释放事件把 Popup 立即关掉
+        QTimer.singleShot(0, self._popup.show)
+
+
+# --------------------------------------------------------------------
+# 带浮动百分比气泡的滑块：拖动时在拇指上方浮现半透明气泡，静止即隐藏
+# --------------------------------------------------------------------
+class KitSlider(QSlider):
+    """带浮动百分比气泡的滑块：拖动时在拇指正上方浮现一个深色圆角气泡包住数字，
+    气泡跟随拇指平滑移动；松手即隐。拇指位置用 QStyle 的 handle 子控件矩形精确
+    取得（不再靠估算），拖动时逐像素跟随，观感顺滑。"""
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._vert = (orientation == Qt.Orientation.Vertical)
+        if self._vert:
+            # 垂直滑块：缩小占地（之前 180×72 显得太大，把整行顶得很高）；
+            # 右侧留一点气泡带即可，不够宽时 _place_bubble 会自动翻到拇指左侧
+            self.setMinimumHeight(120)
+            self.setMinimumWidth(40)
+        else:
+            self.setMinimumHeight(58)          # 顶部留一条带放气泡（子控件会被父矩形裁剪）
+        self.setTickInterval(0)
+        self._bubble = QLabel(self)
+        self._bubble.setObjectName("KitBubble")
+        self._bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._bubble.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        # 关键：开 WA_StyledBackground，QSS 的深色底才会真的画出来——
+        # 之前没开，背景透明、白字落在白底上看不见，看着就像“只有白色数字”。
+        self._bubble.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._bubble.setStyleSheet(
+            "QLabel#KitBubble{background:rgba(31,35,41,0.92);color:#FFFFFF;"
+            "border-radius:7px;padding:3px 9px;font-size:12px;font-weight:600;}")
+        self._bubble.hide()
+        # 气泡水平位置用属性动画平滑跟随拇指（避免拖动时一顿一顿地跳）
+        self._bx = QPropertyAnimation(self._bubble, b"pos", self)
+        self._bx.setDuration(90)
+        self._bx.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.sliderPressed.connect(lambda: self._show_bubble(True))
+        self.sliderReleased.connect(self._on_release)
+        self.valueChanged.connect(lambda: self._place_bubble(animated=self.isSliderDown()))
+        self.sliderMoved.connect(lambda _v: self._place_bubble(animated=True))
+
+    def _fmt(self):
+        return f"{self.value()}%" if self.maximum() == 100 else str(self.value())
+
+    def _show_bubble(self, on):
+        if on:
+            self._place_bubble()
+            self._bubble.show()
+            self._bubble.raise_()
+        elif not self.isSliderDown():
+            self._bubble.hide()
+
+    def _on_release(self):
+        # 松手：若鼠标已不在滑块上则收起；还悬停着就再显示一小会儿由 leave 兜底
+        if not self.underMouse():
+            self._bubble.hide()
+
+    def leaveEvent(self, e):
+        if not self.isSliderDown():
+            self._bubble.hide()
+        super().leaveEvent(e)
+
+    def _handle_rect(self):
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderHandle, self)
+
+    def _place_bubble(self, animated=False):
+        self._bubble.setText(self._fmt())
+        self._bubble.adjustSize()
+        bw, bh = self._bubble.width(), self._bubble.height()
+        hr = self._handle_rect()
+        if self._vert:
+            # 垂直：气泡跟到拇指右侧，居中对齐拇指；右侧放不下就换到左侧
+            by = max(2, min(hr.center().y() - bh // 2, self.height() - bh - 2))
+            bx = hr.right() + 6
+            if bx + bw > self.width() - 2:
+                bx = hr.left() - bw - 6
+            bx = max(2, bx)
+        else:
+            bx = max(2, min(hr.center().x() - bw // 2, self.width() - bw - 2))
+            # 再往上搜一点（留 5px 缝）——用户反馈气泡仍与拇指重叠，往上一点点就够了
+            by = max(0, hr.top() - bh - 5)
+        target = QPoint(bx, by)
+        if animated and self._bubble.isVisible():
+            self._bx.stop()
+            self._bx.setEndValue(target)
+            self._bx.start()
+        else:
+            self._bubble.move(target)
+
+
+# --------------------------------------------------------------------
+# 多行文本：右下角自由拉伸把手（上/下/左/右都能拉），带最小显示区域
+# --------------------------------------------------------------------
+class _SizeGrip(QWidget):
+    """右下角斜纹把手：按住往任意方向拖，宿主随之自由改宽/改高（最小尺寸钳制）。"""
+
+    def __init__(self, host):
+        super().__init__(host)
+        self._host = host
+        self.setFixedSize(18, 18)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self._start = None
+        self._base = None
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        on = self._host.underMouse() or self._start is not None
+        pen = QPen(QColor(C["primary"] if on else C["border_strong"]))
+        pen.setWidthF(1.3)
+        p.setPen(pen)
+        w, h = self.width(), self.height()
+        # 三条平行于右下角 45° 斜线的短斜纹（经典拉伸把手纹样）
+        for i in range(3):
+            t = 5 + i * 4
+            p.drawLine(w - t, h - 2, w - 2, h - t)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._start = QCursor.pos()
+            self._base = QSize(self._host.width(), self._host.height())
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._start is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+            cur = QCursor.pos()
+            d = cur - self._start
+            nw = max(self._host.minimumWidth(), self._base.width() + d.x())
+            nh = max(self._host.minimumHeight(), self._base.height() + d.y())
+            self._host.resize(nw, nh)
+            self.update()
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._start is not None:
+            self._start = None
+            self.update()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+
+class ResizableTextEdit(QWidget):
+    """多行文本 + 右下角自由拉伸把手：上下左右均可拖大拖小，但有最小显示区域。
+    放进布局时需以对齐方式加入（AlignLeft|AlignTop），布局才尊重它的自定义尺寸。"""
+    GRIP = 18
+
+    def __init__(self, min_w=220, min_h=90, placeholder="", parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(min_w, min_h)
+        self.resize(min_w + 160, min_h + 24)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.edit = QPlainTextEdit()
+        self.edit.setPlaceholderText(placeholder)
+        v.addWidget(self.edit)
+        self._grip = _SizeGrip(self)
+
+    def resizeEvent(self, e):
+        self._grip.move(self.width() - self.GRIP, self.height() - self.GRIP)
+        self._grip.raise_()
+        super().resizeEvent(e)
+
+
+# --------------------------------------------------------------------
+# 表格：仅表头右键可设本列对齐/换行；行高可拖；单元格其他处不可设
+# --------------------------------------------------------------------
+class _KitItemDelegate(QStyledItemDelegate):
+    """表格单元格委托：
+    ① 关掉原生焦点虚线框——选中 / 复制的方框统一由 KitTable.paintEvent 自绘，
+       尺寸与整格一致（原生焦点框内缩一圈，看着比单元格小）；
+    ② 双击内联编辑时把编辑器加宽到视口右缘（Excel 式向右溢出），长文本不被窄格遮挡。"""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        # 去掉 HasFocus 位：格子里那圈原生焦点点线就不再画了
+        option.state &= ~QStyle.StateFlag.State_HasFocus
+
+    def createEditor(self, parent, option, index):
+        ed = super().createEditor(parent, option, index)
+        # 内联编辑框改成方角（border-radius:0）+ 主蓝描边：app 级 QLineEdit 的 8px
+        # 圆角会和直角单元格/表格外框相冲（“圆角里套直角黑边”）；方角才能贴进格子里。
+        ed.setStyleSheet(
+            f"QLineEdit{{background:{C['card']};color:{C['text']};"
+            f"border:1px solid {C['primary']};border-radius:0;padding:2px 6px;}}")
+        return ed
+
+    def updateEditorGeometry(self, editor, option, index):
+        r = option.rect
+        parent = editor.parent()
+        vp = parent.rect() if parent is not None else r
+        # 从当前格左缘一直铺到视口右缘，至少保持格宽；双击改长文本时能看全
+        w = max(r.width(), vp.right() - r.left() - 2)
+        editor.setGeometry(r.left(), r.top(), w, max(r.height(), 28))
+
+
+class TableColumnKit(QObject):
+    """表头右键 → 本列靠左/居中/靠右 / 垂直居中 / 自动换行：把这套列对齐+换行交互做成
+    可复用装配器。既能被 KitTable 复用（单一真源），也能 attach 到任意已有 QTableWidget，
+    给全站列表表格补上同一套列交互——且只接管「表头右键」这一个入口，绝不触碰各表自己的
+    委托、选择模式、排序、单元格右键业务菜单等配置（零行为变更）。
+    用法：TableColumnKit(table, baseline_h=None)；实例以 table 为父，生命周期随表，无需另存引用。
+    baseline_h 缺省取表格当前默认行高，作为「关换行」逐行复位的基准。"""
+
+    # 对齐位掩码：水平位与垂直位分开管理，切换行 / 只改某一个方向时另一方向不受影响
+    _HMASK = (int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignRight)
+              | int(Qt.AlignmentFlag.AlignHCenter) | int(Qt.AlignmentFlag.AlignJustify))
+    _VMASK = (int(Qt.AlignmentFlag.AlignTop) | int(Qt.AlignmentFlag.AlignVCenter)
+              | int(Qt.AlignmentFlag.AlignBottom))
+
+    def __init__(self, table, baseline_h=None):
+        super().__init__(table)
+        self._t = table
+        self._wrap = table.wordWrap()   # 跟随表格现状，菜单首项文案才准确
+        self._col_h = {}                # col → 水平对齐基准（仅水平位）
+        self._col_v = {}                # col → 垂直对齐基准（仅垂直位）
+        vh = table.verticalHeader()
+        self._row_h0 = (baseline_h if baseline_h is not None
+                        else vh.defaultSectionSize())
+        hh = table.horizontalHeader()
+        hh.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        hh.installEventFilter(self)
+
+    def set_col_align(self, col, halign):
+        # 只改水平对齐（左/中/右）：存进 _col_h 的水平位，垂直位与换行位一律不动
+        self._col_h[col] = int(halign) & self._HMASK
+        self._apply_col(col)
+
+    def set_col_valign(self, col, valign):
+        # 只改垂直对齐（顶端/居中/底端）：存进 _col_v 的垂直位，水平位与换行位一律不动。
+        # 与水平对齐彼此独立，这样“垂直居中”不会把已设的靠左/居中/靠右冲回默认。
+        self._col_v[col] = int(valign) & self._VMASK
+        self._apply_col(col)
+
+    def _apply_col(self, col):
+        # 组合该行对齐 = 水平基准(_col_h) + 垂直基准(_col_v) + 换行位（按开关）。
+        # 没通过菜单设过的列，基准回退取单元格当前对齐的对应位；当前既没标垂直位
+        # 就是 Qt 默认的垂直居中，故回退默认给 AlignVCenter——保证开/关换行时水平与
+        # 垂直都原样保留（早期把 base 硬取 AlignLeft 且抹 VCenter 是“换行前后不一致”的根因）。
+        word = int(Qt.TextFlag.TextWordWrap)
+        left = int(Qt.AlignmentFlag.AlignLeft)
+        vcenter = int(Qt.AlignmentFlag.AlignVCenter)
+        for r in range(self._t.rowCount()):
+            it = self._t.item(r, col)
+            if it:
+                cur = int(it.textAlignment())
+                h = self._col_h.get(col, (cur & self._HMASK) or left)
+                v = self._col_v.get(col, (cur & self._VMASK) or vcenter)
+                it.setTextAlignment(Qt.AlignmentFlag(h | v | (word if self._wrap else 0)))
+
+    def toggle_wrap(self):
+        self._wrap = not self._wrap
+        # 视图级 wordWrap 直接跟随开关：关→单行 + … 省略（绝不折行，从根上消除“两排字”），
+        # 开→按列宽折行。item 的 TextWordWrap 标志（_apply_col）作为叠加保险，两者同向。
+        self._t.setWordWrap(self._wrap)
+        for c in range(self._t.columnCount()):
+            self._apply_col(c)
+        vh = self._t.verticalHeader()
+        if self._wrap:
+            # 开换行：按内容自适应行高，长文本整格撑开多行
+            vh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            self._t.resizeRowsToContents()
+        else:
+            # 关换行：ResizeToContents 不会自动缩回，必须切回 Interactive 并逐行复位到一行基准高。
+            vh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            t = self._t
+            h0 = self._row_h0
+
+            def _reset_heights():
+                # setRowHeight 只在行高模式已落到 Interactive 时才生效；若同一帧里模式尚未
+                # 完成切换（不同机器/时序下可能发生），此时设值会被 ResizeToContents 忽略，行就
+                # 卡在换行时的两行高。故立即复位一次 + 事件循环后再兜底复位一次（幂等）。
+                for r in range(t.rowCount()):
+                    t.setRowHeight(r, h0)
+
+            _reset_heights()
+            QTimer.singleShot(0, _reset_heights)
+        return self._wrap
+
+    def eventFilter(self, obj, ev):
+        if obj is self._t.horizontalHeader() and ev.type() == QEvent.Type.ContextMenu:
+            hh = self._t.horizontalHeader()
+            col = hh.logicalIndexAt(ev.pos())
+            if col >= 0:
+                self._show_header_menu(col, ev.globalPos())
+                return True
+        return False
+
+    def _show_header_menu(self, col, gpos):
+        menu = StyledMenu(self._t)
+        # 对标飞书：菜单项纯文字——不挂箭头 emoji（字形宽窄不一会把文字挤得参差），
+        # 也不带【列名】前缀（本就是从那一列表头右键弹出的，列名是冗余）；去掉后各
+        # 行统一顶到 QMenu::item 的 16px 左内边距，天然左对齐。
+        a_l = menu.addAction("本列靠左")
+        a_c = menu.addAction("本列居中")
+        a_r = menu.addAction("本列靠右")
+        menu.addSeparator()
+        a_v = menu.addAction("本列垂直居中")
+        menu.addSeparator()
+        a_w = menu.addAction("取消自动换行" if self._wrap else "自动换行")
+        chosen = menu.exec(gpos)
+        A = Qt.AlignmentFlag
+        if chosen is a_l:
+            self.set_col_align(col, A.AlignLeft)
+        elif chosen is a_c:
+            self.set_col_align(col, A.AlignHCenter)
+        elif chosen is a_r:
+            self.set_col_align(col, A.AlignRight)
+        elif chosen is a_v:
+            self.set_col_valign(col, A.AlignVCenter)
+        elif chosen is a_w:
+            self.toggle_wrap()
+
+
+class KitTable(QTableWidget):
+    def __init__(self, rows, cols, headers, parent=None):
+        super().__init__(rows, cols, parent)
+        self.setHorizontalHeaderLabels(headers)
+        hh = self.horizontalHeader()
+        hh.setSectionsClickable(True)
+        hh.setHighlightSections(False)
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)   # 列宽可拖
+        vh = self.verticalHeader()
+        vh.setVisible(True)
+        # 行高用 Interactive + 手动控制：默认一行基准高；开换行时按内容撑高，
+        # 关换行时逐行复位到基准高（ResizeToContents 关换行不会自动缩回，反而重现“两行”bug）
+        vh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        vh.setDefaultSectionSize(38)
+        # 默认一行：直接关掉视图级 wordWrap（这才是“折不折行”的总开关）——列宽超出部分用
+        # … 省略（配合下面 ElideRight），悬停靠 tooltip 看完整内容。只靠 item 不带 TextWordWrap
+        # 标志不够：视图 wordWrap 默认为 True 时会无视 item 标志、照样按列宽折行，行高一旦
+        # 回到一行高就被裁成“两排字”（即用户反馈的“自动换行前/后不一致”）。toggle_wrap 里切这个开关。
+        self.setWordWrap(False)
+        self.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)  # 单元格右键不弹
+        # 单元格：可选中（配合 Ctrl+C 复制）；双击走内联编辑（像 Excel 在格子里改）
+        self.setItemDelegate(_KitItemDelegate(self))   # 去原生焦点框 + 编辑框加宽
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                             | QAbstractItemView.EditTrigger.EditKeyPressed)
+        # 编辑提交后把 tooltip 同步成最新内容，悬停才能看到改后的全文（等值守卫防信号回环）
+        self.itemChanged.connect(self._sync_tooltip)
+        # 复制后的 Excel 式“行走的虚线框”（marching ants）
+        self._marching = []
+        self._marquee_phase = 0
+        self._marquee_timer = QTimer(self)
+        self._marquee_timer.setInterval(220)
+        self._marquee_timer.timeout.connect(self._tick_marquee)
+        # 另选其它单元格时清掉虚线框（复制本身不改选区，不影响刚启动的动画）
+        self.selectionModel().selectionChanged.connect(self._stop_marching)
+        # 列对齐 / 换行交互交给可复用装配器（单一真源）：表头右键菜单 + 逐列对齐状态
+        # 都在 TableColumnKit 里，KitTable 仅复用、不再自带一份实现。放在 wordWrap 已置
+        # False 之后创建，装配器读到的初始 _wrap 才与实际一致。
+        self._colkit = TableColumnKit(self, baseline_h=38)
+
+    def _sync_tooltip(self, it):
+        # setToolTip 也会触发 dataChanged→itemChanged，不同值才写，避免无限回环
+        if it is not None and it.toolTip() != it.text():
+            it.setToolTip(it.text())
+
+    # —— 列对齐 / 自动换行的对外方法转发给 _colkit（保持 KitTable 既有 API 不变）——
+    def set_col_align(self, col, halign):
+        self._colkit.set_col_align(col, halign)
+
+    def set_col_valign(self, col, valign):
+        self._colkit.set_col_valign(col, valign)
+
+    def toggle_wrap(self):
+        return self._colkit.toggle_wrap()
+
+    def _copy_selection(self):
+        """把选中区拼成制表符分隔文本复制到剪贴板（多行多列都行）；无选中则复制当前格。
+        复制后记住这片区域，在它周围画 Excel 式“行走的虚线框”。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        ranges = self.selectedRanges()
+        if not ranges:
+            it = self.currentItem()
+            if it is not None:
+                app.clipboard().setText(it.text())
+                ranges = [QTableWidgetSelectionRange(it.row(), it.column(),
+                                                     it.row(), it.column())]
+            else:
+                return
+        lines = []
+        for r in ranges:
+            for row in range(r.topRow(), r.bottomRow() + 1):
+                cells = []
+                for col in range(r.leftColumn(), r.rightColumn() + 1):
+                    it = self.item(row, col)
+                    cells.append(it.text() if it is not None else "")
+                lines.append("\t".join(cells))
+        app.clipboard().setText("\n".join(lines))
+        # 记住刚复制的区域，启动虚线框动画（按 Esc 或重新选中会停）
+        self._start_marching(ranges)
+
+    def _start_marching(self, ranges):
+        self._marching = list(ranges)
+        self._marquee_phase = 0
+        self._marquee_timer.start()
+        self.viewport().update()
+
+    def _stop_marching(self):
+        if self._marching:
+            self._marching = []
+            self._marquee_timer.stop()
+            self.viewport().update()
+
+    def _tick_marquee(self):
+        self._marquee_phase = (self._marquee_phase + 1) % 8
+        self.viewport().update()
+
+    def _marching_rect(self, rng):
+        """把选中区映射成视口坐标矩形（visualRect 返回的就是视口坐标）。"""
+        tl = self.visualRect(self.model().index(rng.topRow(), rng.leftColumn()))
+        br = self.visualRect(self.model().index(rng.bottomRow(), rng.rightColumn()))
+        return QRect(tl.left(), tl.top(),
+                     br.right() - tl.left() + 1, br.bottom() - tl.top() + 1)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self.viewport())
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if self._marching:
+            # 复制后：整片选区外圈画“行走的虚线框”（Excel marching ants）
+            pen = QPen(QColor(C["text"]))
+            pen.setWidthF(1.2)
+            pen.setDashPattern([3, 3])
+            pen.setDashOffset(self._marquee_phase * 0.75)   # 逐帧偏移→虚线“行走”
+            p.setPen(pen)
+            for rng in self._marching:
+                p.drawRect(self._marching_rect(rng))
+        else:
+            # 平时选中：画一圈与整格等大的实线框（和复制后的虚线框同尺寸，只是实→虚）
+            pen = QPen(QColor(C["primary"]))
+            pen.setWidthF(1.2)
+            p.setPen(pen)
+            for rng in self.selectedRanges():
+                p.drawRect(self._marching_rect(rng))
+        p.end()
+
+    def keyPressEvent(self, e):
+        if e.matches(QKeySequence.StandardKey.Copy):
+            self._copy_selection()
+            return
+        if e.key() == Qt.Key.Key_Escape:      # Esc 取消“行走的虚线框”
+            self._stop_marching()
+            return
+        super().keyPressEvent(e)
+
+    def _edit_cell(self, row, col):
+        """已改为 Excel 式双击内联编辑，此弹框编辑保留备用（当前不接线）。"""
+        it = self.item(row, col)
+        if it is None:
+            return
+        head = self.horizontalHeaderItem(col)
+        title = head.text() if head else f"第 {col + 1} 列"
+        dlg = QDialog(self.window())
+        dlg.setWindowTitle(f"编辑单元格 · {title} · 第 {row + 1} 行")
+        dlg.setModal(True)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+        editor = QPlainTextEdit()
+        editor.setPlainText(it.text())
+        editor.setMinimumSize(360, 160)
+        v.addWidget(editor)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("取消")
+        ok = QPushButton("确定")
+        ok.setDefault(True)
+        cancel.clicked.connect(dlg.reject)
+        ok.clicked.connect(dlg.accept)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        v.addLayout(btns)
+        _round_dialog(dlg)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            it.setText(editor.toPlainText())   # setText 不动对齐/换行标志
+
+
+# --------------------------------------------------------------------
+# 日期选择器变体（供选型）：紧凑内嵌日历卡片 + 现代换皮 QDateEdit
+# --------------------------------------------------------------------
+class CompactCalendar(QWidget):
+    """内嵌式日历：不用点开，直接展开在页面里；顶部快捷「今天」。适合侧栏/弹窗。"""
+
+    def __init__(self, date=None, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"background:{C['card']};border:1px solid {C['border_popup']};"
+            f"border-radius:{ui_kit.RADIUS['card']}px;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+        self.cal = QCalendarWidget()
+        self.cal.setGridVisible(False)
+        self.cal.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.cal.setHorizontalHeaderFormat(
+            QCalendarWidget.HorizontalHeaderFormat.SingleLetterDayNames)
+        self.cal.setStyleSheet(_CAL_QSS)
+        if date:
+            self.cal.setSelectedDate(date)
+        lay.addWidget(self.cal)
+        row = QHBoxLayout()
+        today = KitButton("今天", kind="ghost", obj_name="GhostBtn", explain=False)
+        today.clicked.connect(lambda: self.cal.setSelectedDate(QDate.currentDate()))
+        row.addWidget(today)
+        row.addStretch(1)
+        self.date_lbl = QLabel(date.toString("yyyy-MM-dd") if date else "")
+        self.date_lbl.setStyleSheet(f"color:{C['primary']};font-weight:600;"
+                                    "background:transparent;")
+        self.cal.clicked.connect(lambda d: self.date_lbl.setText(d.toString("yyyy-MM-dd")))
+        row.addWidget(self.date_lbl)
+        lay.addLayout(row)
+
+
+class ModernDateEdit(QDateEdit):
+    """原生 QDateEdit 换皮：白底圆角、右侧日历小按钮点开日历弹层（保留键盘输入习惯）。"""
+
+    def __init__(self, date=None, parent=None):
+        super().__init__(parent)
+        self.setCalendarPopup(True)
+        self.setDate(date or QDate.currentDate())
+        self.setDisplayFormat("yyyy 年 MM 月 dd 日")
+        self.setStyleSheet(
+            f"QDateEdit{{background:{C['card']};color:{C['text']};"
+            f"border:1px solid {C['border']};border-radius:{ui_kit.RADIUS['md']}px;"
+            f"padding:6px 8px;min-height:20px;}}"
+            f"QDateEdit:focus{{border-color:{C['primary']};}}")
+        cal = self.calendarWidget()
+        if cal is not None:
+            cal.setStyleSheet(_CAL_QSS)
+
+
+class _FlowKpiCard(KpiCard):
+    """画廊演示用：宽度钉成固定 W（供 FlowLayout 按此宽定位），高度只当“最小高”。
+    原生 KpiCard 内部 value/name 两个 QLabel 与固定 96px 的 spark 会把自身最小宽撑到 ~310，
+    setFixedWidth 压不动它（而 FlowLayout 又是按 sizeHint 定位）；这里显式覆盖 sizeHint
+    把宽锁到目标宽，高度取 max(最小高, 内容自然高)——内容装不下时卡片会自己长高。
+    （FlowLayout 按 sizeHint 定位、并用 sizeHint().height() 设行高，所以高度只要写进 sizeHint 即可自适应。）"""
+
+    def __init__(self, w, min_h, name, icon, color, parent=None):
+        super().__init__(name, icon, color, parent)
+        self._fw, self._minh = w, min_h
+        self.value.setMinimumWidth(0)     # 放开数字标签最小宽（spark 的最小宽由调用方放开）
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+
+    def sizeHint(self):
+        # 宽固定；高取“最小高”与“内容自然高”的较大值，让内容多时卡片自动长高
+        natural = super().sizeHint().height()
+        return QSize(self._fw, max(self._minh, natural))
+
+    def minimumSizeHint(self):
+        return QSize(self._fw, self._minh)

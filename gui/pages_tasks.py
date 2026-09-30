@@ -11,7 +11,7 @@ from PySide6.QtCore import (QThread, Signal, Qt, QDate, QPoint, QSize, QTimer,
 from PySide6.QtGui import QColor, QCursor, QGuiApplication, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
                                QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
-                               QMenu, QMessageBox, QFileDialog, QAbstractItemView,
+                               QMessageBox, QFileDialog, QAbstractItemView,
                                QLineEdit, QDateEdit, QCheckBox, QInputDialog, QFrame,
                                QDialog, QDialogButtonBox, QFormLayout,
                                QGroupBox, QGraphicsOpacityEffect,
@@ -31,7 +31,11 @@ from gui.delegates import ProgressDelegate, ProgressRole
 from gui.formatting import secs
 from gui.widgets import VideoPlayerDialog, HoverPreview, Toast, FlowLayout
 from gui.header import page_header, Card, kpi_row
-from gui.tablekit import apply_field_layout, enable_drag_with_lock, SecsItem
+from gui.menus import StyledMenu
+from gui.tablekit import (FieldManagerDialog, apply_field_layout,
+                          enable_drag_with_lock, SecsItem)
+from gui.kit import TableColumnKit
+from gui.theme import tokenize
 
 STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
                  "cancelled": "#8F959E", "submitted": "#3370FF", "queued": "#3370FF",
@@ -207,13 +211,13 @@ class _GuideBubble(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         card = QFrame()
         card.setObjectName("GuideCard")
-        card.setStyleSheet("QFrame#GuideCard{background:#FFFFFF;border:1px solid #3370FF;"
-                           "border-radius:10px;}")
+        card.setStyleSheet(tokenize("QFrame#GuideCard{background:#FFFFFF;border:1px solid #3370FF;"
+                           "border-radius:10px;}"))
         cl = QVBoxLayout(card)
         cl.setContentsMargins(16, 12, 16, 12)
         cl.setSpacing(8)
         head = QLabel(f"快速上手 · {idx}/{total}")
-        head.setStyleSheet("color:#3370FF;font-weight:bold;")
+        head.setStyleSheet(tokenize("color:#3370FF;font-weight:bold;"))
         cl.addWidget(head)
         body = QLabel(text)
         body.setWordWrap(True)
@@ -433,165 +437,14 @@ class FilterPanel(QWidget):
         self._page.refresh()
 
 
-class FieldPanel(QWidget):
-    """⚟ 字段管理：快捷筛选条下方就地展开的内嵌面板（取代旧模态弹窗）。
-
-    左侧＝字段按分类勾选显示/隐藏，右侧＝已显示字段的顺序预览（内部拖拽调序＝
-    表格列的「预计排序」）。任一处改动即时套用到底部表格并持久化，与「更多筛选」
-    同款所见即所得；也可直接回表格上拖表头调序（下次展开面板会同步过来）。"""
-    # 分类 -> 字段名（须与 DATA_HEADERS 一一对应，覆盖全部可管理列）
-    _CATEGORIES = [
-        ("基础信息", ["任务ID", "编号", "品名", "标签", "备注"]),
-        ("文案素材", ["脚本", "提示词", "口播文案", "分镜数"]),
-        ("执行状态", ["状态", "时长", "生成用时", "排队", "账号", "运行", "成功", "取消"]),
-        ("时间输出", ["更新时间", "输出文件"]),
-        ("技术字段", ["job_id", "URL"]),
-    ]
-
-    def __init__(self, page, parent=None):
-        super().__init__(parent)
-        self._page = page
-        self._syncing = False
-        self._title = {}       # 逻辑列号 -> 字段名
-        self._chips = {}       # 逻辑列号 -> QPushButton
-        self.setObjectName("Card")
-        # 子类不自开 WA_StyledBackground，不补这行 QSS 白底画不出来
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        name2col = {name: i + 1 for i, name in enumerate(DATA_HEADERS)}   # 逻辑 0 是勾选列
-        v = QVBoxLayout(self)
-        v.setContentsMargins(14, 10, 14, 12)
-        v.setSpacing(8)
-        trow = QHBoxLayout()
-        tip = QLabel("左侧勾选要显示的字段 · 右侧拖动调整列顺序 · 改动即时生效（也可直接拖表头）")
-        tip.setObjectName("PageTip")
-        trow.addWidget(tip)
-        trow.addStretch(1)
-        b_reset = QPushButton("↺ 恢复默认")
-        b_reset.setObjectName("GhostBtn")
-        b_reset.setToolTip("列序回到默认、技术字段（job_id/URL）重新收起")
-        b_reset.clicked.connect(self._reset_default)
-        trow.addWidget(b_reset)
-        v.addLayout(trow)
-
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        # ---------- 左：分类勾选（显示 / 隐藏）----------
-        left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(8)
-        for label, names in self._CATEGORIES:
-            box = QGroupBox(label)
-            bv = QVBoxLayout(box)
-            bv.setContentsMargins(8, 6, 8, 8)
-            flow = FlowLayout(hgap=6, vgap=6)
-            for name in names:
-                col = name2col[name]
-                self._title[col] = name
-                b = QPushButton(name)
-                b.setObjectName("ChipBtn")
-                b.setCheckable(True)
-                b.setCursor(Qt.CursorShape.PointingHandCursor)
-                b.setToolTip("点亮＝在表格中显示这一列，再点取消＝隐藏")
-                b.clicked.connect(lambda _c=False, c=col: self._on_toggle(c))
-                flow.addWidget(b)
-                self._chips[col] = b
-            bv.addLayout(flow)
-            lv.addWidget(box)
-        lv.addStretch(1)
-        lscroll = QScrollArea()
-        lscroll.setWidgetResizable(True)
-        lscroll.setFrameShape(QFrame.Shape.NoFrame)
-        lscroll.setWidget(left)
-        lscroll.setFixedWidth(360)
-        lscroll.setMaximumHeight(240)
-        body.addWidget(lscroll)
-        # ---------- 右：顺序预览（拖拽调序 = 表格列的预计排序）----------
-        rbox = QVBoxLayout()
-        rbox.setSpacing(4)
-        rlabel = QLabel("已显示字段 · 上下拖动调整列顺序")
-        rlabel.setObjectName("PageTip")
-        rbox.addWidget(rlabel)
-        self.lst = QListWidget()
-        self.lst.setDragDropMode(QListWidget.DragDropMode.InternalMove)
-        self.lst.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.lst.setMaximumHeight(240)
-        self.lst.setToolTip("这里就是表格列的最终顺序预览：拖动条目即可调整，松手立即生效")
-        self.lst.model().rowsMoved.connect(self._on_reorder)
-        rbox.addWidget(self.lst)
-        body.addLayout(rbox, 1)
-        v.addLayout(body)
-
-    # ---------- 同步 ----------
-    def reload(self):
-        """展开时按当前表格列序/显隐，回勾左侧分类胶囊 + 重建右侧顺序"""
-        table = self._page.table
-        h = table.horizontalHeader()
-        n = table.columnCount()
-        order = [lg for lg in (h.logicalIndex(i) for i in range(1, n))
-                 if lg in self._chips and not table.isColumnHidden(lg)]
-        hidden = {lg for lg in range(1, n) if table.isColumnHidden(lg)}
-        self._syncing = True
-        for col, b in self._chips.items():
-            b.setChecked(col not in hidden)
-        self.lst.clear()
-        for col in order:
-            self._add_item(col)
-        self._syncing = False
-
-    def _add_item(self, col):
-        it = QListWidgetItem(self._title.get(col, str(col)))
-        it.setData(Qt.ItemDataRole.UserRole, col)
-        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsDragEnabled)
-        self.lst.addItem(it)
-
-    def _row_of(self, col):
-        for i in range(self.lst.count()):
-            if self.lst.item(i).data(Qt.ItemDataRole.UserRole) == col:
-                return i
-        return None
-
-    def _on_toggle(self, col):
-        """左侧勾选变化：即时增删右侧条目并套用"""
-        if self._syncing:
-            return
-        vis = self._chips[col].isChecked()
-        row = self._row_of(col)
-        self._syncing = True
-        if vis and row is None:
-            self._add_item(col)
-        elif not vis and row is not None:
-            self.lst.takeItem(row)
-        self._syncing = False
-        self._apply()
-
-    def _on_reorder(self, *_a):
-        """右侧拖拽调序：延迟一帧读最终顺序再套用（避免拖拽过程中重入）"""
-        if self._syncing:
-            return
-        QTimer.singleShot(0, self._apply)
-
-    def _current_layout(self):
-        order = [self.lst.item(i).data(Qt.ItemDataRole.UserRole)
-                 for i in range(self.lst.count())]
-        hidden = {c for c in self._chips if c not in order}
-        return order, hidden
-
-    def _apply(self):
-        """把右侧顺序 + 左侧显隐落到表格并持久化（所见即所得）"""
-        order, hidden = self._current_layout()
-        apply_field_layout(self._page.table, order, hidden, first_locked=1)
-        app_state.set_value("tasks_fields",
-                            {"order": list(order), "hidden": sorted(hidden)})
-
-    def _reset_default(self):
-        """恢复默认：自然列序、技术字段（job_id/URL）重新收起"""
-        order = list(range(1, len(DATA_HEADERS) + 1))
-        hidden = set(DEFAULT_HIDDEN)
-        apply_field_layout(self._page.table, order, hidden, first_locked=1)
-        app_state.set_value("tasks_fields",
-                            {"order": order, "hidden": sorted(hidden)})
-        self.reload()
+# 字段管理弹窗的列分组（标题须与 DATA_HEADERS 一一对应，覆盖全部可管理列）
+_FIELD_CATEGORIES = [
+    ("基础信息", ["任务ID", "编号", "品名", "标签", "备注"]),
+    ("文案素材", ["脚本", "提示词", "口播文案", "分镜数"]),
+    ("执行状态", ["状态", "时长", "生成用时", "排队", "账号", "运行", "成功", "取消"]),
+    ("时间输出", ["更新时间", "输出文件"]),
+    ("技术字段", ["job_id", "URL"]),
+]
 
 
 class TasksPage(QWidget):
@@ -745,15 +598,13 @@ class TasksPage(QWidget):
         self.b_more.clicked.connect(lambda: self._toggle_filter_panel())
         chbar.addWidget(self.b_more)
         chbar.addStretch(1)
-        # 「⚟ 字段管理」挪到快捷筛选这一行的最右端：与「更多筛选」同款胶囊入口，
-        # 点击在下方就地展开「左分类 / 右排序预览」面板（取代原来的模态弹窗）
-        self.b_fields = QPushButton("⚟ 字段管理 ▾")
+        # 「⚟ 字段管理」入口：点开放大式弹窗（推广后台同款：左分类勾选 / 右拖动排序）
+        self.b_fields = QPushButton("⚟ 字段管理")
         self.b_fields.setObjectName("ChipBtn")
         self.b_fields.setProperty("accent", "1")
         self.b_fields.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.b_fields.setToolTip("就地展开：左侧按分类勾选要显示的字段，右侧拖动预览并调整列顺序<br>"
-                                 "改动即时生效，也可直接拖动表头调序（设置会被记住）")
-        self.b_fields.clicked.connect(lambda: self._toggle_field_panel())
+        self.b_fields.setToolTip("弹窗管理列显示/隐藏与顺序：左侧按分类勾选，右侧拖动调序（设置会被记住）")
+        self.b_fields.clicked.connect(self._manage_fields)
         chbar.addWidget(self.b_fields)
         ctrl.v.addLayout(chbar)
 
@@ -767,15 +618,7 @@ class TasksPage(QWidget):
         self._panel_an.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._panel_an.finished.connect(self._panel_an_done)
 
-        # ---------- 内嵌字段管理面板：默认收起，展开时把表格整体下推 ----------
-        self.field_panel = FieldPanel(self)
-        self.field_panel.setVisible(False)
-        self.field_panel.setMaximumHeight(0)
-        ctrl.v.addWidget(self.field_panel)
-        self._fpanel_an = QPropertyAnimation(self.field_panel, b"maximumHeight", self)
-        self._fpanel_an.setDuration(180)
-        self._fpanel_an.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._fpanel_an.finished.connect(self._fpanel_an_done)
+        # 字段管理改为弹窗（见 _manage_fields），不再内嵌下推面板
         lay.addWidget(ctrl)
 
         # ---------- 内容区卡片：表格 + 分页栏收进一张白卡 ----------
@@ -823,6 +666,10 @@ class TasksPage(QWidget):
         self.table.installEventFilter(self)      # 空格键弹全文预览用
         self._tag_editor = None                  # 当前内联标签下拉（非 None 时暂停重建表）
         content.v.addWidget(self.table, 1)
+        # 统一列交互：表头右键可设本列靠左/居中/靠右 / 垂直居中 / 自动换行。
+        # 复用 gui.kit.TableColumnKit：只接管「表头右键」这一个入口，不动本页的
+        # 进度条委托 / 框选勾选 / 排序 / 字段管理 / 单元格业务菜单等既有行为。
+        TableColumnKit(self.table)
         self._build_empty_state()        # 空表时盖在表格上的引导层（导入/新建 或 清除筛选）
 
         # ---------- 分页栏 ----------
@@ -882,7 +729,6 @@ class TasksPage(QWidget):
         self._expect_done = False    # 提交后等待完成通知
         self._filters = _empty_filters()   # 筛选条件集（多条件×多选），空=不限
         self._panel_open = False       # 「⚟ 更多筛选」内嵌面板是否展开
-        self._fpanel_open = False      # 「⚟ 字段管理」内嵌面板是否展开
         self._last_view_sig = None   # 上次刷新的视图指纹（未变则跳过重建）
         self._last_data_sig = None   # 上次刷新的数据指纹（库写入 + 内存在途态）
 
@@ -900,7 +746,7 @@ class TasksPage(QWidget):
 
     # ============ 导入/导出菜单 ============
     def _build_io_menu(self):
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("📥 从 Excel 导入任务", self._import_excel)
         m.addAction("📄 下载导入模板", self._download_template)
         m.addSeparator()
@@ -913,7 +759,7 @@ class TasksPage(QWidget):
 
     def _build_tidy_menu(self):
         """成品整理下拉：把原来三个工具栏按钮收进一处（行尾提示同旧版）"""
-        m = QMenu(self)
+        m = StyledMenu(self)
         a_bad = m.addAction("🧹 清理不可用", self._cleanup_bad)
         a_bad.setToolTip("把所有标了「👎 不可用」的成品一次移到回收站（能搜回来）；\n"
                          "只删视频与它们的标记，不删任务、也不删执行记录")
@@ -1031,35 +877,24 @@ class TasksPage(QWidget):
         if p is not None and self._panel_open and p.isVisible():
             p.reload()
 
-    def _toggle_field_panel(self, show=None):
-        """「⚟ 字段管理」：在快捷筛选条下方就地展开/收起（取代旧模态弹窗），
-        展开时把表格整体下推；面板内改动即时套用到表格。"""
-        p = self.field_panel
-        on = (not self._fpanel_open) if show is None else show
-        if on == self._fpanel_open:
-            return
-        self._fpanel_open = on
-        if on:
-            p.reload()               # 展开前按当前列布局回勾
-            p.setVisible(True)
-        self._fpanel_an.stop()
-        self._fpanel_an.setStartValue(p.height() if p.maximumHeight() == 16777215
-                                      else p.maximumHeight())
-        self._fpanel_an.setEndValue(max(p.sizeHint().height(), 260) if on else 0)
-        self._fpanel_an.start()
-        self._update_field_label()
-
-    def _fpanel_an_done(self):
-        """字段面板动画收尾：展开后放开高度上限跟随内容，收起则隐藏"""
-        if self._fpanel_open:
-            self.field_panel.setMaximumHeight(16777215)
-        else:
-            self.field_panel.setVisible(False)
-
-    def _update_field_label(self):
-        """刷新「⚟ 字段管理」按钮文字里的展开箭头"""
-        arrow = "▴" if self._fpanel_open else "▾"
-        self.b_fields.setText(f"⚟ 字段管理 {arrow}")
+    def _manage_fields(self):
+        """「⚟ 字段管理」弹窗（推广后台式）：左分类勾选、右拖动排序，确定后应用并持久化。"""
+        table = self.table
+        h = table.horizontalHeader()
+        n = table.columnCount()
+        vis = [c for c in (h.logicalIndex(v) for v in range(1, n))
+               if not table.isColumnHidden(c)]
+        hidden = {c for c in range(1, n) if table.isColumnHidden(c)}
+        cols = [(i + 1, DATA_HEADERS[i]) for i in range(len(DATA_HEADERS))]
+        dlg = FieldManagerDialog(
+            self, cols, vis, hidden, categories=_FIELD_CATEGORIES,
+            default_order=list(range(1, len(DATA_HEADERS) + 1)),
+            default_hidden=set(DEFAULT_HIDDEN), title="字段管理 · 任务中心")
+        if dlg.exec():
+            apply_field_layout(table, dlg.order, dlg.hidden, first_locked=1)
+            app_state.set_value("tasks_fields",
+                                {"order": list(dlg.order),
+                                 "hidden": sorted(dlg.hidden)})
 
     # 快捷标签：一键套用常用条件（与「⚟ 更多筛选」面板共用同一 _filters 状态）
     _QUICK_GROUPS = [("待执行", "pending"), ("进行中", "running"),
@@ -1725,7 +1560,7 @@ class TasksPage(QWidget):
         self._empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self._empty_icon)
         self._empty_title = QLabel("")
-        self._empty_title.setStyleSheet("font-size:16px;font-weight:bold;color:#1F2329;")
+        self._empty_title.setStyleSheet(tokenize("font-size:16px;font-weight:bold;color:#1F2329;"))
         self._empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self._empty_title)
         self._empty_sub = QLabel("")
@@ -2234,7 +2069,7 @@ class TasksPage(QWidget):
             return
         r = idx.row()
         path = self._cell_path(r)
-        menu = QMenu(self)
+        menu = StyledMenu(self)
         ats = REG.get_all_by_row(self._row_tid(r))
         if ats:
             if len(ats) == 1:

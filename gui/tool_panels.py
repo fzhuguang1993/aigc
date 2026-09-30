@@ -22,6 +22,7 @@ from core.config import DOWNLOAD_DIR, MATERIAL_DIR
 from gui.header import page_header
 from gui.maintainer import Gate, app_has_unlocked
 from utils.desktop_utils import open_path
+from gui.theme import tokenize
 
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv"}
 
@@ -188,6 +189,11 @@ class FileListWidget(QWidget):
     def paths(self):
         return [self.list.item(i).text() for i in range(self.list.count())]
 
+    def set_paths(self, paths):
+        """整批替换当前清单（编辑已有方案/回填用）。"""
+        self.list.clear()
+        self._add([p for p in paths if p])
+
     def _accept(self, p):
         return not self.video_only or Path(p).suffix.lower() in VIDEO_EXT
 
@@ -226,7 +232,7 @@ def _dep_missing_panel(hint: str) -> QWidget:
     lab = QLabel(hint)
     lab.setWordWrap(True)
     lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    lab.setStyleSheet("font-size:13px; color:#8F959E; padding:40px;")
+    lab.setStyleSheet(tokenize("font-size:13px; color:#8F959E; padding:40px;"))
     lay.addWidget(lab)
     return w
 
@@ -497,8 +503,8 @@ class CoverPanel(BasePanel):
         self.preview = QLabel()
         self.preview.setFixedSize(180, 320)
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setStyleSheet("background:#F2F3F5; border-radius:8px;"
-                                   "font-size:12px; color:#8F959E;")
+        self.preview.setStyleSheet(tokenize("background:#F2F3F5; border-radius:8px;"
+                                   "font-size:12px; color:#8F959E;"))
         self.preview.setText("封面预览")
         outer.addWidget(self.preview)
 
@@ -968,8 +974,8 @@ class MaterialPanel(BasePanel):
 
         # ---- 接口状态：常态只显示“配了没”（含快捷键提示），不暴露地址/凭证 ----
         self.lbl_api_host = QLabel()
-        self.lbl_api_host.setStyleSheet("font-size:12px; color:#646A73;"
-                                        " background:transparent;")
+        self.lbl_api_host.setStyleSheet(tokenize("font-size:12px; color:#646A73;"
+                                        " background:transparent;"))
         outer.addWidget(self.lbl_api_host)
 
         # ---- 接口配置：默认整组隐藏，需 Alt+W（Mac ⌘+W）口令解锁；同一功能当天
@@ -1237,6 +1243,12 @@ def _build_recording_panel(parent=None):
     return RecordingPanel(parent)
 
 
+def _build_rec_demo_panel(parent=None):
+    """录屏测试 Demo（极简）面板：同样延迟导入断循环（它要从本模块拿 BasePanel）"""
+    from gui.dialogs_rec_demo import RecDemoPanel
+    return RecDemoPanel(parent)
+
+
 def _build_breakdown_panel(parent=None):
     """爆款拆解面板在 dialogs_breakdown 里；同样延迟导入断循环
     （dialogs_breakdown 要从本模块拿 BasePanel/ToolWorker）"""
@@ -1267,6 +1279,7 @@ PANEL_FACTORIES = {
     "视频溯源": _safe_factory(TracePanel),
     "素材提取": _safe_factory(MaterialPanel),
     "屏幕录制": _safe_factory(_build_recording_panel),
+    "录屏测试Demo": _safe_factory(_build_rec_demo_panel),
     "语音识别": _safe_factory(_build_asr_panel),
     "爆款拆解": _safe_factory(_build_breakdown_panel),
     "一键发布": _safe_factory(_build_publish_panel),

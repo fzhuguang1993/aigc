@@ -92,6 +92,23 @@ class TestRoundtrip:
         assert a.read_bytes() != b.read_bytes()      # 随机 salt
         assert json.loads(decrypt_manifest(a)["exported_at"][:4]) or True
 
+    def test_selective_export_only_chosen_items(self, cfg_dir, tmp_path):
+        """导出前勾选：only_ids 只打指定条目，manifest 与落盘都只剩这几条"""
+        pkg = tmp_path / "part.aigccfg"
+        info = cp.export_package(str(pkg), only_ids=["text_config", "db_products"])
+        assert set(info["items"]) == {
+            cp.ITEMS_BY_ID["text_config"].title,
+            cp.ITEMS_BY_ID["db_products"].title}
+        assert {m["id"] for m in decrypt_manifest(pkg)["items"]} == {
+            "text_config", "db_products"}
+
+    def test_selective_export_skips_missing_config(self, cfg_dir, tmp_path):
+        """只勾产品、本机没 config.json：不被「缺 config」报错拦住（未勾中的不 collect）"""
+        (cfg_dir / "config.json").unlink()
+        pkg = tmp_path / "prod_only.aigccfg"
+        info = cp.export_package(str(pkg), only_ids=["db_products"])
+        assert info["items"] == [cp.ITEMS_BY_ID["db_products"].title]
+
 
 def decrypt_manifest(path):
     import zipfile, io

@@ -27,6 +27,7 @@ from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header, Card
 from utils.desktop_utils import open_path
+from gui.theme import tokenize
 
 # 线路表列号：末列是行内「打开接口」按钮（setCellWidget，不进 _rows/不写配置）
 COL_NAME, COL_BASE, COL_CONC, COL_OPEN = range(4)
@@ -186,8 +187,8 @@ class ApiManagerPage(QWidget):
         # 套了滚动区后表格不再有“ extra 空间”自动撑高，给个下限免得塌成一行
         self.acc_table.setMinimumHeight(180)
         self.acc_table.setStyleSheet(
-            "QTableWidget::item { padding: 3px 8px; border-bottom: 1px solid #EFF0F1; }"
-            "QTableWidget::item:selected { background: #EAF1FF; color: #1F2329; }")
+            tokenize("QTableWidget::item { padding: 3px 8px; border-bottom: 1px solid #EFF0F1; }"
+            "QTableWidget::item:selected { background: #EAF1FF; color: #1F2329; }"))
         # 整行选中 + 连续多选：鼠标按住拖就能圈好几行，配合批量删除
         self.acc_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.acc_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)

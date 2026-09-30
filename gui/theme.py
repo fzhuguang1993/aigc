@@ -16,11 +16,53 @@ QSS 里的 @CHK@/@DOT@/@UP@/@DOWN@ 占位符在 apply_theme 时替换成真实�
 生成失败只是装饰图消失，其余样式不受影响。
 """
 import os
+import re
 import tempfile
 
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QStyledItemDelegate,
                                QStyleOptionViewItem, QWidget)
+
+from gui.ui_kit import COLORS
+
+
+# --------------------------------------------------------------------
+# QSS 接「设计令牌」：下方大段 QSS 与各兜底样式里，历史上直接写死的十六进制，
+# 统一以 tokenize() 在运行时映射回 gui.ui_kit.COLORS——QSS 原文不动（零转录风险），
+# 但以后想整体换色只改 ui_kit.COLORS 一处即可全站生效（种子值→现值的单遍正则，
+# 不会二次替换，也不必担心一个令牌的新值恰好等于另一个种子）。
+#   种子 = 这段 QSS 当初采用那个 hex；它同时是 COLORS 里对应项的当前值。
+# --------------------------------------------------------------------
+_SEED_TO_TOKEN = {
+    # 品牌主色三态 + 软底
+    "#3370FF": "primary", "#5A8BFF": "primary_hover", "#2457D9": "primary_press",
+    "#EAF1FF": "primary_soft", "#F2F6FF": "primary_bg",
+    # 状态语义
+    "#F54A45": "danger", "#D83931": "danger_text", "#FFF1F0": "danger_bg",
+    "#FFCCC7": "danger_border",
+    # 文字层级
+    "#1F2329": "text", "#646A73": "sub", "#8F959E": "weak",
+    "#475569": "table_head", "#37445A": "ghost_text",
+    # 边框 / 分隔
+    "#DEE0E3": "border", "#C9CDD4": "border_strong", "#A9AFB8": "border_hover",
+    "#EFF0F1": "divider", "#E5E7EB": "border_popup", "#ECEEF1": "card_border",
+    "#D6E4FF": "chip_border", "#E1ECFF": "chip_hover",
+    # 背景层级
+    "#F2F3F5": "bg", "#FAFBFC": "bg_soft", "#F7F8FA": "bg_field",
+    "#F5F6F7": "disabled_bg", "#E9EBEF": "disabled_border",
+    "#FFFFFF": "card", "#EFF1F5": "track",
+    # 侧栏（深色）
+    "#17212F": "sidebar", "#243144": "sidebar_item", "#33455E": "sidebar_border",
+    "#D5E0F0": "sidebar_text", "#8FA3BF": "sidebar_status",
+    # 日志控制台
+    "#10151C": "log_bg", "#B7C4D6": "log_text",
+}
+_SEED_RE = re.compile("|".join(re.escape(s) for s in _SEED_TO_TOKEN), re.IGNORECASE)
+
+
+def tokenize(qss):
+    """把样式串里写死的种子 hex 换成 COLORS 当前值（单遍替换，无二次污染）。"""
+    return _SEED_RE.sub(lambda m: COLORS[_SEED_TO_TOKEN[m.group(0).upper()]], qss)
 
 
 class _ArrowOverlay(QWidget):
@@ -49,7 +91,7 @@ class _ArrowOverlay(QWidget):
         combo = self._combo
         view = combo.view()
         opened = view is not None and view.isVisible()
-        arrow = _arrow_pixmap("#3370FF" if opened else "#646A73")
+        arrow = _arrow_pixmap(COLORS["primary"] if opened else COLORS["sub"])
         p = QPainter(self)
         p.drawPixmap((self.width() - arrow.width()) // 2,
                      (self.height() - arrow.height()) // 2, arrow)
@@ -130,15 +172,15 @@ class _ComboTweak(QObject):
         if getattr(view, "_aigc_polished", False):
             return
         view._aigc_polished = True
-        view.setStyleSheet(self._VIEW_QSS)
+        view.setStyleSheet(tokenize(self._VIEW_QSS))
         from PySide6.QtGui import QPalette, QColor
         pal = view.palette()
-        for role, col in ((QPalette.ColorRole.Base, "#FFFFFF"),
-                          (QPalette.ColorRole.Text, "#1F2329"),
-                          (QPalette.ColorRole.Window, "#FFFFFF"),
-                          (QPalette.ColorRole.WindowText, "#1F2329"),
-                          (QPalette.ColorRole.Highlight, "#3370FF"),
-                          (QPalette.ColorRole.HighlightedText, "#FFFFFF")):
+        for role, col in ((QPalette.ColorRole.Base, COLORS["card"]),
+                          (QPalette.ColorRole.Text, COLORS["text"]),
+                          (QPalette.ColorRole.Window, COLORS["card"]),
+                          (QPalette.ColorRole.WindowText, COLORS["text"]),
+                          (QPalette.ColorRole.Highlight, COLORS["primary"]),
+                          (QPalette.ColorRole.HighlightedText, COLORS["card"])):
             pal.setColor(role, QColor(col))
         view.setPalette(pal)
         vp = view.viewport()
@@ -149,9 +191,9 @@ class _ComboTweak(QObject):
         container = view.window()
         if container is not None and container is not view:
             cpal = container.palette()
-            for role, col in ((QPalette.ColorRole.Window, "#FFFFFF"),
-                              (QPalette.ColorRole.Base, "#FFFFFF"),
-                              (QPalette.ColorRole.WindowText, "#1F2329")):
+            for role, col in ((QPalette.ColorRole.Window, COLORS["card"]),
+                              (QPalette.ColorRole.Base, COLORS["card"]),
+                              (QPalette.ColorRole.WindowText, COLORS["text"])):
                 cpal.setColor(role, QColor(col))
             container.setPalette(cpal)
 
@@ -166,18 +208,50 @@ class _TipPolish(QObject):
     残留的原生 tooltip（按钮/表格单元格/标题栏…）一并被拉回浅色。"""
 
     TIP_QSS = ("background-color:#FFFFFF; color:#1F2329;"
-               " border:1px solid #DEE0E3; padding:6px 9px; font-size:12px;")
+               " border:1px solid #DEE0E3; border-radius:8px;"
+               " padding:6px 9px; font-size:12px;")
 
     def eventFilter(self, obj, ev):
-        if (ev.type() == QEvent.Show and isinstance(obj, QWidget)
-                and obj.metaObject().className() == "QTipLabel"):
-            obj.setStyleSheet(self.TIP_QSS)
-            from PySide6.QtGui import QPalette, QColor
-            pal = obj.palette()
-            pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#FFFFFF"))
-            pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#1F2329"))
-            obj.setPalette(pal)
+        # 只认原生 tooltip 标签本体（QTipLabel）本身。刻意不去碰它的祖先窗口：
+        # 之前给 window() 也钉样式 + setAutoFillBackground(True)，一旦某个带
+        # ToolTip 标志的窗口解析到主窗体，就会把主窗刷成不透明白底——透明圆角
+        # 窗被盖成一个实心矩形，看着就是「软件外层套了个框」。改回只治 QTipLabel。
+        # Show：给即将弹出的本体钉上白底圆角样式 + 浅色 palette（即时、不重建窗口）。
+        # Hide：趁窗口已收起，一次性补上“逐像素透明 + 关系统投影”——这两个属性要在
+        # 窗口隐藏时设才能在下次创建时真正生效（Show 时改 flags 会把当前 tooltip 打断）。
+        if isinstance(obj, QWidget) and obj.metaObject().className() == "QTipLabel":
+            t = ev.type()
+            if t == QEvent.Show:
+                self._polish(obj)
+            elif t == QEvent.Hide:
+                self._prep_rounded(obj)
         return False
+
+    def _polish(self, w):
+        # 控件级样式表（优先级最高）+ palette 多角色钉浅色：白底圆角卡由 QSS 画。
+        w.setStyleSheet(tokenize(self.TIP_QSS))
+        from PySide6.QtGui import QPalette, QColor
+        base, ink = QColor(COLORS["card"]), QColor(COLORS["text"])
+        pal = w.palette()
+        for role in (QPalette.ColorRole.ToolTipBase, QPalette.ColorRole.Base,
+                    QPalette.ColorRole.Window):
+            pal.setColor(role, base)
+        for role in (QPalette.ColorRole.ToolTipText, QPalette.ColorRole.Text,
+                    QPalette.ColorRole.WindowText):
+            pal.setColor(role, ink)
+        w.setPalette(pal)
+
+    def _prep_rounded(self, w):
+        """tooltip 收起时对复用单例做一次窗口级设置，让下一次弹出就是干净的圆角：
+        ① WA_TranslucentBackground——圆角外四角透出背景而不是被填成黑角；
+        ② NoDropShadowWindowHint——Windows 会给 ToolTip 顶层窗加一层 DWM 方形投影，
+           叠在圆角透明上就表现为“圆角外面套一圈直角黑边”，关掉它。"""
+        if getattr(w, "_aigc_tip_rounded", False):
+            return
+        w._aigc_tip_rounded = True
+        w.setAutoFillBackground(False)
+        w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        w.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
 
 
 QSS = """
@@ -190,7 +264,7 @@ QMainWindow, QDialog { background: #F2F3F5; }
 QListWidget#NavList { background: transparent; border: none; color: #D5E0F0; outline: none; }
 QListWidget#NavList::item { height: 42px; border-radius: 10px; margin: 2px 8px; padding-left: 12px; font-size: 14px; }
 QListWidget#NavList::item:selected { background: #3370FF; color: #FFFFFF; }
-QListWidget#NavList::item:hover:!selected { background: #243144; }
+QListWidget#NavList::item:hover:!selected { background: rgba(51, 112, 255, 0.30); }
 
 QPushButton { background: #3370FF; color: white; border: none; border-radius: 8px;
     padding: 7px 14px; font-weight: 500; }
@@ -280,9 +354,10 @@ QTabBar::tab { background: transparent; color: #646A73; border: none;
 QTabBar::tab:hover { color: #1F2329; }
 QTabBar::tab:selected { color: #3370FF; font-weight: 600; border-bottom: 2px solid #3370FF; }
 
-/* 进度条：14px 胶囊，淡灰轨道 + 主蓝填充 */
+/* 进度条：14px 胶囊，淡灰轨道 + 主蓝填充；百分比文字用正文墨色（不再浅灰），
+   Qt 会先把 chunk 画在底、再把文字画在上层，走到中段也压得住、看得清 */
 QProgressBar { background: #EFF1F5; border: none; border-radius: 7px;
-    height: 14px; text-align: center; color: #646A73; font-size: 11px; }
+    height: 14px; text-align: center; color: #1F2329; font-size: 11px; font-weight: 600; }
 QProgressBar::chunk { background: #3370FF; border-radius: 7px; }
 
 /* 滑块：细轨道 + 白圆钮（播放器壳内的 #PlayerShell 局部样式优先级更高，不互扰） */
@@ -310,9 +385,16 @@ QTableCornerButton::section { background: #F5F6F7; border: none; }
 QPlainTextEdit#LogBox { background: #10151C; color: #B7C4D6; border: none; border-radius: 10px;
     font-family: Consolas, monospace; font-size: 12px; }
 QStatusBar { background: #FFFFFF; color: #8F959E; border-top: 1px solid #E5E7EB; }
-QMenu { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px; padding: 6px; }
-QMenu::item { padding: 6px 22px; border-radius: 6px; }
+QMenu { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 10px; padding: 6px; }
+/* 菜单项：行高拉高到接近飞书（30px+）、文字左对齐给图标留列、右侧给子菜单箭头留白；
+   悬停用整行淡蓝圆角块（radius 6），像现代弹层而不是 XP 那种挤成一坨 */
+QMenu::item { padding: 8px 34px 8px 16px; border-radius: 6px; min-height: 22px; color: #1F2329; }
 QMenu::item:selected { background: #EAF1FF; color: #3370FF; }
+QMenu::item:disabled { color: #C9CDD4; }
+QMenu::icon { left: 2px; }
+QMenu::right-arrow { width: 8px; height: 8px; margin-right: 8px; }
+/* 分隔线：原生默认是 Vista 凹刻线（XP 味），换成淡灰细线+留白 */
+QMenu::separator { height: 1px; background: #EFF0F1; margin: 5px 10px; }
 
 QScrollBar:vertical { background: transparent; width: 10px; }
 QScrollBar::handle:vertical { background: #C9CDD4; border-radius: 5px; min-height: 30px; }
@@ -409,7 +491,7 @@ def _icon_assets():
                 assets[name] = path.replace("\\", "/")
 
         def _chk(p, w, h):                 # 12px 白对钩（垫在蓝底上）
-            pen = QPen(QColor("#FFFFFF"))
+            pen = QPen(QColor(COLORS["on_primary"]))
             pen.setWidthF(2.2)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -419,18 +501,18 @@ def _icon_assets():
 
         def _dot(p, w, h):                 # 16px 单选蓝心
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#3370FF"))
+            p.setBrush(QColor(COLORS["primary"]))
             p.drawEllipse(QPointF(w / 2.0, h / 2.0), 4.0, 4.0)
 
         def _up(p, w, h):                  # 10x6 实心三角（上下各一张）
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#646A73"))
+            p.setBrush(QColor(COLORS["sub"]))
             p.drawPolygon(QPolygonF([QPointF(1, h - 1), QPointF(w - 1, h - 1),
                                      QPointF(w / 2.0, 1)]))
 
         def _down(p, w, h):
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#646A73"))
+            p.setBrush(QColor(COLORS["sub"]))
             p.drawPolygon(QPolygonF([QPointF(1, 1), QPointF(w - 1, 1),
                                      QPointF(w / 2.0, h - 1)]))
 
@@ -445,9 +527,9 @@ def _icon_assets():
 
 
 def build_qss():
-    """把 QSS 模板里的 @xxx@ 占位符换成小图真实路径（无图时为空串）"""
+    """先按令牌把 QSS 主题色拉齐，再把 @xxx@ 占位符换成小图真实路径（无图时空串）"""
     a = _icon_assets()
-    return (QSS.replace("@CHK@", a.get("check.png", ""))
+    return (tokenize(QSS).replace("@CHK@", a.get("check.png", ""))
               .replace("@DOT@", a.get("radio_dot.png", ""))
               .replace("@UP@", a.get("spin_up.png", ""))
               .replace("@DOWN@", a.get("spin_down.png", "")))
@@ -481,10 +563,18 @@ def apply_theme(app):
     # 在 tooltip 窗口弹出的瞬间直接给它本体钉上浅色样式（最终兜底）
     from PySide6.QtGui import QPalette, QColor
     pal = app.palette()
-    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#FFFFFF"))
-    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#1F2329"))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(COLORS["card"]))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(COLORS["text"]))
     # 输入框占位文字统一弱文灰（QSS 无 placeholder 伪元素，只能走 palette）
-    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#8F959E"))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(COLORS["weak"]))
     app.setPalette(pal)
     app.installEventFilter(_TipPolish(app))
     app.installEventFilter(_ComboTweak(app))   # 全局修下拉：单箭头覆盖层、无对钩、宽度自适应
+    # 统一消息弹窗：把 QMessageBox 四个静态便捷方法接管成 _round_dialog 圆角浮层
+    # （延迟导入避开 theme↔kit 模块级循环；kit 已是运行期依赖，不增加启动开销）。
+    # 任何异常都吞掉：最坏只是弹窗回到原生方角，不拖垮整体主题装配。
+    try:
+        from gui.kit import install_rounded_messagebox
+        install_rounded_messagebox()
+    except Exception:
+        pass

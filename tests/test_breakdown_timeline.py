@@ -38,7 +38,8 @@ def test_build_timeline_shots_align_segments():
 
 def test_build_timeline_empty_safe():
     tl = timeline.build_timeline(BreakdownResult())
-    assert tl == {"shots": [], "lines": []}
+    # 板块拆分接入后 build_timeline 恒返回三序列（空结果各为空列表）
+    assert tl == {"shots": [], "lines": [], "blocks": []}
 
 
 def test_build_timeline_shots_without_segments():

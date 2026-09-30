@@ -14,6 +14,7 @@ gui/dialogs_recorder.py —— 屏幕录制工具（工具中心面板）
 功能逻辑全在 video_text_tools.screen_recorder（纯逻辑层），本文件只做界面。
 """
 import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
@@ -31,12 +32,13 @@ from PySide6.QtWidgets import (QApplication, QDialog, QWidget, QComboBox,
                                QButtonGroup, QHBoxLayout, QVBoxLayout, QLabel,
                                QLineEdit, QPushButton, QMessageBox, QFileDialog,
                                QSizePolicy, QFileIconProvider, QScrollArea,
-                               QListWidget, QListWidgetItem, QInputDialog, QMenu,
+                               QListWidget, QListWidgetItem, QInputDialog,
                                QFrame, QCheckBox)
 
 from core.config import DOWNLOAD_DIR
 from core.logger import log
 from gui.header import page_header
+from gui.menus import StyledMenu
 from gui.tool_panels import BasePanel, _dep_missing_panel
 from utils.desktop_utils import reveal_in_folder, move_to_trash, open_path
 from video_text_tools.ffmpeg_utils import (get_ffmpeg_path, get_video_info,
@@ -45,7 +47,9 @@ from video_text_tools.screen_recorder import (
     IS_WINDOWS, ERR_NOT_WINDOWS, Recorder, build_record_command,
     list_windows, list_audio_devices, is_mix_device, has_wasapi_loopback,
     rect_to_physical, screen_physical, virtual_desktop, get_window_rect,
-    restore_window)
+    restore_window, probe_audio_level)
+from gui.theme import tokenize
+from gui.kit import KitButton
 
 # 主题色（与 gui/theme.py 同一套：主蓝 #3370FF，警示红 #D83931 一族）
 PRIMARY = "#3370FF"
@@ -55,6 +59,23 @@ MIN_DRAG = 8                # 框选小于这个尺寸视为误点
 
 # 呼吸框外扩的光晕范围（逻辑像素）；窗口要按它留边，不然光晕被屏幕边裁掉
 GLOW_PAD = 26
+
+# 设备检测结果的反馈色（与主题同一族）
+TXT_OK = "#12A150"          # 收到声音·绿
+TXT_BAD = "#D83931"         # 静音/失败·红
+TXT_MUTED = "#8F959E"       # 检测中·灰
+
+# 幽灵模式：Windows 10 2004+ 的 SetWindowDisplayAffinity——
+# 把窗口设成「屏幕上看得到，但不进任何采集（录屏/截屏/投屏）」。
+# gdigrab 整屏抓取拿不到它，用户却仍看得见、点得动停止按钮。
+WDA_NONE = 0x0
+WDA_EXCLUDEFROMCAPTURE = 0x11
+
+# 全局录制热键（RegisterHotKey）：Ctrl+Alt+R 开始/停止切换
+WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
+MOD_CONTROL, MOD_ALT = 0x0002, 0x0001
+HOTKEY_MODS = MOD_CONTROL | MOD_ALT
+VK_TOGGLE = 0x52            # 'R'
 
 
 # ====================================================================
@@ -160,6 +181,25 @@ def _ffmpeg_usable():
     if p and os.path.isfile(p):
         return p
     return shutil.which(p) if p else None
+
+
+def _set_ghost_mode(widget, on=True):
+    """把窗口设成“幽灵”：屏幕上看得到但不进录屏/截屏等任何采集。
+
+    走 Windows 10 2004+ 的 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)。
+    成功 True；老系统/不支持/拿不到句柄给 False（窗口照常显示，只是仍会被录）。
+    必须在窗口已创建原生句柄（winId）后调用，返回是否真正生效。"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        hwnd = int(widget.winId())
+        affinity = WDA_EXCLUDEFROMCAPTURE if on else WDA_NONE
+        u32 = ctypes.windll.user32
+        u32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+        u32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+        return bool(u32.SetWindowDisplayAffinity(hwnd, affinity))
+    except Exception:
+        return False
 
 
 def _fmt_secs(sec):
@@ -577,7 +617,7 @@ class RecBar(QDialog):
         card = QWidget(self)
         card.setObjectName("RecBarCard")
         card.setStyleSheet(
-            "#RecBarCard { background:#1F2329; border-radius:14px; border:1px solid #3A404B; }"
+            tokenize("#RecBarCard { background:#1F2329; border-radius:14px; border:1px solid #3A404B; }"
             "#RecBarCard QLabel { color:#E6E8EB; font-size:13px; background:transparent; }"
             "#RecBarCard QLabel#Dot { color:#E74C3C; font-size:11px; }"
             "#RecBarCard QLabel#Time { color:#FFFFFF; font-size:15px; font-weight:700;"
@@ -585,7 +625,7 @@ class RecBar(QDialog):
             "#RecBarCard QPushButton { background:#D83931; color:white;"
             " border:none; border-radius:8px; padding:6px 16px; font-size:13px; font-weight:600; }"
             "#RecBarCard QPushButton:hover { background:#F04438; }"
-            "#RecBarCard QPushButton:disabled { background:#4A5160; color:#8F959E; }")
+            "#RecBarCard QPushButton:disabled { background:#4A5160; color:#8F959E; }"))
         lay = QHBoxLayout(card)
         lay.setContentsMargins(16, 8, 16, 8)
         lay.setSpacing(10)
@@ -609,6 +649,15 @@ class RecBar(QDialog):
         self.adjustSize()
         geo = QApplication.primaryScreen().availableGeometry()
         self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 28)
+        self._ghost_done = False     # 首次 show 拿到句柄后再上幽灵模式，只设一次
+
+    def showEvent(self, e):
+        """浮条一显示就变“幽灵”：用户看得到、能点停止，但不会被录进画面。
+        需在窗口已上屏（winId 有效）后才能设，故放 showEvent。"""
+        super().showEvent(e)
+        if not self._ghost_done:
+            self._ghost_done = True
+            self._ghost_on = _set_ghost_mode(self, True)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self.windowHandle():
@@ -632,7 +681,7 @@ class RecBar(QDialog):
 
     def closing(self):
         self.lbl_state.setText("收尾中…")
-        self.lbl_dot.setStyleSheet("color:#8F959E;")
+        self.lbl_dot.setStyleSheet(tokenize("color:#8F959E;"))
         self.b_stop.setEnabled(False)
 
 
@@ -689,7 +738,7 @@ def _card(title, icon="", tint=PRIMARY, tint_bg="#EAF1FF", tip=""):
     badge.setStyleSheet(
         f"background:{tint_bg}; color:{tint}; border-radius:9px; font-size:15px;")
     ttl = QLabel(title)
-    ttl.setStyleSheet("background:transparent; color:#1F2329; font-size:14px; font-weight:700;")
+    ttl.setStyleSheet(tokenize("background:transparent; color:#1F2329; font-size:14px; font-weight:700;"))
     head.addWidget(badge)
     head.addWidget(ttl)
     head.addStretch(1)
@@ -794,10 +843,10 @@ class RecordItemWidget(QWidget):
         self.setFixedHeight(84)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(
-            '#RecordItem{background:#FFFFFF; border:1px solid #E9EBEF;'
+            tokenize('#RecordItem{background:#FFFFFF; border:1px solid #E9EBEF;'
             ' border-radius:8px;}'
             '#RecordItem[sel="1"]{background:#F0F6FF; border:2px solid'
-            ' #3370FF;}')
+            ' #3370FF;}'))
         h = QHBoxLayout(self)
         h.setContentsMargins(8, 6, 8, 6)
         h.setSpacing(10)
@@ -805,12 +854,12 @@ class RecordItemWidget(QWidget):
         self.thumb.setFixedSize(self.THUMB_W, self.THUMB_H)
         self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb.setStyleSheet(
-            "background:#1F2329; color:#8F959E; border-radius:4px; font-size:20px;")
+            tokenize("background:#1F2329; color:#8F959E; border-radius:4px; font-size:20px;"))
         h.addWidget(self.thumb)
         right = QVBoxLayout()
         right.setSpacing(2)
         self.name = QLabel(name)
-        self.name.setStyleSheet("background:transparent; color:#1F2329; font-size:13px;")
+        self.name.setStyleSheet(tokenize("background:transparent; color:#1F2329; font-size:13px;"))
         right.addWidget(self.name)
         self.meta = _tip(date_text)
         right.addWidget(self.meta)
@@ -828,9 +877,9 @@ class RecordItemWidget(QWidget):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setStyleSheet(
-                "QPushButton{background:transparent;color:#FFFFFF;border:none;"
+                tokenize("QPushButton{background:transparent;color:#FFFFFF;border:none;"
                 "padding:2px 6px;font-size:13px;}"
-                "QPushButton:hover{color:#3370FF;}")
+                "QPushButton:hover{color:#3370FF;}"))
             b.clicked.connect(lambda _c=False, s=sig: s.emit(self._path))
             ab.addWidget(b)
         self.actions.setVisible(False)
@@ -909,7 +958,7 @@ class RecordingsLibrary(QWidget):
         v.setSpacing(8)
         head = QHBoxLayout()
         title = QLabel("📀  <b>录制记录</b>")
-        title.setStyleSheet("background:transparent; font-size:13px; color:#1F2329;")
+        title.setStyleSheet(tokenize("background:transparent; font-size:13px; color:#1F2329;"))
         head.addWidget(title)
         head.addStretch(1)
         self.lbl_count = _tip("0")
@@ -957,9 +1006,8 @@ class RecordingsLibrary(QWidget):
             app.aboutToQuit.connect(self.shutdown)
 
     def _ghost(self, text):
-        b = QPushButton(text)
-        b.setObjectName("GhostBtn")
-        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 组件库幽灵钮：自绘带悬停/回弹动效；KitButton 已给手型光标，这里只防抢焦点
+        b = KitButton(text, kind="ghost", obj_name="GhostBtn", explain=False)
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         return b
 
@@ -1112,7 +1160,7 @@ class RecordingsLibrary(QWidget):
         if not path:
             return
         self.lst.setCurrentItem(it)
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("▶ 播放", lambda: self._play(path))
         m.addAction("📂 定位", lambda: self._locate(path))
         m.addAction("✎ 重命名", self._rename_current)
@@ -1123,6 +1171,81 @@ class RecordingsLibrary(QWidget):
     def shutdown(self):
         self._worker.request_stop()
         self._worker.wait(1000)
+
+
+# ====================================================================
+# 全局热键：RegisterHotKey + 独立线程消息循环，Ctrl+Alt+R 开/停录制
+# ====================================================================
+class HotkeyGrabber(QThread):
+    """系统级热键监听（切到其它应用/全屏也生效）。
+
+    RegisterHotKey 用 NULL 句柄 → WM_HOTKEY 进本线程消息队列，故在本线程里
+    GetMessage 阻塞收取，命中就发 pressed(id) 回主线程。注册不上（被别的
+    程序占用）就静默跳过，不影响界面；退出时投递 WM_QUIT 让阻塞返回并注销。"""
+    pressed = Signal(int)
+
+    def __init__(self, hotkeys, parent=None):
+        super().__init__(parent)
+        self._hotkeys = dict(hotkeys)          # id -> (mods, vk)
+        self._tid = None
+        self._ready = threading.Event()
+
+    def run(self):
+        u32 = ctypes.windll.user32
+        u32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int,
+                                       ctypes.c_uint, ctypes.c_uint]
+        u32.RegisterHotKey.restype = wintypes.BOOL
+        u32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        u32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                    wintypes.UINT, wintypes.UINT]
+        u32.GetMessageW.restype = ctypes.c_int
+        self._tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        self._ready.set()
+        live = {}
+        for hid, (mods, vk) in self._hotkeys.items():
+            if u32.RegisterHotKey(None, hid, mods, vk):
+                live[hid] = True
+        if not live:                            # 一个都没注册上：静默收工
+            return
+        msg = wintypes.MSG()
+        while True:
+            r = u32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if r == 0 or r == -1:               # WM_QUIT / 出错 → 退出循环
+                break
+            if msg.message == WM_HOTKEY and int(msg.wParam) in live:
+                self.pressed.emit(int(msg.wParam))
+        for hid in live:
+            u32.UnregisterHotKey(None, hid)
+
+    def stop(self):
+        """投递 WM_QUIT 让阻塞中的 GetMessage 立即返回，线程收尾注销热键。"""
+        self._ready.wait(1.0)
+        if not self._tid:
+            return
+        try:
+            u32 = ctypes.windll.user32
+            u32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
+                                               wintypes.WPARAM, wintypes.LPARAM]
+            u32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+        except Exception:
+            pass
+
+
+# ====================================================================
+# 设备检测：后台跑 ffmpeg 试录测电平，主线程只收结果（不卡 UI）
+# ====================================================================
+class LevelProbe(QThread):
+    """采一段选中设备测峰值电平。2 秒左右，放后台线程避免界面冻结；
+    结果通过 done 信号回主线程（(峰值dB|None, 是否收到, 一句话)）。"""
+    done = Signal(object)
+
+    def __init__(self, ffmpeg_path, spec, parent=None):
+        super().__init__(parent)
+        self._ffmpeg = ffmpeg_path
+        self._spec = spec
+
+    def run(self):
+        self.done.emit(probe_audio_level(self._ffmpeg, self._spec))
 
 
 # ====================================================================
@@ -1155,8 +1278,9 @@ class RecordingPanel(BasePanel):
         self._out_path = ""
         self._audio_paths = []      # 本次录制的旁路 WAV（完成提示用）
         self._filter_on = False
-        self._sys_spec = None       # 内部声音的实现方式 ("system", None|名字)
-        self._sys_desc = ""
+        self._sys_spec = None       # 内部声音当前选型 ("system", None|名字)
+        self._probes = {}           # kind(mic/sys) -> LevelProbe（同一时刻各一个）
+        self._hotkey = None         # HotkeyGrabber（全局 Ctrl+Alt+R 开/停，仅 Windows）
 
         # ---- 双栏骨架：左＝(滚动的配置卡 + 固定底部的日志/录制按钮) / 右＝记录库 ----
         # 日志与录制主按钮挂在左列底部不参与滚动：否则内容比窗口高时，
@@ -1211,8 +1335,7 @@ class RecordingPanel(BasePanel):
         self.row_screen.setLayout(self._lb_row(_tip("全屏范围"), self.cb_screen))
         v1.addWidget(self.row_screen)
 
-        self.b_pick = QPushButton("⬚  开始框选")
-        self.b_pick.setObjectName("GhostBtn")
+        self.b_pick = KitButton("⬚  开始框选", kind="ghost", obj_name="GhostBtn", explain=False)
         self.lbl_region = _tip("")
         self.row_region = QWidget()
         rr = QHBoxLayout(self.row_region)
@@ -1221,13 +1344,11 @@ class RecordingPanel(BasePanel):
         rr.addWidget(self.lbl_region, 1)
         v1.addWidget(self.row_region)
 
-        self.b_pickwin = QPushButton("🎯  在屏幕上点选")
-        self.b_pickwin.setObjectName("GhostBtn")
+        self.b_pickwin = KitButton("🎯  在屏幕上点选", kind="ghost", obj_name="GhostBtn", explain=False)
         self.cb_window = _WindowCombo()
         self.cb_window.setSizePolicy(QSizePolicy.Policy.Expanding,
                                      QSizePolicy.Policy.Fixed)
-        self.b_wrefresh = QPushButton("⟳")
-        self.b_wrefresh.setObjectName("GhostBtn")
+        self.b_wrefresh = KitButton("⟳", kind="ghost", obj_name="GhostBtn", explain=False)
         self.b_wrefresh.setFixedWidth(36)
         self.lbl_win = _tip("")
         wr = QHBoxLayout()
@@ -1272,19 +1393,38 @@ class RecordingPanel(BasePanel):
         self.chip_a_none.setChecked(True)
         v2.addLayout(_row(self.chip_a_none, self.chip_a_sys, self.chip_a_mic))
 
+        # 内部声音：设备下拉（WASAPI 环回 / 各声卡立体声混音可切换）+ 检测
+        self.cb_sys = QComboBox()
+        self.cb_sys.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                  QSizePolicy.Policy.Fixed)
+        self.b_test_sys = KitButton("🔍 检测", kind="ghost", obj_name="GhostBtn", explain=False)
+        self.row_sys = QWidget()
+        srw = QHBoxLayout(self.row_sys)
+        srw.setContentsMargins(0, 0, 0, 0)
+        srw.addWidget(_tip("内部声音设备"))
+        srw.addWidget(self.cb_sys, 1)
+        srw.addWidget(self.b_test_sys)
+        v2.addWidget(self.row_sys)
+        self.lbl_test_sys = _tip("")
+        v2.addWidget(self.lbl_test_sys)
+
+        # 麦克风：设备下拉（多声卡/多通道可切换）+ 检测 + ⟳ 刷新
         self.cb_mic = QComboBox()
         self.cb_mic.setSizePolicy(QSizePolicy.Policy.Expanding,
                                   QSizePolicy.Policy.Fixed)
-        self.b_arefresh = QPushButton("⟳")
-        self.b_arefresh.setObjectName("GhostBtn")
+        self.b_arefresh = KitButton("⟳", kind="ghost", obj_name="GhostBtn", explain=False)
         self.b_arefresh.setFixedWidth(36)
+        self.b_test_mic = KitButton("🔍 检测", kind="ghost", obj_name="GhostBtn", explain=False)
         self.row_mic = QWidget()
         mr = QHBoxLayout(self.row_mic)
         mr.setContentsMargins(0, 0, 0, 0)
         mr.addWidget(_tip("麦克风设备"))
         mr.addWidget(self.cb_mic, 1)
+        mr.addWidget(self.b_test_mic)
         mr.addWidget(self.b_arefresh)
         v2.addWidget(self.row_mic)
+        self.lbl_test_mic = _tip("")
+        v2.addWidget(self.lbl_test_mic)
 
         self.lbl_audio = _tip("")
         v2.addWidget(self.lbl_audio)
@@ -1296,13 +1436,11 @@ class RecordingPanel(BasePanel):
             "· 录制文件保存到该目录，文件名自动生成：录屏_年月日_时分秒.mp4。<br>"
             "· 勾选的音轨同目录存放，命名如 录屏_…_内部声音.wav、录屏_…_麦克风.wav。"))
         self.ed_out = QLineEdit(str(Path(DOWNLOAD_DIR) / "录屏"))
-        self.b_dir = QPushButton("浏览…")
-        self.b_dir.setObjectName("GhostBtn")
+        self.b_dir = KitButton("浏览…", kind="ghost", obj_name="GhostBtn", explain=False)
         v3.addLayout(_row(self.ed_out, self.b_dir))
         # 录完顺带生成字幕（逻辑走独立字幕模块，不干扰录制状态机）：勾选 + ⚙ 预配选项
         self.ck_subtitle = QCheckBox("录完顺带生成字幕")
-        self.b_subopt = QPushButton("⚙ 字幕选项")
-        self.b_subopt.setObjectName("GhostBtn")
+        self.b_subopt = KitButton("⚙ 字幕选项", kind="ghost", obj_name="GhostBtn", explain=False)
         self.b_subopt.clicked.connect(self._edit_subtitle_opts)
         v3.addLayout(_row(self.ck_subtitle, self.b_subopt))
         self._subtitle_opts = None
@@ -1339,6 +1477,14 @@ class RecordingPanel(BasePanel):
         # （如自动弹回「不录音」）不会触发，联动会漏
         self._audio_group.buttonToggled.connect(self._audio_toggled)
         self.b_arefresh.clicked.connect(self._refresh_audios)
+        self.b_test_mic.clicked.connect(lambda: self._run_probe("mic"))
+        self.b_test_sys.clicked.connect(lambda: self._run_probe("sys"))
+        # 换设备就抹掉上一次检测结果，免得拿着旧结论开录
+        self.cb_mic.currentIndexChanged.connect(
+            lambda: self._reset_probe_lbl(self.lbl_test_mic))
+        self.cb_sys.currentIndexChanged.connect(
+            lambda: self._reset_probe_lbl(self.lbl_test_sys))
+        self.cb_sys.currentIndexChanged.connect(self._audio_changed)
 
         self._mode_changed(0)
         self._refresh_windows()
@@ -1347,6 +1493,17 @@ class RecordingPanel(BasePanel):
         self.ed_out.editingFinished.connect(
             lambda: self.library.set_dir(self.ed_out.text().strip()))
         self.library.set_dir(self.ed_out.text().strip())
+
+        # ---- 全局热键：Ctrl+Alt+R 开始/停止（切到别的应用、全屏也生效）----
+        # 浮条已上幽灵模式（录不进画面），但用户可能在别的窗口想随手开关，
+        # 热键就是那条不依赖浮条可见性的兜底通道。随应用退出注销，免得泄漏。
+        if IS_WINDOWS:
+            self._hotkey = HotkeyGrabber({1: (HOTKEY_MODS, VK_TOGGLE)}, self)
+            self._hotkey.pressed.connect(self._on_hotkey)
+            self._hotkey.start()
+            app = QApplication.instance()
+            if app is not None:
+                app.aboutToQuit.connect(self._hotkey.stop)
 
     @staticmethod
     def _lb_row(*ws):
@@ -1466,11 +1623,19 @@ class RecordingPanel(BasePanel):
 
     def _audio_changed(self):
         mic = self.chip_a_mic.isChecked()
+        sys_on = self.chip_a_sys.isChecked()
         self.row_mic.setVisible(mic)
+        self.lbl_test_mic.setVisible(mic)
+        self.row_sys.setVisible(sys_on)
+        self.lbl_test_sys.setVisible(sys_on)
+        # 内部声音选型直接取下拉当前项（多设备时用户切哪个就是哪个）
+        self._sys_spec = self.cb_sys.currentData() if sys_on else None
         parts = []
-        if self.chip_a_sys.isChecked() and self._sys_desc:
-            parts.append(f"内部声音实现方式：{self._sys_desc}")
-        if mic and not self.cb_mic.count():
+        if sys_on and self.cb_sys.count() == 0:
+            parts.append("没有可选的内部声音设备：点 ⟳ 重试，或在声音设置里启用「立体声混音」")
+        elif sys_on and self._sys_spec is not None:
+            parts.append(f"内部声音将走：{self.cb_sys.currentText()}")
+        if mic and self.cb_mic.count() == 0:
             parts.append("没有枚举到麦克风设备：可点 ⟳ 重试，或改用其它音源")
         self.lbl_audio.setText("；".join(parts))
 
@@ -1479,39 +1644,107 @@ class RecordingPanel(BasePanel):
         devices = list_audio_devices(ffmpeg) if ffmpeg else []
         mics = [n for n in devices if not is_mix_device(n)]
         mixes = [n for n in devices if is_mix_device(n)]
+        supports_wasapi = bool(ffmpeg) and has_wasapi_loopback(ffmpeg)
 
+        # 麦克风：列出全部非混音输入设备（多声卡/多通道都能选），重刷后留住旧选择
+        keep_mic = self.cb_mic.currentData()
         self.cb_mic.clear()
         for n in mics:
             self.cb_mic.addItem(n, n)
+        self._keep_combo(self.cb_mic, keep_mic)
 
-        self._sys_spec = None
-        self._sys_desc = ""
-        if ffmpeg and has_wasapi_loopback(ffmpeg):
-            self._sys_spec, self._sys_desc = ("system", None), "WASAPI 环回（当前 ffmpeg 支持）"
-        elif mixes:
-            self._sys_spec = ("system", mixes[0])
-            self._sys_desc = f"立体声混音设备（{mixes[0]}）"
-        can_sys = bool(ffmpeg) and self._sys_spec is not None
+        # 内部声音：WASAPI 环回（若支持排最前作推荐）+ 各声卡的立体声混音都列出来可切
+        keep_sys = self.cb_sys.currentData()
+        self.cb_sys.clear()
+        if supports_wasapi:
+            self.cb_sys.addItem("WASAPI 环回（录当前系统播放·推荐）", ("system", None))
+        for n in mixes:
+            self.cb_sys.addItem(f"立体声混音（{n}）", ("system", n))
+        self._keep_combo(self.cb_sys, keep_sys)
+
+        can_sys = bool(ffmpeg) and self.cb_sys.count() > 0
         self.chip_a_sys.setEnabled(can_sys)
         self.chip_a_sys.setToolTip(
-            self._sys_desc if can_sys else
+            "在下拉里选一个内部声音设备，点「🔍 检测」确认能否收到声音" if can_sys else
             "录不到系统内部声音：当前 ffmpeg 没有 WASAPI 环回，也没发现"
             "「立体声混音」类设备（可在声音设置里启用后点 ⟳）")
         self.chip_a_mic.setEnabled(bool(mics))
-        if not mics:
-            self.chip_a_mic.setToolTip("没有枚举到麦克风设备")
+        self.chip_a_mic.setToolTip(
+            "选麦克风设备后点「🔍 检测」确认能否收到声音" if mics else "没有枚举到麦克风设备")
+        # 设备列表变了，清掉两路旧的检测结论
+        self._reset_probe_lbl(self.lbl_test_mic)
+        self._reset_probe_lbl(self.lbl_test_sys)
         self._audio_changed()
 
     def _audio_specs(self):
-        """选中的音源列表（可内部+外部两个）：[('system',…) 和/或 ('mic', 名字)]"""
+        """选中的音源列表（可内部+外部两个）：直接读下拉当前项，与选型不脱节"""
         specs = []
-        if self.chip_a_sys.isChecked() and self._sys_spec:
-            specs.append(self._sys_spec)
+        if self.chip_a_sys.isChecked():
+            s = self.cb_sys.currentData()
+            if s:
+                specs.append(s)
         if self.chip_a_mic.isChecked():
             name = self.cb_mic.currentData()
             if name:
                 specs.append(("mic", name))
         return specs
+
+    # ---- 设备检测（试录测电平） ----
+    @staticmethod
+    def _keep_combo(combo, data):
+        """重建下拉后把选中项尽量恢复到之前的设备（找不到就留默认第一项）"""
+        if data is None:
+            return
+        for i in range(combo.count()):
+            if combo.itemData(i) == data:
+                combo.setCurrentIndex(i)
+                return
+
+    def _reset_probe_lbl(self, lbl):
+        """清掉某一路的检测结论（换设备/刷新时用）"""
+        lbl.setText("")
+        lbl.setStyleSheet("")
+
+    def _probe_spec(self, kind):
+        """当前该音源要检测的规格：麦克风取下拉名，内部声音取下拉元组"""
+        if kind == "mic":
+            name = self.cb_mic.currentData()
+            return ("mic", name) if name else None
+        return self.cb_sys.currentData()
+
+    def _run_probe(self, kind):
+        """对选中设备试录 2 秒测电平：后台线程跑，结果回填到该行反馈标签"""
+        btn, lbl = ((self.b_test_mic, self.lbl_test_mic) if kind == "mic"
+                    else (self.b_test_sys, self.lbl_test_sys))
+        spec = self._probe_spec(kind)
+        if spec is None:
+            lbl.setText("先选一个设备")
+            lbl.setStyleSheet(f"color: {TXT_MUTED};")
+            return
+        ffmpeg = _ffmpeg_usable()
+        if not ffmpeg:
+            lbl.setText("缺少 ffmpeg，无法检测")
+            lbl.setStyleSheet(f"color: {TXT_BAD};")
+            return
+        if kind in self._probes:          # 同一路线程还没回，忽略重复点击
+            return
+        btn.setEnabled(False)
+        lbl.setText("检测中…（对着设备说话/让系统出声，约 2 秒）")
+        lbl.setStyleSheet(f"color: {TXT_MUTED};")
+        probe = LevelProbe(ffmpeg, spec, self)
+        probe.done.connect(lambda res: self._probe_done(kind, btn, lbl, res))
+        probe.finished.connect(probe.deleteLater)
+        self._probes[kind] = probe
+        probe.start()
+
+    def _probe_done(self, kind, btn, lbl, res):
+        """检测结果回主线程：绿=收到声音，红=静音/失败（一句话已含建议）"""
+        _db, ok, msg = res
+        lbl.setText(msg)
+        lbl.setToolTip(msg)
+        lbl.setStyleSheet(f"color: {TXT_OK if ok else TXT_BAD};")
+        btn.setEnabled(True)
+        self._probes.pop(kind, None)
 
     def _pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择保存目录")
@@ -1584,6 +1817,13 @@ class RecordingPanel(BasePanel):
             out_path, fps=self.cb_fps.currentText(), bitrate=self.cb_br.currentText(),
             physical=physical, title=title, audio=self._audio_specs())
         return plans
+
+    def _on_hotkey(self, hid):
+        """全局热键命中：录制中→停止，空闲→开始。跟面板按钮走同两条路径，行为一致。"""
+        if self._rec is not None:
+            self._stop_rec()
+        else:
+            self._start_rec()
 
     def _start_rec(self):
         if self._rec is not None:

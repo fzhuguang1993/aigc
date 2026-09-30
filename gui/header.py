@@ -6,19 +6,23 @@ gui/header.py —— 统一页头与 KPI 卡片（飞书风格配色）
 import math
 
 from PySide6.QtCore import Qt, QTimer, QPointF
-from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel
+from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath, QLinearGradient
+from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
+                               QSizePolicy)
 
-FS_BLUE = "#3370FF"
-FS_TEXT = "#1F2329"
-FS_SUB = "#646A73"
-FS_WEAK = "#8F959E"
+from gui.ui_kit import COLORS, rgba
+
+# 页头/KPI 常用色：不再自写十六进制，一律引用 ui_kit 令牌（值不变，改令牌即全站跟着变）
+FS_BLUE = COLORS["primary"]
+FS_TEXT = COLORS["text"]
+FS_SUB = COLORS["sub"]
+FS_WEAK = COLORS["weak"]
 
 # 线路状态语义色（商务低饱和版）：墨绿 / 赭石 / 干枯玫瑰红，
 # 替代刺眼的高饱和红绿灯（#1FA45C/#F5A623/#E5484D 看着老气）。
-FS_GREEN = "#2F9E77"
-FS_AMBER = "#C88A2E"
-FS_RED = "#C14B4B"
+FS_GREEN = COLORS["line_ok"]
+FS_AMBER = COLORS["line_alive"]
+FS_RED = COLORS["line_down"]
 
 # 线路状态灯三档，不是“绿/红”两档：探活接口未实现时（服务有话回但路径不对，
 # 典型是 GET {base}/health 返回 HTML 404）画红灯会把人吓去删线路，画绿灯又是
@@ -157,6 +161,65 @@ def page_header(title, subtitle="", icon=""):
     return w
 
 
+class Sparkline(QWidget):
+    """迷你趋势线：只画一条折线 + 下方淡渐变填充，无横纵轴/刻度/网格——
+    填 KpiCard 右侧那一大片空白，让人一眼看到这指标的近期走势而不占地方。"""
+
+    def __init__(self, values=None, color=FS_BLUE, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(96, 42)
+        self._values = list(values or [])
+        self._color = QColor(color)
+
+    def set_values(self, values, color=None):
+        self._values = list(values or [])
+        if color:
+            self._color = QColor(color)
+        self.update()
+
+    def paintEvent(self, e):
+        n = len(self._values)
+        if n < 2:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        pad = 4.0
+        mn, mx = min(self._values), max(self._values)
+        rng = (mx - mn) or 1
+        xs = [pad + (w - 2 * pad) * i / (n - 1) for i in range(n)]
+        ys = [h - pad - (h - 2 * pad) * (v - mn) / rng for v in self._values]
+        pts = [QPointF(x, y) for x, y in zip(xs, ys)]
+        # 折线下方淡渐变填充（顶部有色、底部透明）
+        area = QPainterPath()
+        area.moveTo(pts[0].x(), h)
+        for pt in pts:
+            area.lineTo(pt)
+        area.lineTo(pts[-1].x(), h)
+        area.closeSubpath()
+        fill = QColor(self._color)
+        fill.setAlpha(48)
+        g = QLinearGradient(0, 0, 0, h)
+        g.setColorAt(0, fill)
+        g.setColorAt(1, QColor(255, 255, 255, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(g)
+        p.drawPath(area)
+        # 折线本体
+        pen = QPen(self._color)
+        pen.setWidthF(1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        for a, b in zip(pts, pts[1:]):
+            p.drawLine(a, b)
+        # 末点高亮，暗示“当前值”
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._color)
+        p.drawEllipse(pts[-1], 2.4, 2.4)
+        p.end()
+
+
 class Card(QWidget):
     """白色圆角卡片容器（可叠加 hover 描边）；新刻度：边距 18/16、行距 8，
     与数据中台的卡内呼吸感对齐（KpiCard 等自带 margins 的不受影响）"""
@@ -181,8 +244,7 @@ class KpiCard(Card):
     def __init__(self, name, icon, color, parent=None):
         super().__init__(parent, margins=(14, 12, 14, 10))
         self.color = color
-        c = QColor(color)
-        soft = f"rgba({c.red()},{c.green()},{c.blue()},0.12)"
+        soft = rgba(color, 0.12)
         head = QHBoxLayout()
         head.setSpacing(10)
         badge = QLabel(icon)
@@ -203,7 +265,9 @@ class KpiCard(Card):
         t.addWidget(name_lbl)
         t.addWidget(self.value)
         head.addLayout(t)
-        head.addStretch(1)
+        self._spacer = head.addStretch(1)
+        self._head = head
+        self._spark = None
         self.v.addLayout(head)
         self.delta = QLabel("")
         self.delta.setStyleSheet(f"font-size:11px; color:{FS_WEAK}; background:transparent;")
@@ -215,8 +279,25 @@ class KpiCard(Card):
         if up is None:
             self.delta.setStyleSheet(f"font-size:11px; color:{FS_WEAK}; background:transparent;")
         else:
-            col = "#00B96B" if up else "#F54A45"
+            col = COLORS["success"] if up else COLORS["danger"]
             self.delta.setStyleSheet(f"font-size:11px; color:{col}; background:transparent;")
+
+    def set_sparkline(self, values, color=None):
+        """在卡片右侧挂一条迷你趋势线（不传就不占位，老页面外观不变）。
+        传入后去掉中部撑开的弹簧，让折线水平铺满中间到右侧那一段，
+        消除「数字与折线之间一大截空白」。color 默认取卡片主色。"""
+        col = color or self.color
+        if self._spark is None:
+            if self._spacer is not None:
+                self._head.removeItem(self._spacer)
+                self._spacer = None
+            self._spark = Sparkline(values, col, self)
+            self._spark.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                      QSizePolicy.Policy.Preferred)
+            self._head.addWidget(self._spark)
+        else:
+            self._spark.set_values(values, col)
+        self._spark.show()
 
     def paintEvent(self, e):
         super().paintEvent(e)

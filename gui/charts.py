@@ -23,23 +23,26 @@ from PySide6.QtGui import (QColor, QCursor, QFont, QGuiApplication, QPainter,
                            QPen, QLinearGradient, QPainterPath, QBrush)
 from PySide6.QtWidgets import QWidget
 
-# 飞书风色板：绿/红/灰语义分明，主蓝克制
-C_OK = QColor("#00B96B")
+from gui.ui_kit import COLORS
+
+# 飞书风色板：绿/红/灰语义分明，主蓝克制。凡 ui_kit 令牌里有同值语义色的一律
+# 取令牌（改品牌色时图表跟着走）；浅渐变端/网格这类无对应令牌的保留 hex。
+C_OK = QColor(COLORS["success"])      # #00B96B
 C_OK2 = QColor("#5CD39B")
-C_FAIL = QColor("#F54A45")
+C_FAIL = QColor(COLORS["danger"])     # #F54A45
 C_FAIL2 = QColor("#FF928D")
-C_CANCEL = QColor("#8F959E")
+C_CANCEL = QColor(COLORS["weak"])     # #8F959E
 C_CANCEL2 = QColor("#B8BEC7")
 C_GRID = QColor("#E8EAED")
-C_AXIS = QColor("#8F959E")
-C_DARK = QColor("#1F2329")
-C_BLUE = QColor("#3370FF")     # 飞书主色
+C_AXIS = QColor(COLORS["weak"])       # #8F959E
+C_DARK = QColor(COLORS["text"])       # #1F2329
+C_BLUE = QColor(COLORS["primary"])    # #3370FF 飞书主色
 C_BLUE2 = QColor("#7FABFF")
-# 多分类环形图色板（产品/时长这些非状态语义的维度用）：蓝绿橙紫青玫灰，
-# 每对是（主色, 浅色渐变端），与语义色同一套克制风格
-PALETTE = [("#3370FF", "#7FABFF"), ("#00B96B", "#5CD39B"), ("#FF8D19", "#FFC57A"),
-           ("#7F3FBF", "#B388FF"), ("#0FB5AE", "#6FE0DA"), ("#F54A45", "#FF928D"),
-           ("#8F959E", "#B8BEC7")]
+# 多分类环形图色板（产品/时长这些非状态语义的维度用）：主色取令牌，浅色渐变端保留 hex
+PALETTE = [(COLORS["primary"], "#7FABFF"), (COLORS["success"], "#5CD39B"),
+           (COLORS["warning"], "#FFC57A"), (COLORS["purple"], "#B388FF"),
+           (COLORS["info"], "#6FE0DA"), (COLORS["danger"], "#FF928D"),
+           (COLORS["weak"], "#B8BEC7")]
 
 FONT = "Microsoft YaHei"
 
@@ -106,10 +109,10 @@ class _ChartTip(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(31, 35, 41, 26))
         p.drawRoundedRect(box.adjusted(2, 3, 2, 3), 9, 9)     # 软阴影
-        p.setBrush(QColor("#FFFFFF"))
-        p.setPen(QPen(QColor("#DEE0E3"), 1))
+        p.setBrush(QColor(COLORS["card"]))
+        p.setPen(QPen(QColor(COLORS["border"]), 1))
         p.drawRoundedRect(box, 8, 8)                          # 白卡本体
-        p.setPen(QColor("#1F2329"))
+        p.setPen(QColor(COLORS["text"]))
         fm = p.fontMetrics()
         y = 10 + fm.height()
         for t in self._lines:
@@ -624,7 +627,7 @@ class ComboChart(_Base):
     量与质一张图看完——单看堆叠柱看不出“跑得多但质置在滑坡”"""
 
     M_L, M_R, M_T, M_B = 40, 44, 30, 34   # 右边距给成功率刻度
-    C_RATE = QColor("#7F3FBF")            # 与 KPI「成功率」同紫色
+    C_RATE = QColor(COLORS["purple"])          # 与 KPI「成功率」同紫色
 
     def __init__(self, title="每日执行量与成功率", parent=None):
         super().__init__(parent)

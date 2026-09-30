@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QFrame)
 
 from store import app_state
+from gui.theme import tokenize
 
 _ACCENT = "#3370FF"
 _RING_PAD = 5                # 描边框比目标四周各外扩这么多像素
@@ -56,8 +57,8 @@ class _TourCard(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent, _TOPFLAGS)
-        self.setStyleSheet(f"QFrame#TourCard{{background:#FFFFFF;"
-                           f"border:1px solid {_ACCENT};border-radius:10px;}}")
+        self.setStyleSheet(tokenize(f"QFrame#TourCard{{background:#FFFFFF;"
+                           f"border:1px solid {_ACCENT};border-radius:10px;}}"))
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 12, 16, 12)
         lay.setSpacing(8)

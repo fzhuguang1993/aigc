@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QSizePolicy, QGraphicsDropShadowEffect)
 
 from gui.header import page_header, LightDot, LIGHT_KIND_COLOR, FS_WEAK, Card
+from gui.theme import tokenize
 
 SRV_HEADERS = ["线路", "状态", "并发上限", "负载(实时)"]
 LIST_HEADERS = ["线路", "状态", "本机在跑", "并发上限", "空余", "连续失败", "云端负载"]
@@ -136,7 +137,7 @@ class ConsoleCard(QWidget):
         head.setSpacing(9)
         self.dot = LightDot("pending")
         self.name = QLabel(name)
-        self.name.setStyleSheet("font-size:15px;font-weight:800;color:#1F2329;background:transparent;")
+        self.name.setStyleSheet(tokenize("font-size:15px;font-weight:800;color:#1F2329;background:transparent;"))
         self.pill = QLabel("待检测")
         self.pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         head.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -172,9 +173,9 @@ class ConsoleCard(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(1)
         t = QLabel(cap)
-        t.setStyleSheet("font-size:11px;color:#8F959E;background:transparent;")
+        t.setStyleSheet(tokenize("font-size:11px;color:#8F959E;background:transparent;"))
         val = QLabel("-")
-        val.setStyleSheet("font-size:15px;font-weight:800;color:#1F2329;background:transparent;")
+        val.setStyleSheet(tokenize("font-size:15px;font-weight:800;color:#1F2329;background:transparent;"))
         v.addWidget(t)
         v.addWidget(val)
         return box, val
@@ -268,7 +269,7 @@ class _Stat(QWidget):
         col = QVBoxLayout()
         col.setSpacing(2)
         self.value = QLabel("0")
-        self.value.setStyleSheet("font-size:24px;font-weight:800;color:#1F2329;background:transparent;")
+        self.value.setStyleSheet(tokenize("font-size:24px;font-weight:800;color:#1F2329;background:transparent;"))
         cap_lbl = QLabel(cap)
         cap_lbl.setStyleSheet(f"font-size:12px;color:{FS_WEAK};background:transparent;")
         col.addWidget(self.value)

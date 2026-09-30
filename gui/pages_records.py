@@ -16,6 +16,7 @@ from gui.header import page_header, Card
 from gui.widgets import LoadingOverlay
 from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
                           SecsItem)
+from gui.kit import TableColumnKit
 
 DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间",
                 "总用时", "生成", "排队", "输出文件", "错误信息"]
@@ -117,6 +118,10 @@ class RecordsPage(QWidget):
         # 默认「最新在前」：按开始时间倒序，与任务中心口径一致（点表头可改列/方向）
         self.table.horizontalHeader().setSortIndicator(COL_START, Qt.SortOrder.DescendingOrder)
         content.v.addWidget(self.table, 3)
+        # 统一列交互：表头右键可设本列靠左/居中/靠右 / 垂直居中 / 自动换行。
+        # 复用 gui.kit.TableColumnKit：只接管「表头右键」这一个入口，不改本页
+        # 的选择模式 / 排序 / 字段管理 / 勾选导出等既有行为（实例随表析构）。
+        TableColumnKit(self.table)
 
         content.v.addWidget(QLabel("实时日志"))
         self.log = QPlainTextEdit()

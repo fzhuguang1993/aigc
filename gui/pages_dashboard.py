@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPlainTextEdit, QDialog, QTableWidget,
                                QTableWidgetItem, QHeaderView, QAbstractItemView,
                                QTabBar, QStackedWidget, QLineEdit, QFormLayout,
-                               QMessageBox, QMenu, QInputDialog, QFrame)
+                               QMessageBox, QInputDialog, QFrame)
 
 from core.config import USER_NAME
 from store import app_state, task_store
@@ -39,16 +39,19 @@ from gui.formatting import secs
 from gui.header import page_header, Card, KpiCard
 from gui.widgets import LoadingOverlay
 from gui.window_frame import apply_rounded
+from gui.menus import StyledMenu
+from gui import ui_kit
+from gui.ui_kit import COLORS
 from gui.charts import (TrendChart, DonutChart, HBarChart, LineChart, ComboChart,
                         HeatmapChart, PALETTE, C_OK, C_OK2, C_FAIL, C_FAIL2,
                         C_CANCEL, C_CANCEL2, C_BLUE, C_BLUE2)
+from gui.theme import tokenize
 
 
 # ---------- 图表点击下钻：每种维度一套表头（取值函数统一返字符串） ----------
 _STATUS_CN = {"completed": "成功", "failed": "失败", "error": "错误",
               "cancelled": "取消", "running": "运行中"}
-_STATUS_COLOR = {"成功": "#00B96B", "失败": "#F54A45", "错误": "#F54A45",
-                 "取消": "#8F959E", "运行中": "#FF8D19"}
+_STATUS_COLOR = ui_kit.STATUS_COLORS
 
 
 def _c_hm(r):
@@ -267,12 +270,12 @@ class DashboardPage(QWidget):
         self.tabs.addTab("  其他图表  ")
         self.tabs.setStyleSheet(
             "QTabBar{background:transparent;}"
-            "QTabBar::tab{background:transparent;color:#646A73;font-size:13px;"
+            f"QTabBar::tab{{background:transparent;color:{COLORS['sub']};font-size:13px;"
             "padding:6px 18px;margin-right:8px;border:none;"
             "border-bottom:2px solid transparent;}"
-            "QTabBar::tab:selected{color:#3370FF;font-weight:600;"
-            "border-bottom:2px solid #3370FF;}"
-            "QTabBar::tab:hover{color:#1F2329;}")
+            f"QTabBar::tab:selected{{color:{COLORS['primary']};font-weight:600;"
+            f"border-bottom:2px solid {COLORS['primary']};}}"
+            f"QTabBar::tab:hover{{color:{COLORS['text']};}}")
         self.tabs.currentChanged.connect(self._on_tab)
         self.tabs.rename_cb = self._rename_tab
         # 自定义页签带 × 可关；总览/其他图表两个固定页签的 × 在
@@ -312,13 +315,13 @@ class DashboardPage(QWidget):
         # ----- KPI 行 -----
         kpis = QHBoxLayout()
         kpis.setSpacing(14)
-        self.k_total = KpiCard("执行总条数", "▶", "#3370FF")
-        self.k_ok = KpiCard("成功", "✔", "#00B96B")
-        self.k_rate = KpiCard("成功率", "％", "#7F3FBF")
-        self.k_fail = KpiCard("失败", "✖", "#F54A45")
-        self.k_cancel = KpiCard("取消", "⊘", "#8F959E")
-        self.k_run = KpiCard("正在运行", "◌", "#FF8D19")
-        self.k_dur = KpiCard("平均生成时长", "⏱", "#0FB5AE")
+        self.k_total = KpiCard("执行总条数", "▶", COLORS["primary"])
+        self.k_ok = KpiCard("成功", "✔", COLORS["success"])
+        self.k_rate = KpiCard("成功率", "％", COLORS["purple"])
+        self.k_fail = KpiCard("失败", "✖", COLORS["danger"])
+        self.k_cancel = KpiCard("取消", "⊘", COLORS["weak"])
+        self.k_run = KpiCard("正在运行", "◌", COLORS["warning"])
+        self.k_dur = KpiCard("平均生成时长", "⏱", COLORS["info"])
         for k in (self.k_total, self.k_ok, self.k_rate, self.k_fail,
                   self.k_cancel, self.k_run, self.k_dur):
             k.setMinimumWidth(125)
@@ -863,7 +866,7 @@ class ReportDialog(QDialog):
 
         hint = QLabel("今日截至目前 vs 昨日同时段 · 汇报人用「设置」里的姓名 · "
                       "不受数据中台时间范围影响；打开本窗口已自动复制，直接去群里粘贴")
-        hint.setStyleSheet("font-size:11px;color:#8F959E;background:transparent;")
+        hint.setStyleSheet(tokenize("font-size:11px;color:#8F959E;background:transparent;"))
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
@@ -871,8 +874,8 @@ class ReportDialog(QDialog):
         self.view.setReadOnly(True)
         self.view.setPlainText(self._text)
         self.view.setStyleSheet(
-            "QPlainTextEdit{background:#F7F8FA;border:1px solid #E8EAED;"
-            "border-radius:8px;font-size:12.5px;color:#1F2329;}")
+            tokenize("QPlainTextEdit{background:#F7F8FA;border:1px solid #E8EAED;"
+            "border-radius:8px;font-size:12.5px;color:#1F2329;}"))
         lay.addWidget(self.view, 1)
         self.b_copy.clicked.connect(self._copy)
         apply_rounded(self, show_min=False, show_max=False)
@@ -925,7 +928,7 @@ class DetailDialog(QDialog):
         foot = QHBoxLayout()
         self.lbl_hint = QLabel("首列 # 是按开始时间倒序的行号，用于和数据源逐条核对"
                                " · 点表头可排序 · Esc 关闭")
-        self.lbl_hint.setStyleSheet("font-size:11px;color:#8F959E;background:transparent;")
+        self.lbl_hint.setStyleSheet(tokenize("font-size:11px;color:#8F959E;background:transparent;"))
         foot.addWidget(self.lbl_hint, 1)
         b_close = QPushButton("关闭")
         b_close.setObjectName("GhostBtn")
@@ -1118,7 +1121,7 @@ class _Canvas(QWidget):
         super().paintEvent(e)
 
     def contextMenuEvent(self, e):
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("＋ 添加组件…", self.view.prompt_add_widget)
         m.exec(e.globalPos())
 
@@ -1145,19 +1148,19 @@ class _PanelBar(QWidget):
         lay.setContentsMargins(6, 0, 2, 0)
         lay.setSpacing(6)
         self.lbl = QLabel()
-        self.lbl.setStyleSheet("font-size:12px;font-weight:600;color:#1F2329;"
-                               "background:transparent;")
+        self.lbl.setStyleSheet(tokenize("font-size:12px;font-weight:600;color:#1F2329;"
+                               "background:transparent;"))
         self.sub = QLabel()
-        self.sub.setStyleSheet("font-size:11px;color:#8F959E;"
-                               "background:transparent;")
+        self.sub.setStyleSheet(tokenize("font-size:11px;color:#8F959E;"
+                               "background:transparent;"))
         b_min = QPushButton("—")
         b_min.setFixedSize(26, 20)
         b_min.setCursor(Qt.CursorShape.PointingHandCursor)
         b_min.setStyleSheet(
-            "QPushButton{border:none;border-radius:4px;color:#646A73;"
+            tokenize("QPushButton{border:none;border-radius:4px;color:#646A73;"
             "background:transparent;font-size:12px;}"
             "QPushButton:hover{background:#EFF1F5;}"
-            "QPushButton:pressed{background:#E2E5EC;}")
+            "QPushButton:pressed{background:#E2E5EC;}"))
         b_min.setToolTip("最小化 / 还原（最小化后只留这条标题栏）")
         b_min.clicked.connect(panel.toggle_min)
         lay.addWidget(self.lbl)
@@ -1246,8 +1249,8 @@ class WidgetPanel(QFrame):
         # 子类不自开 WA_StyledBackground：不补这行，下面内联样式的白底画不出
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
-            "#WidgetPanel{background:#FFFFFF;border:1px solid #E5E8EF;"
-            "border-radius:8px;}")
+            tokenize("#WidgetPanel{background:#FFFFFF;border:1px solid #E5E8EF;"
+            "border-radius:8px;}"))
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(8, 4, 8, 8)
         self._lay.setSpacing(4)
@@ -1370,7 +1373,7 @@ class WidgetPanel(QFrame):
         self.update()
 
     def contextMenuEvent(self, e):
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("✎ 编辑数据…", lambda: self.view.edit_widget(self))
         m.addAction("✏ 重命名组件", lambda: self.view.rename_widget(self))
         m.addAction("↩ 还原" if self.w.get("min") else "— 最小化",
@@ -1459,7 +1462,7 @@ class CustomViewDialog(QDialog):
         lay.addWidget(title)
         hint = QLabel("组件跟随页头「时间范围」刷新；排行/趋势可点柱下钻明细，"
                       "表格形态只看不下钻。位置与大小：拖标题栏 / 拖右下角。")
-        hint.setStyleSheet("font-size:11px;color:#8F959E;background:transparent;")
+        hint.setStyleSheet(tokenize("font-size:11px;color:#8F959E;background:transparent;"))
         hint.setWordWrap(True)
         lay.addWidget(hint)
 

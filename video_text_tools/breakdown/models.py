@@ -39,10 +39,11 @@ STAGE_ACQUIRE = "解析下载"
 STAGE_FRAMES = "抽帧"
 STAGE_TRANSCRIBE = "转写"
 STAGE_VISION = "视觉分析"
+STAGE_BLOCKS = "板块拆分"
 STAGE_PROMPTS = "提示词生成"
 STAGE_REWRITE = "改写去重"
 STAGES = [STAGE_ACQUIRE, STAGE_FRAMES, STAGE_TRANSCRIBE,
-          STAGE_VISION, STAGE_PROMPTS, STAGE_REWRITE]
+          STAGE_VISION, STAGE_BLOCKS, STAGE_PROMPTS, STAGE_REWRITE]
 
 
 class BreakdownError(Exception):
@@ -121,6 +122,26 @@ class SegmentPrompts:
 
 
 @dataclass
+class BlockSegment:
+    """一个营销板块（钩子/痛点/行动号召…）在时间轴上的一段。
+
+    start/end 为秒（钳在 [0,duration] 且区间互不重叠，见 prompts.build_blocks）；
+    type 限定在配置的板块类型白名单内。summary 是该板块的一句话说明。"""
+    index: int
+    type: str
+    start: float
+    end: float
+    summary: str = ""
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(**_slim(cls, d))
+
+
+@dataclass
 class OverallAnalysis:
     """整条视频的可复用分析。"""
     hook_desc: str = ""       # 前 3 秒钩子描述
@@ -150,6 +171,7 @@ class BreakdownResult:
     transcript: list = field(default_factory=list)        # [TranscriptSegment]
     transcript_text: str = ""                             # 逐字稿纯文本
     segments: list = field(default_factory=list)          # [SegmentPrompts]
+    blocks: list = field(default_factory=list)            # [BlockSegment] 营销板块时间轴
     overall: OverallAnalysis = field(default_factory=OverallAnalysis)
     shot_count: int = 0
     shot_durations: str = ""                              # 每段时长串
@@ -178,6 +200,7 @@ class BreakdownResult:
                                 for x in (d.get("frame_analyses") or [])]
         kw["transcript"] = [_segment_from_dict(x) for x in (d.get("transcript") or [])]
         kw["segments"] = [SegmentPrompts.from_dict(x) for x in (d.get("segments") or [])]
+        kw["blocks"] = [BlockSegment.from_dict(x) for x in (d.get("blocks") or [])]
         kw["overall"] = OverallAnalysis.from_dict(d.get("overall") or {})
         kw["gallery"] = list(d.get("gallery") or [])
         return cls(**kw)

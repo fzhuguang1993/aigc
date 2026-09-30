@@ -58,4 +58,13 @@ def build_timeline(result):
             "end": float(getattr(s, "end", 0) or 0),
             "text": getattr(s, "text", "") or "",
         })
-    return {"shots": shots, "lines": lines}
+    blocks = []
+    for i, b in enumerate(getattr(result, "blocks", None) or []):
+        blocks.append({
+            "i": getattr(b, "index", i + 1),
+            "type": getattr(b, "type", "") or "",
+            "start": float(getattr(b, "start", 0) or 0),
+            "end": float(getattr(b, "end", 0) or 0),
+            "summary": getattr(b, "summary", "") or "",
+        })
+    return {"shots": shots, "lines": lines, "blocks": blocks}

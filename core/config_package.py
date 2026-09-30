@@ -264,10 +264,17 @@ def _write_text(target: Path, content):
 # 导出
 # ============================================================
 
-def collect_items():
-    """跑一遍注册表 → [(item, files)]；单条 collect 失败不拖垮整包"""
+def collect_items(only_ids=None):
+    """跑一遍注册表 → [(item, files)]；单条 collect 失败不拖垮整包。
+
+    only_ids 给定时只收集其中的条目（导出前勾选用）；None＝全收集。
+    过滤在 collect 之前做：没勾中的条目连 collect 都不跑（如本机没 config.json
+    但只勾了产品，不会被「缺 config」报错拦住）。"""
+    wanted = None if only_ids is None else set(only_ids)
     out = []
     for it in ITEMS:
+        if wanted is not None and it.id not in wanted:
+            continue
         try:
             files = it.collect()
         except ValueError:
@@ -279,9 +286,12 @@ def collect_items():
     return out
 
 
-def export_package(dest: str, passphrase: str = PASSPHRASE) -> dict:
-    """加密写盘，返回 {"items": [标题…], "files": 文件数}"""
-    collected = collect_items()
+def export_package(dest: str, passphrase: str = PASSPHRASE,
+                   only_ids=None) -> dict:
+    """加密写盘，返回 {"items": [标题…], "files": 文件数}
+
+    only_ids：只打包这些 id 的条目（导出勾选用）；None＝全打包。"""
+    collected = collect_items(only_ids)
     buf = io.BytesIO()
     n_files = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:

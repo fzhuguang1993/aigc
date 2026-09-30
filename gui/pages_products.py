@@ -12,13 +12,15 @@ from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QPixmap, QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTreeWidget, QTreeWidgetItem, QSplitter, QInputDialog,
-                               QLineEdit, QMessageBox, QFileDialog, QMenu, QListWidget,
+                               QLineEdit, QMessageBox, QFileDialog, QListWidget,
                                QListWidgetItem, QAbstractItemView, QApplication)
 
 from store import product_store as ps
 from utils.desktop_utils import open_path, reveal_in_folder
 from gui.header import page_header, Card
 from gui.widgets import VideoPlayerDialog, ImagePreviewDialog
+from gui.menus import StyledMenu
+from gui.theme import tokenize
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 VID_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -188,7 +190,7 @@ class ProductsPage(QWidget):
 
         head = QHBoxLayout()
         self.lbl_name = QLabel("← 从左侧选择一个产品或 KOL")
-        self.lbl_name.setStyleSheet("font-size:16px; font-weight:700; color:#1F2329; background:transparent;")
+        self.lbl_name.setStyleSheet(tokenize("font-size:16px; font-weight:700; color:#1F2329; background:transparent;"))
         self.lbl_type = QLabel("")
         head.addWidget(self.lbl_name)
         head.addWidget(self.lbl_type)
@@ -197,7 +199,7 @@ class ProductsPage(QWidget):
 
         row = QHBoxLayout()
         t = QLabel("备注")
-        t.setStyleSheet("font-size:12px; color:#646A73; font-weight:600; background:transparent;")
+        t.setStyleSheet(tokenize("font-size:12px; color:#646A73; font-weight:600; background:transparent;"))
         row.addWidget(t)
         self.ed_note = QLineEdit()
         self.ed_note.setPlaceholderText("产品卖点 / 使用注意（可选，失焦自动保存）")
@@ -623,7 +625,7 @@ class ProductsPage(QWidget):
     # ================= 右键菜单 =================
     def _tree_menu(self, pos):
         it = self.tree.itemAt(pos)
-        menu = QMenu(self)
+        menu = StyledMenu(self)
         role = it.data(0, Qt.ItemDataRole.UserRole) if it else None
         if role and role[0] == "file":
             _, pid, kind, path = role

@@ -11,6 +11,7 @@ gui/asr_widgets.py —— 语音识别相关、被多个界面复用的小控件
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                                QPushButton, QComboBox, QCheckBox)
+from gui.theme import tokenize
 
 # 展示名 ↔ 模型档；顺序即下拉顺序（默认最优档在前）
 SIZE_LABELS = [("medium（默认，最准）", "medium"), ("small", "small"),
@@ -94,7 +95,7 @@ class ModelBar(QWidget):
             self.lbl_status.setText(
                 f"⚠ 「{size}」未下载{hint}；模型下载已收进隐藏的「接口管理」页")
             self.lbl_status.setStyleSheet(
-                "font-size:12px; color:#D83931; background:transparent;")
+                tokenize("font-size:12px; color:#D83931; background:transparent;"))
             self.b_dl.setEnabled(True)
 
     # ---- 模型下载已收到隐藏的接口管理页：本控件不再就地下载，只弹提醒 ----

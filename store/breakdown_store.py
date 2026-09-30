@@ -26,26 +26,53 @@ def _title(result):
     return (getattr(result, "link", "") or "").strip()[:40]
 
 
+def compute_link_key(link):
+    """规范化主链 → sha1[:16]（与拆解缓存同口径）；空链/异常回空串。"""
+    link = str(link or "")
+    if not link.strip():
+        return ""
+    try:
+        from video_text_tools.breakdown import cache as bd_cache
+        return bd_cache.link_key(link)
+    except Exception:
+        return ""
+
+
 def save(result, gallery_dir="", log=None):
-    """把一条拆解结果写库，返回新行 id（回填到 result.task_id）。
+    """把一条拆解结果写库，返回行 id（回填到 result.task_id）。
 
     gallery_dir：本次图集落盘的持久目录（可空）；cover/report 从 result 上取。
     半成品（result.is_partial()）也入库，标 status='partial'，便于回看定位。
+    同 link_key 已有行→ UPDATE 复用 id（避免同链接无限 INSERT 堆重复行）。
     """
     payload = json.dumps(result.to_dict(), ensure_ascii=False)
     status = "partial" if result.is_partial() else "ok"
     now = _now()
-    tid = db.execute(
-        "INSERT INTO breakdown_tasks(title, video_path, link, duration, "
-        "shot_count, cover, gallery_dir, report, status, payload, "
-        "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        (str(_title(result)), str(getattr(result, "video_path", "") or ""),
-         str(getattr(result, "link", "") or ""),
-         float(getattr(result, "duration", 0) or 0),
-         int(getattr(result, "shot_count", 0) or 0),
-         str(getattr(result, "cover_path", "") or ""), str(gallery_dir or ""),
-         str(getattr(result, "report_path", "") or ""), status, payload,
-         now, now))
+    key = compute_link_key(getattr(result, "link", ""))
+    vals = (str(_title(result)), str(getattr(result, "video_path", "") or ""),
+            str(getattr(result, "link", "") or ""),
+            float(getattr(result, "duration", 0) or 0),
+            int(getattr(result, "shot_count", 0) or 0),
+            str(getattr(result, "cover_path", "") or ""), str(gallery_dir or ""),
+            str(getattr(result, "report_path", "") or ""), status, payload,
+            key, now)
+    existing = 0
+    if key:
+        rows = db.query("SELECT id FROM breakdown_tasks WHERE link_key=? "
+                        "ORDER BY id DESC LIMIT 1", (key,))
+        existing = int(rows[0]["id"]) if rows else 0
+    if existing:
+        db.execute(
+            "UPDATE breakdown_tasks SET title=?, video_path=?, link=?, duration=?, "
+            "shot_count=?, cover=?, gallery_dir=?, report=?, status=?, payload=?, "
+            "link_key=?, updated_at=? WHERE id=?", vals + (existing,))
+        tid = existing
+    else:
+        tid = db.execute(
+            "INSERT INTO breakdown_tasks(title, video_path, link, duration, "
+            "shot_count, cover, gallery_dir, report, status, payload, link_key, "
+            "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            vals + (now,))
     result.task_id = int(tid or 0)
     if log:
         log(f"✓ 拆解任务已入库（#{tid}）")
@@ -68,6 +95,30 @@ def get(task_id):
     """取整行（含 payload）。无则 None。"""
     rows = db.query("SELECT * FROM breakdown_tasks WHERE id=?", (int(task_id),))
     return rows[0] if rows else None
+
+
+def _path_present(p):
+    try:
+        return bool(p) and Path(str(p)).exists()
+    except Exception:
+        return False
+
+
+def find_complete(link):
+    """按链接找「已完成且产物文件仍在」的最新一行；无则 None。
+
+    面板跑前用它短路：命中就直载详情、不进 worker、不调接口。
+    “完整”判据：status='ok' 且图集目录与 Word 文档都还在盘上（任一是
+    空/已被删 → 视为不完整，交给重跑）。同一 link_key 多行时取最新可用行。"""
+    key = compute_link_key(link)
+    if not key:
+        return None
+    rows = db.query("SELECT * FROM breakdown_tasks WHERE link_key=? AND status='ok' "
+                    "ORDER BY id DESC LIMIT 5", (key,))
+    for r in rows:
+        if _path_present(r.get("gallery_dir")) and _path_present(r.get("report")):
+            return r
+    return None
 
 
 def load_result(task_id):

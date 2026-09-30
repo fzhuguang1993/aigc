@@ -6,6 +6,7 @@ test_screen_recorder.py —— 屏幕录制功能层单元测试
 """
 import os
 import sys
+import types
 
 import pytest
 
@@ -14,7 +15,7 @@ from video_text_tools.screen_recorder import (
     escape_dshow_name, has_wasapi_loopback, is_mix_device,
     list_audio_devices, list_windows, parse_dshow_devices, rect_to_physical,
     screen_physical, virtual_desktop, _normalize_audio_list,
-    _parse_demuxer_check)
+    _parse_demuxer_check, parse_max_volume, probe_audio_level)
 
 
 # --------------------------------------------------------------------
@@ -348,3 +349,68 @@ def test_recorder_start_missing_exe(tmp_path):
     rec = Recorder([([str(tmp_path / "nope" / "ffmpeg.exe"), out], out)])
     err = rec.start()
     assert err and "找不到 ffmpeg" in err       # 路径型 exe 先验存在性，不盲 spawn
+
+
+# --------------------------------------------------------------------
+# 设备检测（试录测峰值电平）
+# --------------------------------------------------------------------
+def test_parse_max_volume():
+    assert parse_max_volume("max_volume: -12.3 dB") == -12.3
+    assert parse_max_volume("[x] max_volume: -inf dB") == -200.0
+    assert parse_max_volume("nothing here") is None
+    assert parse_max_volume("") is None
+    assert parse_max_volume(None) is None
+
+
+def _fake_probe_run(monkeypatch, stderr, holder=None):
+    """把 screen_recorder.subprocess.run 替成返回给定 stderr 的假体，
+    顺便把拼好的命令存进 holder 便于断言。"""
+    import video_text_tools.screen_recorder as sr
+
+    def _run(cmd, **kw):
+        if holder is not None:
+            holder["cmd"] = cmd
+        return types.SimpleNamespace(stderr=stderr, stdout="")
+    monkeypatch.setattr(sr.subprocess, "run", _run)
+
+
+def test_probe_audio_level_signal(monkeypatch):
+    got = {}
+    _fake_probe_run(monkeypatch,
+                    "[Parsed_volumedetect_0 @ 0x1] max_volume: -18.7 dB\n", got)
+    db, ok, msg = probe_audio_level("ffmpeg.exe", ("mic", "My Mic"))
+    assert db == -18.7 and ok is True and "收到声音" in msg
+    cmd = " ".join(got["cmd"])
+    # 采集输入与录制同一口径：dshow 指定设备 + volumedetect + null 输出
+    assert "-f dshow -i audio=My Mic" in cmd
+    assert "-af volumedetect -f null" in cmd and "-t 2" in cmd
+
+
+def test_probe_audio_level_silence(monkeypatch):
+    _fake_probe_run(monkeypatch, "max_volume: -inf dB\n")
+    db, ok, msg = probe_audio_level("ffmpeg.exe", ("mic", "Quiet Mic"))
+    assert db == -200.0 and ok is False and "几乎没声音" in msg
+
+
+def test_probe_audio_level_device_busy_hint(monkeypatch):
+    _fake_probe_run(monkeypatch,
+                    "[dshow @ 0x1] Could not run the "
+                    "graph: Audio device in use\n")
+    db, ok, msg = probe_audio_level("ffmpeg.exe", ("mic", "Busy"))
+    assert db is None and ok is False and "in use" in msg
+
+
+def test_probe_audio_level_no_ffmpeg_or_spec():
+    # 不跑子进程的早退分支
+    assert probe_audio_level("", ("mic", "M"))[1] is False
+    assert probe_audio_level("ffmpeg.exe", None)[1] is False
+
+
+def test_probe_system_without_wasapi_short_circuits(monkeypatch):
+    """('system', None) 且 ffmpeg 无 WASAPI 环回：直接给引导，不跑子进程"""
+    import video_text_tools.screen_recorder as sr
+    monkeypatch.setattr(sr, "has_wasapi_loopback", lambda p: False)
+    called = {}
+    _fake_probe_run(monkeypatch, "", called)
+    db, ok, msg = probe_audio_level("ffmpeg.exe", ("system", None))
+    assert ok is False and "WASAPI" in msg and "cmd" not in called

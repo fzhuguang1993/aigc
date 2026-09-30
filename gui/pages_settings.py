@@ -16,9 +16,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QStandardPaths, QPoint
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QMessageBox, QMenu, QScrollArea, QFrame,
+                               QPushButton, QMessageBox, QScrollArea, QFrame,
                                QFileDialog, QInputDialog, QSpinBox, QComboBox,
-                               QKeySequenceEdit, QCheckBox, QApplication)
+                               QKeySequenceEdit, QCheckBox, QApplication,
+                               QDialog, QDialogButtonBox)
 
 from core.config import (CONFIG_JSON, USER_NAME,
                          DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR,
@@ -26,16 +27,20 @@ from core.config import (CONFIG_JSON, USER_NAME,
 from core import license as lic
 from core import naming
 from core import tags as tag_lib
+from core import block_categories
 from gui.header import page_header
 from gui.dialogs_naming import NamingEditor
 from gui.dialogs_tags import TagEditor
+from gui.dialogs_blocks import BlockCategoryEditor
 from gui.maintainer import Gate, app_has_unlocked
 from gui.mouse_gesture import (GESTURE_COMMANDS, COMMAND_LABELS,
                               gesture_display, shape_distance, SHAPE_MAX_DIST)
 from gui.pages_tools import TOOLS
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, PANEL_FACTORIES
 from gui.widgets import VideoPlayerDialog
+from gui.menus import StyledMenu
 from store import app_state
+from gui.theme import tokenize
 
 
 def _same_path(a, b):
@@ -94,7 +99,7 @@ def _form_label(text, w=110):
     lb = QLabel(text)
     lb.setFixedWidth(w)
     lb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-    lb.setStyleSheet("color:#646A73; background:transparent;")
+    lb.setStyleSheet(tokenize("color:#646A73; background:transparent;"))
     return lb
 
 
@@ -106,7 +111,7 @@ def _field_row(label, widget, hint=""):
     r.addWidget(widget)
     if hint:
         h = QLabel(hint)
-        h.setStyleSheet("color:#8F959E; font-size:12px; background:transparent;")
+        h.setStyleSheet(tokenize("color:#8F959E; font-size:12px; background:transparent;"))
         r.addWidget(h)
     r.addStretch(1)
     return r
@@ -124,14 +129,14 @@ def _section_card(title, hint=""):
     head.setSpacing(8)
     bar = QLabel()
     bar.setFixedSize(3, 14)
-    bar.setStyleSheet("background:#3370FF; border-radius:2px;")
+    bar.setStyleSheet(tokenize("background:#3370FF; border-radius:2px;"))
     head.addWidget(bar, 0, Qt.AlignmentFlag.AlignVCenter)
     t = QLabel(title)
-    t.setStyleSheet("font-size:14px; font-weight:700; color:#1F2329; background:transparent;")
+    t.setStyleSheet(tokenize("font-size:14px; font-weight:700; color:#1F2329; background:transparent;"))
     head.addWidget(t)
     if hint:
         h = QLabel(hint)
-        h.setStyleSheet("font-size:12px; color:#8F959E; background:transparent;")
+        h.setStyleSheet(tokenize("font-size:12px; color:#8F959E; background:transparent;"))
         head.addWidget(h, 0, Qt.AlignmentFlag.AlignVCenter)
     head.addStretch(1)
     v.addLayout(head)
@@ -248,7 +253,7 @@ class SettingsPage(QWidget):
         kr.addWidget(self.tool_key)
         kr.addWidget(b_key_clear)
         h = QLabel("示例：F9 / Ctrl+Alt+1；同一键位只归最后一个工具")
-        h.setStyleSheet("color:#8F959E; font-size:12px; background:transparent;")
+        h.setStyleSheet(tokenize("color:#8F959E; font-size:12px; background:transparent;"))
         kr.addWidget(h)
         kr.addStretch(1)
         cv.addLayout(_field_row("工具", self.tool_combo))
@@ -276,7 +281,7 @@ class SettingsPage(QWidget):
         gr0.addWidget(self.ck_gesture)
         gr0.addWidget(b_g_clear)
         self.lbl_gesture = QLabel("未绑定的命令不会触发，右键照常弹菜单")
-        self.lbl_gesture.setStyleSheet("color:#8F959E; font-size:12px; background:transparent;")
+        self.lbl_gesture.setStyleSheet(tokenize("color:#8F959E; font-size:12px; background:transparent;"))
         gr0.addWidget(self.lbl_gesture, 1)
         cv.addLayout(gr0)
         for cid, label, tip in GESTURE_COMMANDS:
@@ -284,11 +289,11 @@ class SettingsPage(QWidget):
             rr.setSpacing(10)
             lb = QLabel(label)
             lb.setFixedWidth(170)
-            lb.setStyleSheet("color:#1F2329; background:transparent;")
+            lb.setStyleSheet(tokenize("color:#1F2329; background:transparent;"))
             lb.setToolTip(tip)
             val = QLabel("")
             val.setFixedWidth(110)
-            val.setStyleSheet("color:#3370FF; background:transparent;")
+            val.setStyleSheet(tokenize("color:#3370FF; background:transparent;"))
             b_rec = QPushButton("✏ 录制手势…")
             b_rec.setObjectName("GhostBtn")
             b_rec.clicked.connect(lambda _=False, c=cid: self._record_gesture(c))
@@ -320,6 +325,12 @@ class SettingsPage(QWidget):
         self.sec_tags = _ExpandSection("内容标签", self.editor_tags, icon="🏷")
         cv.addWidget(self.sec_tags)
         self._refresh_tags()
+
+        self.editor_blocks = BlockCategoryEditor()
+        self.editor_blocks.saved.connect(self._on_blocks_saved)
+        self.sec_blocks = _ExpandSection("素材类别", self.editor_blocks, icon="🎬")
+        cv.addWidget(self.sec_blocks)
+        self._refresh_blocks()
         lay.addWidget(card)
 
         # ---------- 输出目录：默认隐藏，Alt+W（Mac ⌘+W）口令解锁后才出现（不暴露入口） ----------
@@ -447,6 +458,19 @@ class SettingsPage(QWidget):
         if page is not None and hasattr(page, "refresh"):
             page.refresh()
 
+    # ---------- 素材板块类别（同样：展开编辑栏内保存即生效） ----------
+    def _refresh_blocks(self):
+        self.sec_blocks.set_summary("、".join(block_categories.load()))
+
+    def _on_blocks_saved(self):
+        self._refresh_blocks()
+        self.sec_blocks.collapse()
+        w = self.window()
+        page = getattr(w, "page_material", None)         # 素材库「类型」下拉同步新类别
+        if page is not None and hasattr(page, "rebuild_filters"):
+            page.rebuild_filters()
+            page._reload()
+
     # ---------- 视频预览框大小（存 ui_state，与播放器共享同一个键） ----------
     def _load_preview_scale(self):
         try:
@@ -510,9 +534,9 @@ class SettingsPage(QWidget):
                 bound += 1
             else:
                 val.setText("未绑定")
-                val.setStyleSheet("color:#8F959E; background:transparent;")
+                val.setStyleSheet(tokenize("color:#8F959E; background:transparent;"))
                 continue
-            val.setStyleSheet("color:#3370FF; background:transparent;")
+            val.setStyleSheet(tokenize("color:#3370FF; background:transparent;"))
         self.lbl_gesture.setText(
             f"已绑定 {bound} 条：软件内按住右键划出轨迹（形状相近即触发，不必划得一模一样）"
             if bound else "未绑定的命令不会触发，右键照常弹菜单")
@@ -583,13 +607,13 @@ class SettingsPage(QWidget):
 
     # ---------- 配置迁移 / 线路包下拉菜单（各将导出/导入合一） ----------
     def _build_pkg_menu(self):
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("📤 导出配置包", self._export_pkg)
         m.addAction("📥 一键导入配置", self._import_pkg)
         return m
 
     def _build_lines_menu(self):
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("🔗 导出线路小包", self._export_lines)
         m.addAction("📥 导入线路小包", self._import_lines)
         return m
@@ -653,9 +677,58 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "已保存", "设置已保存，重启软件后生效")
 
     # ================= 配置迁移（加密包） =================
+    def _pick_export_items(self, cp):
+        """导出前勾选要打包的部分：每个已登记条目一行复选框，默认全选。
+        返回选中的 id 列表；取消或未选返回 None（调用方据此中止）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择要导出的配置")
+        dlg.setMinimumWidth(420)
+        v = QVBoxLayout(dlg)
+        v.setSpacing(8)
+        tip = QLabel("勾选要打包进配置包的部分（默认全部）：\n"
+                     "含接口凭证与产品业务数据，只发给信得过的同事。")
+        tip.setObjectName("InlineTip")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+        boxes = []
+        for it in cp.ITEMS:
+            cb = QCheckBox(it.title)
+            cb.setChecked(True)
+            v.addWidget(cb)
+            boxes.append((it.id, cb))
+        quick = QHBoxLayout()
+        b_all = QPushButton("全选")
+        b_all.setObjectName("GhostBtn")
+        b_none = QPushButton("全不选")
+        b_none.setObjectName("GhostBtn")
+        b_all.clicked.connect(lambda: [cb.setChecked(True) for _, cb in boxes])
+        b_none.clicked.connect(lambda: [cb.setChecked(False) for _, cb in boxes])
+        quick.addWidget(b_all)
+        quick.addWidget(b_none)
+        quick.addStretch(1)
+        v.addLayout(quick)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("下一步：选保存位置")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if not dlg.exec():
+            return None
+        chosen = [iid for iid, cb in boxes if cb.isChecked()]
+        if not chosen:
+            QMessageBox.information(self, "提示", "没有勾选任何要导出的内容")
+            return None
+        return chosen
+
     def _export_pkg(self):
-        """全部配置加密成一个 .aigccfg 文件（口令内置，见 core/config_package.py）"""
+        """先勾选要导出的部分，再选保存位置，加密成一个 .aigccfg 文件
+        （口令内置，见 core/config_package.py）"""
         from core import config_package as cp
+        chosen = self._pick_export_items(cp)
+        if chosen is None:
+            return
         here = (QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.DesktopLocation) or str(Path.home()))
         default = str(Path(here) / f"AIGC配置_{time.strftime('%m%d')}{cp.SUFFIX}")
@@ -666,9 +739,13 @@ class SettingsPage(QWidget):
         if not path.endswith(cp.SUFFIX):
             path += cp.SUFFIX
         try:
-            info = cp.export_package(path)
+            info = cp.export_package(path, only_ids=chosen)
         except Exception as e:
             QMessageBox.warning(self, "导出失败", str(e))
+            return
+        if not info["items"]:
+            QMessageBox.warning(self, "导出失败",
+                                "勾选的部分本机没有可导出的内容（如本机还没有配置）")
             return
         QMessageBox.information(
             self, "已导出",

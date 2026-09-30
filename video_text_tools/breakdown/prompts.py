@@ -12,7 +12,7 @@ video_text_tools/breakdown/prompts.py —— 3 类提示词生成 + 整体分析
 import json
 import re
 
-from .models import SegmentPrompts, OverallAnalysis
+from .models import SegmentPrompts, OverallAnalysis, BlockSegment
 
 _JSON_RE = re.compile(r"[\{\[].*[\}\]]", re.S)
 
@@ -213,6 +213,101 @@ def build_prompts_and_analysis(frame_analyses, transcript, vision, log=None):
     segments = build_prompts(shots, vision, log=log)
     overall = build_analysis(shots, transcript_text, vision, log=log)
     return segments, overall
+
+
+# 板块类型白名单兜底（配置缺失时用）：与计划 A1 默认一致。
+BLOCKS_TYPES_DEFAULT = ["钩子", "痛点", "产品介绍", "权威背书", "使用场景", "行动号召"]
+
+_BLOCKS_HEADER = (
+    "你是短视频营销结构分析师。下面是一条带货短视频的分镜画面表与口播逐字稿。\n"
+    "请把它按「营销板块」切成连续的时间段，每段标注属于哪一类。\n"
+    "板块类型只能从这个白名单里选：{types}。\n"
+    "严格输出 JSON 数组，每项形如 "
+    '{{"type":"板块类型","start":起始秒,"end":结束秒,"summary":"一句话说明"}}，\n'
+    "要求：start/end 为秒且 0<=start<end、各段按时间先后不重叠、并覆盖全片；不要多余文字。\n\n"
+)
+
+
+def _coerce_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_blocks(raw, types, duration):
+    """模型回的板块列表 → 白名单过滤 + 时间钳位 + 去重叠，返回 [BlockSegment]。
+
+    逐条校验：type 不在白名单、时间非数字、钳入 [0,duration] 后 start>=end → 丢弃；
+    再按 start 升序，与上一段重叠（start < 上一段 end）的丢弃。全程绝不抛，给多少收多少。"""
+    if duration is None or duration <= 0:
+        return []
+    cand = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        t = str(item.get("type", "")).strip()
+        if t not in types:
+            continue
+        start, end = _coerce_num(item.get("start")), _coerce_num(item.get("end"))
+        if start is None or end is None:
+            continue
+        start = min(max(start, 0.0), duration)
+        end = min(max(end, 0.0), duration)
+        if start >= end:
+            continue
+        cand.append((start, end, t, str(item.get("summary", ""))))
+    cand.sort(key=lambda x: x[0])
+    out, last_end = [], 0.0
+    for start, end, t, summary in cand:
+        if start < last_end:          # 与已收段重叠 → 丢弃
+            continue
+        out.append(BlockSegment(index=len(out) + 1, type=t, start=start, end=end,
+                                summary=summary))
+        last_end = end
+    return out
+
+
+def build_blocks(shots, transcript_text, vision, types=None, log=None, duration=None):
+    """按营销板块切时间轴。返回 [BlockSegment]；解析/调用失败降级为单块「整片」，绝不静默。
+
+    types 为板块类型白名单（留空用 BLOCKS_TYPES_DEFAULT）；duration 缺省时从分镜表推算。
+    复用 _extract_json 与整体分析同款单次大请求；降级仍标 ok（板块是锦上添花，不拖累主链）。"""
+    types = [str(t).strip() for t in (types or BLOCKS_TYPES_DEFAULT) if str(t).strip()] \
+        or BLOCKS_TYPES_DEFAULT
+    if duration is None:
+        duration = max((s.get("end", 0) for s in (shots or [])), default=0.0)
+    duration = float(duration or 0)
+
+    def _whole(note):
+        blk = BlockSegment(index=1, type="整片", start=0.0, end=duration,
+                           summary=note) if duration > 0 else None
+        return ([blk], blk is not None) if blk else ([], False)
+
+    table = _shot_table(shots) if shots else "（无分镜画面）"
+    prompt = (_BLOCKS_HEADER.format(types="、".join(types)) +
+              f"【分镜】\n{table}\n\n【口播逐字稿】\n{transcript_text or '（无）'}")
+    if log:
+        log(f"  ⏳ 板块拆分：按 {'/'.join(types)} 切时间轴（单次请求，通常 1~2 分钟）…")
+    if duration <= 0:
+        if log:
+            log("  ⚠ 板块拆分跳过：未推算出视频时长")
+        return [], False
+    try:
+        data = _extract_json(vision.chat_text(prompt, temperature=0.4, max_tokens=3000))
+        if isinstance(data, dict):
+            data = data.get("blocks") or data.get("items") or []
+        blocks = _normalize_blocks(data, types, duration)
+        if not blocks:
+            raise ValueError("无有效板块")
+        if log:
+            log(f"  ✓ 板块拆分完成：{len(blocks)} 个板块")
+        return blocks, True
+    except Exception as e:
+        blocks, ok = _whole(f"板块拆分失败（{str(e)[:60]}），回退整片")
+        if log:
+            log(f"  ⚠ 板块拆分失败，已降级为整片单块：{e}")
+        return blocks, ok
 
 
 def rewrite_for_dedup(segments, vision, log=None):

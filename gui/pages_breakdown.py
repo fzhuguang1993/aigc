@@ -13,10 +13,12 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QScrollArea, QGridLayout,
-                               QSizePolicy, QMenu, QMessageBox, QFrame,
+                               QSizePolicy, QMessageBox, QFrame,
                                QDialog, QListWidget, QListWidgetItem)
 
 from gui.header import page_header, FS_BLUE, FS_SUB, FS_WEAK
+from gui.menus import StyledMenu
+from gui.theme import tokenize
 
 CARD_W = 184
 COVER_H = 328          # 手机竖屏比例（≈9:16）：封面不被裁成横条，一眼认出是哪个任务
@@ -54,8 +56,8 @@ class _TaskCard(QFrame):
         self.cover = QLabel()
         self.cover.setFixedSize(CARD_W, COVER_H)
         self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cover.setStyleSheet("background:#EDF0F5; color:#8F959E; font-size:22px;"
-                                 "border-top-left-radius:8px; border-top-right-radius:8px;")
+        self.cover.setStyleSheet(tokenize("background:#EDF0F5; color:#8F959E; font-size:22px;"
+                                 "border-top-left-radius:8px; border-top-right-radius:8px;"))
         self.cover.setText("🎬")
         v.addWidget(self.cover)
         r = row
@@ -95,7 +97,7 @@ class _TaskCard(QFrame):
         super().mouseReleaseEvent(e)
 
     def contextMenuEvent(self, e):
-        m = QMenu(self)
+        m = StyledMenu(self)
         m.addAction("🔎 打开详情", lambda: self._on_open(self.task_id))
         if self._on_tag:
             m.addAction("🏷 关联产品…", lambda: self._on_tag(self.task_id, self.row))

@@ -444,6 +444,17 @@ def audio_out_paths(out_path, audio):
             for spec in _normalize_audio_list(audio)]
 
 
+def _audio_input_args(spec):
+    """按音频规格给出 ffmpeg 采集「输入」参数（不含可执行文件与全局开关）。
+
+    ('system', None) = wasapi 环回录当前系统播放；其它 = dshow 指定设备名
+    （麦克风 ('mic', 名字) 或立体声混音 ('system', 名字)）。
+    录制命令与设备检测共用这一份，避免两条路的取源逻辑漂移。"""
+    if spec == ("system", None):
+        return ["-f", "wasapi_loopback", "-i", ""]
+    return ["-f", "dshow", "-i", f"audio={escape_dshow_name(spec[1])}"]
+
+
 def build_record_command(ffmpeg_path, mode, out_path, *,
                          fps=30, bitrate="4M",
                          physical=None, title=None,
@@ -496,14 +507,131 @@ def build_record_command(ffmpeg_path, mode, out_path, *,
     plans = [(cmd, out_path)]
     # 每个音源一条独立进程：dshow/wasapi 设备不同，可同时采集互不抢占
     for spec, wav in audio_out_paths(out_path, aspecs):
-        acmd = [ffmpeg_path, "-hide_banner", "-y"]
-        if spec == ("system", None):
-            acmd += ["-f", "wasapi_loopback", "-i", ""]
-        else:
-            acmd += ["-f", "dshow", "-i", f"audio={escape_dshow_name(spec[1])}"]
-        acmd += ["-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", wav]
+        acmd = [ffmpeg_path, "-hide_banner", "-y", *_audio_input_args(spec),
+                "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", wav]
         plans.append((acmd, wav))
     return plans
+
+
+def pick_system_audio(ffmpeg_path):
+    """自动挑一个能录系统内部声音的源（测试 Demo 用，不提供设备选择 UI）。
+
+    优先 wasapi 环回（若该 ffmpeg 支持），否则退到第一个「立体声混音」类
+    dshow 设备；都没有给 None（Demo 会只录画面，不算错误）。"""
+    if not ffmpeg_path:
+        return None
+    if has_wasapi_loopback(ffmpeg_path):
+        return ("system", None)
+    for n in list_audio_devices(ffmpeg_path):
+        if is_mix_device(n):
+            return ("system", n)
+    return None
+
+
+def build_av_record_command(ffmpeg_path, out_path, *, fps=30, bitrate="8M",
+                            audio=None, physical=None):
+    """极简录屏：全屏画面 +（可选）系统声音，混流成【单个】MP4（音画合一）。
+
+    与 build_record_command 的区别：那条把画面(-an)与每个音源拆成独立产物、
+    一个产物一个子进程；这里只拼一条命令、一个输出，交给 Recorder 直接跑，
+    用于「能不能把屏幕录下来」的测试 Demo。
+    audio：None = 只录画面；('system', None) = wasapi 环回；
+           ('system', 名字) = 立体声混音类 dshow 设备（用 pick_system_audio 挑）。
+    physical：多屏并集的物理包围盒 (x, y, w, h)，None = 只录主屏。
+    返回 (命令, 产物路径)。"""
+    cmd = [ffmpeg_path, "-hide_banner", "-y",
+           "-f", "gdigrab", "-framerate", str(int(fps))]
+    if physical:
+        x, y, w, h = physical
+        # 奇数宽高会让 yuv420p 报错，统一向下取偶（gdigrab 也要求偶数）
+        cmd += ["-offset_x", str(int(x)), "-offset_y", str(int(y)),
+                "-video_size", f"{int(w) & ~1}x{int(h) & ~1}"]
+    cmd += ["-i", "desktop"]
+    spec = _normalize_audio(audio)
+    if spec:
+        cmd += _audio_input_args(spec)
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(bitrate),
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-ac", "2", "-ar", "44100",
+                "-movflags", "+faststart", out_path]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(bitrate),
+                "-pix_fmt", "yuv420p", "-an",
+                "-movflags", "+faststart", out_path]
+    return cmd, out_path
+
+
+# ====================================================================
+# 设备检测（试录测峰值电平）
+# ====================================================================
+_VOL_MAX_RE = re.compile(r"max_volume:\s*(\S+)\s*dB")
+# volumedetect 对纯静音报 -inf/-91dB 一类；高于该阈值才算「收到了声音」
+SILENCE_DB = -60.0
+
+
+def parse_max_volume(text):
+    """从 volumedetect 输出里抠出峰值 dB；inf/nan 归一为 -200（数字静音），
+    解析不出给 None。"""
+    m = _VOL_MAX_RE.search(text or "")
+    if not m:
+        return None
+    tok = m.group(1).lower().lstrip("-+")
+    if tok in ("inf", "infinity", "nan"):
+        return -200.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _capture_error_hint(text):
+    """ffmpeg 打不开设备时的关键报错行（供检测失败提示），挑不到给空串。"""
+    keys = ("device not found", "cannot open", "can't open", "in use",
+            "occupied", "invalid", "no such", "failed", "error",
+            "正在使用", "无法", "找不到", "参数错误")
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if any(k in low for k in keys):
+            return line.split("]")[-1].strip() or line.strip()
+    return ""
+
+
+def probe_audio_level(ffmpeg_path, audio, seconds=2):
+    """试录指定音源若干秒，用 volumedetect 测峰值电平，判断能否真收到声音。
+
+    返回 (峰值 dB 或 None, 是否收到声音, 一句话说明)。全程不抛异常，
+    出问题时一律用 (None, False, 原因) 表达，界面直接展示。
+    audio 与录制同一套规格：('mic', 名字) / ('system', 名字) / ('system', None)。
+    原理：ffmpeg 采 seconds 秒到 null 输出，挂 volumedetect 滤镜，峰值
+    写在 stderr（max_volume: -xx.x dB）；纯静音会得到 -inf/-91dB 一类低值。"""
+    spec = _normalize_audio(audio)
+    if spec is None:
+        return (None, False, "先选一个设备")
+    if not ffmpeg_path:
+        return (None, False, "缺少 ffmpeg，无法检测")
+    if spec == ("system", None) and not has_wasapi_loopback(ffmpeg_path):
+        return (None, False, "当前 ffmpeg 无 WASAPI 环回，请改选立体声混音设备")
+    cmd = [ffmpeg_path, "-hide_banner", "-y", *_audio_input_args(spec),
+           "-t", str(int(seconds)), "-af", "volumedetect", "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           timeout=seconds + 15, creationflags=_devnull())
+    except subprocess.TimeoutExpired:
+        return (None, False, "检测超时：设备可能被其它程序占用")
+    except Exception as e:
+        return (None, False, f"检测失败：{e}")
+    text = (r.stderr or "") + "\n" + (r.stdout or "")
+    db = parse_max_volume(text)
+    if db is None:
+        return (None, False, _capture_error_hint(text) or "没测到电平，设备可能不可用")
+    ok = db > SILENCE_DB
+    kind = "内部声音" if spec[0] == "system" else "麦克风"
+    if ok:
+        return (db, True, f"✓ {kind}收到声音（峰值 {db:.0f} dB）")
+    hint = ("（立体声混音只能收到本声卡的播放：把默认播放切到它或换个设备）"
+            if spec[0] == "system" else "（对着设备说话/播放再测，或换个设备）")
+    return (db, False, f"✗ {kind}几乎没声音（峰值 {db:.0f} dB）{hint}")
 
 
 # ====================================================================

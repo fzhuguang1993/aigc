@@ -95,14 +95,92 @@ CREATE TABLE IF NOT EXISTS breakdown_tasks(
   cover TEXT DEFAULT '', gallery_dir TEXT DEFAULT '', report TEXT DEFAULT '',
   status TEXT DEFAULT 'ok',         -- ok=完整 partial=半成品
   payload TEXT DEFAULT '',          -- BreakdownResult.to_dict() 的 JSON
+  link_key TEXT DEFAULT '',         -- 规范化主链 sha1[:16]，同链接去重/断点命中用
   created_at TEXT DEFAULT '', updated_at TEXT DEFAULT ''
 );
+-- ⚠ link_key 的索引不在这里建：老库的 breakdown_tasks 没有 link_key 列，executescript
+-- 会在 ALTER 之前先跑这里的 CREATE INDEX 而整段报错；索引改由 _MIGRATIONS（ALTER 补列
+-- 之后）建，新库/老库都幂等安全。
 -- 拆解任务 ↔ 产品 多对多关联（不同产品打法不同，按产品沉淀爆款拆解样本）。
 -- 只存 id 引用，产品改名/删除不级联（关联自然失效，重开拆解不补）。
 CREATE TABLE IF NOT EXISTS breakdown_task_products(
   task_id INTEGER NOT NULL,
   product_id INTEGER NOT NULL,
   PRIMARY KEY(task_id, product_id)
+);
+-- 素材库索引：一条拆解的板块（或手动区间）ffmpeg 切出的片段，一行一个。
+-- path 存「存储侧绝对/可视路径」（本地即素材库根下真实路径）；backend 记录落盘后端
+-- （本轮恒 local，SMB/OSS 落地后据此区分）。block_type/product 供分组筛选。
+CREATE TABLE IF NOT EXISTS material_clips(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT DEFAULT '', backend TEXT DEFAULT 'local',
+  block_type TEXT DEFAULT '', product TEXT DEFAULT '',
+  source_task_id INTEGER DEFAULT 0,
+  start REAL DEFAULT 0, end REAL DEFAULT 0, duration REAL DEFAULT 0,
+  note TEXT DEFAULT '', created_at TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_material_block_type ON material_clips(block_type);
+CREATE INDEX IF NOT EXISTS idx_material_product ON material_clips(product);
+-- 成品库 ↔ 产品 手动绑定：成品库是「扫盘视图」（不建物理表，永远与磁盘一致），
+-- 但「右键绑定产品」这类人工归属必须落库。以归一化绝对路径为主键存一行，
+-- 优先级高于自动 join（runs/tasks 里带出的产品）；解绑即删行。
+-- product 冗余存名（产品改名/删除不级联，展示仍稳），product_id 仅作溯源快捷。
+CREATE TABLE IF NOT EXISTS output_binds(
+  path TEXT PRIMARY KEY,
+  product TEXT DEFAULT '', product_id INTEGER DEFAULT 0,
+  updated_at TEXT DEFAULT ''
+);
+-- 软件内回收站：成品「移入回收站」是把文件物理移到 scan_root 下的专用目录（不进系统回收站），
+-- 一行记一条回收站里的文件：path=当前在回收站目录的真实路径，origin_path=移入前的完整原路径
+-- （还原时移回 origin_path.parent，文件名撞车则重排）。彻底删除才真 unlink 并删这行。
+CREATE TABLE IF NOT EXISTS output_trash(
+  path TEXT PRIMARY KEY,
+  origin_path TEXT DEFAULT '',
+  name TEXT DEFAULT '',
+  size INTEGER DEFAULT 0,
+  trashed_at TEXT DEFAULT ''
+);
+-- 成品外显名称（别名）：卡片底部默认显示「文件名去后缀」，可批量自定义；只存这一层显示用的名字，
+-- 绝不碰物理文件名。以归一化绝对路径为主键（与绑定/标记同口径，改名/还原随路径迁移）。
+CREATE TABLE IF NOT EXISTS output_display(
+  path TEXT PRIMARY KEY,
+  display TEXT DEFAULT '',
+  updated_at TEXT DEFAULT ''
+);
+-- 批量基建（抖音本地推搭计划）执行历史：一次「方案 × 账户」的搭建结果存一行。
+-- 只存回执与原因，真实创建结果以平台为准；CREATE TABLE IF NOT EXISTS 对新老库
+-- 都幂等，不进 _MIGRATIONS。
+CREATE TABLE IF NOT EXISTS local_build_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform TEXT DEFAULT '', account TEXT DEFAULT '', advertiser_id TEXT DEFAULT '',
+  plan_name TEXT DEFAULT '', ok INTEGER DEFAULT 0,
+  project_id TEXT DEFAULT '', marketing_id TEXT DEFAULT '', asset_count INTEGER DEFAULT 0,
+  message TEXT DEFAULT '', created_at TEXT DEFAULT '',
+  customer_id INTEGER DEFAULT 0, license_id INTEGER DEFAULT 0, account_id INTEGER DEFAULT 0
+);
+-- 批量基建·三级组织：客户 → 执照/主体 → 本地推账户（严格树，一个账户只归一个执照）。
+-- 每层都带 owner（负责成员名，对齐 org_store 的「成员名」值域）：账户为空则就近继承
+-- 执照、再继承客户，实现「层级授权 + 逐个授权」混合。owner 空且 org 启用＝仅 admin 可见。
+-- 凭证沿用 config 的 encrypt_value(盐=USER_NAME) 存 secret_enc，盘上不留明文。
+CREATE TABLE IF NOT EXISTS local_customers(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL, owner TEXT DEFAULT '', remark TEXT DEFAULT '',
+  created_at TEXT DEFAULT '', updated_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS local_licenses(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER DEFAULT 0, name TEXT NOT NULL,
+  subject TEXT DEFAULT '',      -- 营业执照主体名/统一社会信用代码
+  owner TEXT DEFAULT '', remark TEXT DEFAULT '',
+  created_at TEXT DEFAULT '', updated_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS local_ad_accounts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  license_id INTEGER DEFAULT 0,
+  platform TEXT DEFAULT 'douyin', label TEXT DEFAULT '',
+  advertiser_id TEXT DEFAULT '', auth_type TEXT DEFAULT 'oauth',
+  secret_enc TEXT DEFAULT '', owner TEXT DEFAULT '', extra TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT '', updated_at TEXT DEFAULT ''
 );
 """
 
@@ -128,6 +206,17 @@ _MIGRATIONS = (
     # 演示数据标记：打包给新用户播种的看板样例任务 demo=1，真实任务恒为 0；
     # 「清除演示数据」只删除 demo=1 的行，绝不碰真实数据。
     "ALTER TABLE tasks ADD COLUMN demo INTEGER DEFAULT 0",
+    # 爆款拆解按链接去重：老库补 link_key 列 + 索引（重复执行安全）。
+    "ALTER TABLE breakdown_tasks ADD COLUMN link_key TEXT DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_breakdown_link_key ON breakdown_tasks(link_key)",
+    # 素材库片段索引表（新库 _SCHEMA 已建；老库补建，CREATE TABLE IF NOT EXISTS 幂等）。
+    "CREATE INDEX IF NOT EXISTS idx_material_block_type ON material_clips(block_type)",
+    "CREATE INDEX IF NOT EXISTS idx_material_product ON material_clips(product)",
+    # 批量基建三级组织：老库的 local_build_runs 补三个组织维度列（新库 _SCHEMA 已带，
+    # ALTER 重复执行安全）；三张组织表 CREATE TABLE IF NOT EXISTS 在 _SCHEMA 里幂等建。
+    "ALTER TABLE local_build_runs ADD COLUMN customer_id INTEGER DEFAULT 0",
+    "ALTER TABLE local_build_runs ADD COLUMN license_id INTEGER DEFAULT 0",
+    "ALTER TABLE local_build_runs ADD COLUMN account_id INTEGER DEFAULT 0",
 )
 
 
