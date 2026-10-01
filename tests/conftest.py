@@ -40,6 +40,7 @@ def _clean_state():
         db.execute("DELETE FROM tasks")
         db.execute("DELETE FROM runs")
         db.execute("DELETE FROM file_marks")
+        db.execute("DELETE FROM material_clips")
         # 组织表与会话也归零：org 用例哪怕中途崩，也不能把成员泄给后续用例
         # （残留成员会让 org_enabled() 变 True，改变所有被过滤查询的口径）
         db.execute("DELETE FROM org_members")

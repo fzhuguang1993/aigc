@@ -11,7 +11,7 @@ CompactCalendar）、浮动气泡滑块 KitSlider、可自由拉伸多行文本 
 """
 from PySide6.QtCore import (Qt, QDate, QTimer, QPoint, QRect, QSize, QEvent,
                             QRectF, QPointF, Property, QPropertyAnimation,
-                            QEasingCurve, QSortFilterProxyModel, QObject)
+                            QEasingCurve, QSortFilterProxyModel, QObject, Signal)
 from PySide6.QtGui import (QColor, QCursor, QPainter, QPen, QBrush,
                            QPainterPath, QFont, QPolygonF, QLinearGradient,
                            QStandardItemModel, QStandardItem, QKeySequence)
@@ -850,7 +850,12 @@ class _DateRangePopup(_RoundPopup):
 
 class DateRangePicker(QPushButton):
     """字段式按钮：点开日历浮层选一段日期区间（近 N 天是一个范围）。单选日期
-    用不带快捷的 ModernDateEdit；要区间就用这颗。"""
+    用不带快捷的 ModernDateEdit；要区间就用这颗。
+
+    set_range 回填时发 changed 信号（日历弹层提交 / 外部设值都会触发），
+    并用 get_range() 取当前 (start, end)——给需要“选完即时过滤”的业务页用。"""
+
+    changed = Signal()
 
     def __init__(self, start=None, end=None, parent=None):
         super().__init__(parent)
@@ -873,6 +878,11 @@ class DateRangePicker(QPushButton):
     def set_range(self, s, e):
         self._start, self._end = (s, e) if s <= e else (e, s)
         self._sync()
+        self.changed.emit()
+
+    def get_range(self):
+        """当前选定的 (起始 QDate, 结束 QDate)。"""
+        return self._start, self._end
 
     def _sync(self):
         n = self._start.daysTo(self._end) + 1

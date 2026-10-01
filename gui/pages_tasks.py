@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QCursor, QGuiApplication, QShortcut, QKeySeque
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
                                QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
                                QMessageBox, QFileDialog, QAbstractItemView,
-                               QLineEdit, QDateEdit, QCheckBox, QInputDialog, QFrame,
+                               QLineEdit, QCheckBox, QInputDialog, QFrame,
                                QDialog, QDialogButtonBox, QFormLayout,
                                QGroupBox, QGraphicsOpacityEffect,
                                QListWidget, QListWidgetItem, QScrollArea)
@@ -34,7 +34,7 @@ from gui.header import page_header, Card, kpi_row
 from gui.menus import StyledMenu
 from gui.tablekit import (FieldManagerDialog, apply_field_layout,
                           enable_drag_with_lock, SecsItem)
-from gui.kit import TableColumnKit
+from gui.kit import TableColumnKit, DateRangePicker
 from gui.theme import tokenize
 
 STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
@@ -346,18 +346,12 @@ class FilterPanel(QWidget):
         gb.toggled.connect(self._on_changed)
         gv = QVBoxLayout(gb)
         gv.setContentsMargins(8, 4, 8, 8)
-        r = QHBoxLayout()
-        self.de_start = QDateEdit(QDate.currentDate().addDays(-7))
-        self.de_end = QDateEdit(QDate.currentDate())
-        for de in (self.de_start, self.de_end):
-            de.setCalendarPopup(True)
-            de.setDisplayFormat("yyyy-MM-dd")
-            de.dateChanged.connect(self._on_changed)
-        r.addWidget(self.de_start)
-        r.addWidget(QLabel("至"))
-        r.addWidget(self.de_end)
-        r.addStretch(1)
-        gv.addLayout(r)
+        # 统一用组件库里的日期区间选择器（一颗按钮弹日历、带近 N 天快捷），
+        # 不再摆两个裸 QDateEdit——与全站其它日期区间口径一致
+        self.dr_date = DateRangePicker()
+        self.dr_date.changed.connect(self._on_changed)
+        gv.addWidget(self.dr_date)
+        gv.addStretch(1)
         return gb
 
     def reload(self):
@@ -391,8 +385,8 @@ class FilterPanel(QWidget):
                 chips.append(b)
             self._chips[key] = chips
         self.gb_date.setChecked(f["date_on"])
-        for de, k in ((self.de_start, "date_start"), (self.de_end, "date_end")):
-            de.setDate(QDate.fromString(f[k], "yyyy-MM-dd"))
+        self.dr_date.set_range(QDate.fromString(f["date_start"], "yyyy-MM-dd"),
+                               QDate.fromString(f["date_end"], "yyyy-MM-dd"))
         self._syncing = False
         # 勾过的值可能已不在候选里（产品被删等）：回推一次，让失效条件静默退场
         self._push()
@@ -416,8 +410,9 @@ class FilterPanel(QWidget):
         f = {k: {b.text() for b in chips if b.isChecked()}
              for k, chips in self._chips.items()}
         f["date_on"] = self.gb_date.isChecked()
-        f["date_start"] = self.de_start.date().toString("yyyy-MM-dd")
-        f["date_end"] = self.de_end.date().toString("yyyy-MM-dd")
+        s, e = self.dr_date.get_range()
+        f["date_start"] = s.toString("yyyy-MM-dd")
+        f["date_end"] = e.toString("yyyy-MM-dd")
         return f
 
     def _on_changed(self, *_a):
@@ -1992,29 +1987,41 @@ class TasksPage(QWidget):
             self.lbl_tip.setText(msg)
 
     def _archive(self):
-        """批量归档：把生成文件夹里散着的成品按【日期/产品/标签】归进子文件夹。
+        """批量归档：把审片标了【可用】的成品搬进【成品库 / 素材库】。
 
-        先算清单给一眼预览（按产品/标签汇总条数），确认后才真搬；
-        搬完同步库里的输出路径与审片标记（见 processors.archiver）。"""
+        先算清单（只收可用、且还在生成目录里没进过库的那些），弹目的地二选一，
+        再按【产品 / 标签】两级子文件夹落进所选库；搬完同步输出路径与审片标记，
+        归档进素材库的额外登记一行 material_clips（见 processors.archiver）。"""
         items = archiver.plan()
         if not items:
             QMessageBox.information(
-                self, "没有需要归档的成品",
-                "生成文件夹里已经是【日期/产品/标签】结构，\n"
-                "或库里没有可定位的成品文件（同事手工放进目录的视频不在归档范围）。")
+                self, "没有可归档的成品",
+                "归档只收【标了「可用」】且还在生成目录里的成品。\n"
+                "请先在任务列表把满意的作品标「👍 可用」，或这些可用成品已进过库。")
             return
+        # 目的地二选一：成品库（可直接发布）/ 素材库（混剪取料的片段）
+        dest, ok = QInputDialog.getItem(
+            self, "归档目的地",
+            f"将把 {len(items)} 个【可用】成品归档到哪个库？\n"
+            "（按 产品 / 标签 两级子文件夹归类）",
+            [archiver.DEST_LABEL[archiver.DEST_OUTPUT],
+             archiver.DEST_LABEL[archiver.DEST_MATERIAL]], 0, False)
+        if not ok:
+            return
+        dest_key = (archiver.DEST_MATERIAL if dest == archiver.DEST_LABEL[archiver.DEST_MATERIAL]
+                    else archiver.DEST_OUTPUT)
         summ = archiver.summary(items)
         lines = "\n".join(f"　{p} ／ {t}：{n} 条" for p, t, n in summ[:12])
         if len(summ) > 12:
             lines += f"\n　…… 另外 {len(summ) - 12} 组"
         if QMessageBox.question(
                 self, "批量归档",
-                f"将把 {len(items)} 个成品按【日期 / 产品 / 标签】归进子文件夹：\n"
+                f"将把 {len(items)} 个【可用】成品归档到【{dest}】，按【产品 / 标签】分子文件夹：\n"
                 f"{lines}\n\n只搬位置、不改文件名；任务输出路径与审片标记会同步更新。\n"
                 "确定归档？") != QMessageBox.StandardButton.Yes:
             return
-        st = archiver.run(items)
-        msg = f"📦 已归档 {len(st['moved'])} 个成品到 日期/产品/标签 子文件夹"
+        st = archiver.run(items, dest=dest_key)
+        msg = f"📦 已归档 {len(st['moved'])} 个可用成品到【{dest} / 产品 / 标签】"
         if st["failed"]:
             msg += f"；{len(st['failed'])} 个失败：{st['failed'][0][1]}"
             QMessageBox.warning(self, "部分归档失败", msg)

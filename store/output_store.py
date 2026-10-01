@@ -50,12 +50,13 @@ def output_root():
 
 
 def scan_root():
-    """成品库扫描根：以 DOWNLOAD_DIR 为准（生成产物落点，含其子目录成品库）。"""
-    try:
-        from core.config import DOWNLOAD_DIR
-        return Path(DOWNLOAD_DIR)
-    except Exception:
-        return output_root()
+    """成品库扫描根：只扫「成品库」目录（storage.output_root）。
+
+    不再扫整个 DOWNLOAD_DIR——否则新生成在 outputs/日期/、归档进素材库的
+    成品会被一锅端进成品库页。成品库 = 只展示已经「批量归档进成品库」的那些；
+    任务刚出的片留在 outputs/日期/，经任务中心审片标可用后归档进来才看得到。
+    """
+    return output_root()
 
 
 def _meta_maps():
