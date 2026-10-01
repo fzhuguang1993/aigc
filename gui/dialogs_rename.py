@@ -116,10 +116,10 @@ class _FieldChip(QFrame):
         press = rgba(accent, 0.38)
         line = rgba(accent, 0.45)
         ink = COLORS["text"]
-        if self.role == "pool":   # 字段池：虚线描边，暗示「可点击/拖拽加入」
+        if self.role == "pool":   # 字段池：实线描边，与 UI 组件库「扁平款胶囊」一致
             self.setStyleSheet(
-                f"#RenChipPool{{background:{soft}; border:1px dashed {line}; border-radius:14px;}}"
-                f"#RenChipPool:hover{{background:{hover}; border:1px dashed {accent};}}"
+                f"#RenChipPool{{background:{soft}; border:1px solid {line}; border-radius:14px;}}"
+                f"#RenChipPool:hover{{background:{hover}; border:1px solid {accent};}}"
                 f"#RenChipPool:pressed{{background:{press};}}"
                 f"#RenChipPool #RenChipText{{color:{ink};}}")
         else:                     # 命名顺序：实线描边，暗示「已选中、可拖排」
