@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QAbstractItemView, QMessageBox, QInputDialog)
 
 from gui.header import page_header
+from gui.kit import TableColumnKit
 from gui.window_frame import apply_rounded
 from store import org_store
 
@@ -134,6 +135,7 @@ class OrgPage(QWidget):
 
         self.tbl_mem = QTableWidget(0, len(_COLS))
         self.tbl_mem.setHorizontalHeaderLabels(_COLS)
+        TableColumnKit(self.tbl_mem)    # 统一列交互：表头右键靠左/中/右/换行
         self.tbl_mem.verticalHeader().setVisible(False)
         self.tbl_mem.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -331,6 +333,7 @@ class OrgPage(QWidget):
         v.addWidget(t)
         self.tbl_line = QTableWidget(0, 2)
         self.tbl_line.setHorizontalHeaderLabels(("线路", "归属成员"))
+        TableColumnKit(self.tbl_line)   # 统一列交互：表头右键靠左/中/右/换行
         self.tbl_line.verticalHeader().setVisible(False)
         self.tbl_line.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)

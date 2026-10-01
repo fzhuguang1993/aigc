@@ -38,6 +38,7 @@ from store import app_state, task_store
 from gui.formatting import secs
 from gui.header import page_header, Card, KpiCard
 from gui.widgets import LoadingOverlay
+from gui.kit import TableColumnKit
 from gui.window_frame import apply_rounded
 from gui.menus import StyledMenu
 from gui import ui_kit
@@ -917,6 +918,7 @@ class DetailDialog(QDialog):
         self.lbl.setObjectName("DialogTitle")
         lay.addWidget(self.lbl)
         self.table = QTableWidget(0, 0)
+        TableColumnKit(self.table)          # 统一列交互：表头右键靠左/中/右/换行
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(
@@ -1284,6 +1286,7 @@ class WidgetPanel(QFrame):
             t = QTableWidget(0, 3)
             t.setHorizontalHeaderLabels(
                 [_DIM_CN.get(dim, dim), self._mlab, "执行次数"])
+            TableColumnKit(t)               # 统一列交互：表头右键靠左/中/右/换行
             t.setAlternatingRowColors(True)
             t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             t.setSelectionBehavior(

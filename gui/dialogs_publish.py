@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
 
 from gui.header import page_header
 from gui.tool_panels import BasePanel, ToolWorker, FileListWidget, VIDEO_EXT
+from gui.kit import TableColumnKit
 
 
 def _split_tags(s):
@@ -221,6 +222,7 @@ class PublishPanel(BasePanel):
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["选", "平台", "别名", "鉴权", "登录态"])
+        TableColumnKit(self.table)      # 统一列交互：表头右键靠左/中/右/换行
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)

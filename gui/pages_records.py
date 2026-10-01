@@ -2,11 +2,11 @@
 gui/pages_records.py —— 执行记录 + 实时日志
 勾选框列 · 字段管理（显示/隐藏 + 拖拽排序）· 列排序 · 搜索 · 日期筛选 · 导出选中
 """
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QDate
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QTableWidget, QTableWidgetItem, QHeaderView,
-                               QPlainTextEdit, QMessageBox, QLineEdit, QDateEdit,
+                               QPlainTextEdit, QMessageBox, QLineEdit,
                                QCheckBox, QAbstractItemView, QDialog)
 
 from store import task_store
@@ -16,7 +16,7 @@ from gui.header import page_header, Card
 from gui.widgets import LoadingOverlay
 from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
                           SecsItem)
-from gui.kit import TableColumnKit
+from gui.kit import TableColumnKit, DateRangePicker
 
 DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间",
                 "总用时", "生成", "排队", "输出文件", "错误信息"]
@@ -71,16 +71,13 @@ class RecordsPage(QWidget):
         self.cb_date = QCheckBox("按日期筛选")
         self.cb_date.toggled.connect(self._toggle_date_filter)
         fbar.addWidget(self.cb_date)
-        self.de_start = QDateEdit()
-        self.de_end = QDateEdit()
-        for de in (self.de_start, self.de_end):
-            de.setCalendarPopup(True)
-            de.setDisplayFormat("yyyy-MM-dd")
-            de.setEnabled(False)
-            de.dateChanged.connect(self.refresh)
-        fbar.addWidget(self.de_start)
-        fbar.addWidget(QLabel("至"))
-        fbar.addWidget(self.de_end)
+        # 统一用组件库里的日期区间选择器（一颗按钮弹日历），与任务中心同口径，
+        # 不再摆两个裸 QDateEdit；默认最近 7 天，勾选后启用。
+        self.dr_date = DateRangePicker(QDate.currentDate().addDays(-7),
+                                       QDate.currentDate())
+        self.dr_date.setEnabled(False)
+        self.dr_date.changed.connect(self.refresh)
+        fbar.addWidget(self.dr_date)
         b_clear = QPushButton("✕ 清除筛选")
         b_clear.setObjectName("GhostBtn")
         b_clear.clicked.connect(self._clear_filters)
@@ -150,8 +147,7 @@ class RecordsPage(QWidget):
 
     # ---------- 筛选 ----------
     def _toggle_date_filter(self, on):
-        self.de_start.setEnabled(on)
-        self.de_end.setEnabled(on)
+        self.dr_date.setEnabled(on)
         self.refresh()
 
     def _clear_filters(self):
@@ -168,20 +164,12 @@ class RecordsPage(QWidget):
                 return False
         if self.cb_date.isChecked():
             d = (r["started_at"] or "")[:10]
-            s = self.de_start.date().toString("yyyy-MM-dd")
-            e = self.de_end.date().toString("yyyy-MM-dd")
-            if not (s <= d <= e):
+            s, e = self.dr_date.get_range()
+            if not (s.toString("yyyy-MM-dd") <= d <= e.toString("yyyy-MM-dd")):
                 return False
         return True
 
     def refresh(self):
-        # 首次可用时把日期控件默认设为最近7天
-        if not self.de_start.property("_init"):
-            from PySide6.QtCore import QDate
-            self.de_start.setDate(QDate.currentDate().addDays(-7))
-            self.de_end.setDate(QDate.currentDate())
-            self.de_start.setProperty("_init", True)
-
         rows = task_store.list_runs()
         header = self.table.horizontalHeader()
         sort_col, sort_order = header.sortIndicatorSection(), header.sortIndicatorOrder()

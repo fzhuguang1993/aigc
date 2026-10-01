@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from store import app_state
 from gui.header import page_header
 from gui.tablekit import FieldManagerDialog, apply_field_layout
+from gui.kit import TableColumnKit
 from gui.tool_panels import ToolWorker
 from gui.dialogs_build import LocalAccountDialog, PlanDialog, _split_list  # noqa: F401
 from gui.theme import tokenize
@@ -276,6 +277,7 @@ class LocalBuildPage(QWidget):
         num_cols：按数值大小排序的计数列（避免 10 排到 9 前）。"""
         tb = QTableWidget(0, len(cols))
         tb.setHorizontalHeaderLabels(cols)
+        TableColumnKit(tb)              # 统一列交互：表头右键靠左/中/右/换行
         tb.setAlternatingRowColors(True)          # 斑马纹（对齐任务中心）
         tb.verticalHeader().setVisible(False)
         tb.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -784,6 +786,7 @@ class LocalBuildPage(QWidget):
         self.tbl_bacct = QTableWidget(0, 5)
         self.tbl_bacct.setHorizontalHeaderLabels(
             ["选", "别名", "归属（客户›执照）", "账户ID", "授权状态"])
+        TableColumnKit(self.tbl_bacct)  # 统一列交互：表头右键靠左/中/右/换行
         self.tbl_bacct.verticalHeader().setVisible(False)
         self.tbl_bacct.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_bacct.horizontalHeader().setSectionResizeMode(
@@ -805,6 +808,7 @@ class LocalBuildPage(QWidget):
         v.addLayout(bar2)
         self.tbl_plan = QTableWidget(0, 5)
         self.tbl_plan.setHorizontalHeaderLabels(["选", "方案名", "推广类型", "日预算", "素材"])
+        TableColumnKit(self.tbl_plan)   # 统一列交互：表头右键靠左/中/右/换行
         self.tbl_plan.verticalHeader().setVisible(False)
         self.tbl_plan.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_plan.horizontalHeader().setSectionResizeMode(

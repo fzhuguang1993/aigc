@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 
 from gui.header import page_header, LightDot, LIGHT_KIND_COLOR, FS_WEAK, Card
 from gui.theme import tokenize
+from gui.kit import TableColumnKit
 
 SRV_HEADERS = ["线路", "状态", "并发上限", "负载(实时)"]
 LIST_HEADERS = ["线路", "状态", "本机在跑", "并发上限", "空余", "连续失败", "云端负载"]
@@ -344,6 +345,7 @@ class ConsolePage(QWidget):
         # 列里没有接口地址（商业版红线），状态用四档圆点+文字+语义色。
         self.list_table = QTableWidget(0, len(LIST_HEADERS))
         self.list_table.setHorizontalHeaderLabels(LIST_HEADERS)
+        TableColumnKit(self.list_table)   # 统一列交互：表头右键靠左/中/右/换行
         self.list_table.setAlternatingRowColors(True)
         self.list_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.list_table.verticalHeader().setVisible(False)
@@ -375,6 +377,7 @@ class ConsolePage(QWidget):
             srv_card.v.addWidget(QLabel("云端线路池（由网关统一调度，仅展示）："))
             self.srv_table = QTableWidget(0, len(SRV_HEADERS))
             self.srv_table.setHorizontalHeaderLabels(SRV_HEADERS)
+            TableColumnKit(self.srv_table)   # 统一列交互：表头右键靠左/中/右/换行
             self.srv_table.setAlternatingRowColors(True)
             self.srv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self.srv_table.verticalHeader().setVisible(False)

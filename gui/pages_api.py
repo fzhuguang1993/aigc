@@ -26,6 +26,7 @@ from core.config import CONFIG_JSON, ACCOUNTS, TRANSLATE
 from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header, Card
+from gui.kit import TableColumnKit
 from utils.desktop_utils import open_path
 from gui.theme import tokenize
 
@@ -177,6 +178,7 @@ class ApiManagerPage(QWidget):
                              "单条线路，要一次对比几条就用下方「🌐 打开选中」）："))
         self.acc_table = QTableWidget(0, 4)
         self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数", "打开"])
+        TableColumnKit(self.acc_table)     # 统一列交互：表头右键靠左/中/右/换行
         self.acc_table.horizontalHeader().setSectionResizeMode(COL_BASE,
                                                                QHeaderView.ResizeMode.Stretch)
         self.acc_table.setColumnWidth(COL_NAME, 110)
