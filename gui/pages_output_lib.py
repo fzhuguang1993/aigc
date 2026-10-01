@@ -19,7 +19,7 @@ from PySide6.QtGui import QPixmap, QColor, QPainter, QFont, QFontMetrics
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QComboBox, QLineEdit, QScrollArea, QGridLayout,
                                QSizePolicy, QMessageBox, QFrame, QDialog,
-                               QListWidget, QListWidgetItem, QAbstractItemView, QCheckBox,
+                               QCheckBox,
                                QRubberBand, QInputDialog)
 
 from store import output_store
@@ -28,6 +28,7 @@ from gui.header import page_header
 from gui.menus import StyledMenu
 from gui.widgets import VideoPlayerDialog
 from gui.theme import tokenize
+from gui.dialogs_product import pick_product
 
 _AUTO_SEC = 6.0      # 定时刷新最小间隔（整目录扫描不便宜，别 2 秒刷一次）
 CARD_W = 200
@@ -595,7 +596,7 @@ class OutputLibPage(QWidget):
 
     def _bind_product(self, rows):
         """右键「绑定产品」：选一个产品人工归属（优先于自动 join）。"""
-        picked = _pick_product(self)
+        picked = pick_product(self)
         if picked is None:
             return
         pid, name = picked
@@ -1021,42 +1022,3 @@ class OutputLibPage(QWidget):
         self._show_physical = False
         self._reload(force=True)
 
-
-def _pick_product(parent):
-    """产品单选框：返回 (id, name)，取消返回 None。人工绑定成品归属用。"""
-    from store import product_store
-    items = product_store.list_products(product_store.TYPE_PRODUCT)
-    dlg = QDialog(parent)
-    dlg.setWindowTitle("绑定产品")
-    dlg.resize(320, 420)
-    v = QVBoxLayout(dlg)
-    tip = QLabel("选择这条成品归属的产品（人工绑定优先于系统自动识别）：")
-    tip.setWordWrap(True)
-    v.addWidget(tip)
-    lst = QListWidget()
-    lst.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-    for it in items:
-        row = QListWidgetItem(it["name"])
-        row.setData(Qt.ItemDataRole.UserRole, int(it["id"]))
-        lst.addItem(row)
-    if not items:
-        lst.addItem("（产品中心还没有产品，请先到「产品中心」新增）")
-    v.addWidget(lst, 1)
-    bb = QHBoxLayout()
-    bb.addStretch(1)
-    b_ok = QPushButton("绑定")
-    b_ok.setDefault(True)
-    b_ok.clicked.connect(dlg.accept)
-    b_no = QPushButton("取消")
-    b_no.setObjectName("GhostBtn")
-    b_no.clicked.connect(dlg.reject)
-    bb.addWidget(b_ok)
-    bb.addWidget(b_no)
-    v.addLayout(bb)
-    lst.itemDoubleClicked.connect(lambda _=None, d=dlg: d.accept())
-    if dlg.exec() != QDialog.DialogCode.Accepted:
-        return None
-    cur = lst.currentItem()
-    if cur is None or cur.data(Qt.ItemDataRole.UserRole) is None:
-        return None
-    return int(cur.data(Qt.ItemDataRole.UserRole)), cur.text()

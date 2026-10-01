@@ -35,7 +35,7 @@ from gui.dialogs_blocks import BlockCategoryEditor
 from gui.maintainer import Gate, app_has_unlocked
 from gui.mouse_gesture import (GESTURE_COMMANDS, COMMAND_LABELS,
                               gesture_display, shape_distance, SHAPE_MAX_DIST)
-from gui.pages_tools import TOOLS
+from gui.tools_registry import TOOLS, set_tool_shortcut
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, PANEL_FACTORIES
 from gui.widgets import VideoPlayerDialog
 from gui.menus import StyledMenu
@@ -141,24 +141,6 @@ def _section_card(title, hint=""):
     head.addStretch(1)
     v.addLayout(head)
     return card, v
-
-
-def set_tool_shortcut(name, seq):
-    """写 app_state 并让主窗口重注册（设置页与工具卡片右键共用）；返回生效值"""
-    seq = (seq or "").strip()
-    seqs = dict(app_state.get("tool_shortcuts") or {})
-    if seq:
-        # 一键一工具：同键其他工具让位，避免一个键弹两个窗口
-        for k in [k for k, v in seqs.items() if v == seq and k != name]:
-            seqs.pop(k)
-        seqs[name] = seq
-    else:
-        seqs.pop(name, None)
-    app_state.set_value("tool_shortcuts", seqs)
-    w = QApplication.instance().activeWindow()
-    if hasattr(w, "apply_tool_shortcuts"):
-        w.apply_tool_shortcuts()
-    return seq
 
 
 class SettingsPage(QWidget):

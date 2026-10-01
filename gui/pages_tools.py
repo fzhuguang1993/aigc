@@ -3,8 +3,9 @@ gui/pages_tools.py —— 工具中心
 小工具以卡片形式上架：点击「✓ 可用」卡片弹出工具窗口（非模态，可同时开多个）。
 新增工具两步：
   1. 在 gui/tool_panels.py 的 PANEL_FACTORIES 里登记 factory；
-  2. 在下方 TOOLS 里加一条卡片信息（factory 传 None 显示为「规划中」）。
+  2. 在 gui/tools_registry.py 的 TOOLS 里加一条卡片信息（factory 传 None 显示为「规划中」）。
 功能逻辑一律放 video_text_tools 包（纯功能、无 UI），本层只做界面。
+登记表 / 固定项 / 快捷键读写都在 tools_registry（与设置页共用、不成环）。
 """
 from PySide6.QtCore import Qt, QTimer, QPoint, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QKeySequence
@@ -17,45 +18,11 @@ from gui.header import page_header
 from gui.tool_panels import PANEL_FACTORIES
 from gui.window_frame import apply_rounded
 from gui.menus import StyledMenu
+from gui.tools_registry import TOOLS, load_pinned, set_pinned, set_tool_shortcut
 from store import app_state
 from gui.theme import tokenize
 
-# 工具登记表：名称 / 图标 / 简介 / factory 名（None = 规划中）
-TOOLS = [
-    ("视频水印", "💧", "批量打静态/碰撞反弹水印，或统一格式化压制分辨率码率", "视频水印"),
-    ("批量改名", "🏷", "数字/字母/罗马/希腊编号规则批量重命名，先预览再执行", "批量改名"),
-    ("封面提取", "🖼", "查看视频参数（ffprobe），抽取指定帧生成封面图", "封面提取"),
-    ("批量粘贴录入", "⌨", "剪贴板多行文本逐行自动粘贴（需辅助功能授权）", "批量粘贴录入"),
-    ("SMB 上传", "📤", "成品视频批量上传到公司共享盘（需配置服务器账号）", "SMB 上传"),
-    ("视频溯源", "🔎", "溯源码池取码、按规则重命名并入库（需内网 MySQL）", "视频溯源"),
-    ("素材提取", "🧲", "粘贴唞喑/筷手分享链接：提取去水印视频、图集、文案", "素材提取"),
-    ("屏幕录制", "🎥", "全屏/框选区域/指定窗口录制，选帧率码率保存 MP4", "屏幕录制"),
-    ("录屏测试Demo", "🎬", "极简：一键录全屏，可选系统声音与画面混成单个 MP4（测试用）", "录屏测试Demo"),
-    ("语音识别", "🎙", "选视频→Whisper 转口播逐字稿，导出 TXT/SRT 字幕、DeepSeek 纠错、可烧录", "语音识别"),
-    ("爆款拆解", "🔥", "粘贴爆款链接：拆分镜/口播，产出画面/文案/复刻 3 类提示词与整体分析", "爆款拆解"),
-    ("一键发布", "🚀", "选成品视频与平台账号，一键分发到抖音/快手/小红书/视频号", "一键发布"),
-    ("素材瘦身", "🗜", "把参考图批量压缩到接口要求的大小，避免上传失败", None),
-    ("文案查重", "🔍", "提示词相似度检查，防止一批任务生成的视频互相雷同", None),
-]
-
 CARD_W, CARD_H, GRID_GAP = 250, 150, 14
-
-# ---------- 固定在左侧（卡片右键可 pin，持久化进 ui_state.json） ----------
-PINNED_KEY = "pinned_tools"
-
-
-def load_pinned():
-    """已固定工具名列表；下架/失效的名字读时顺手丢掉（脏数据不留）。
-    登记表的 factory 名恰好等于工具显示名，两边共用同一个键"""
-    valid = {f for _n, _i, _d, f in TOOLS if f and f in PANEL_FACTORIES}
-    return [n for n in (app_state.get(PINNED_KEY) or []) if n in valid]
-
-
-def set_pinned(name, on):
-    cur = [n for n in app_state.get(PINNED_KEY) or [] if n != name]
-    if on:
-        cur.append(name)
-    app_state.set_value(PINNED_KEY, cur)
 
 
 class ToolCard(QWidget):
@@ -184,7 +151,6 @@ class ToolCard(QWidget):
         ed.setFocus()
         if not dlg.exec():
             return
-        from gui.pages_settings import set_tool_shortcut
         set_tool_shortcut(self.tool_name, ed.keySequence().toString())
         w = self.window()
         page = getattr(w, "page_tools", None)
@@ -192,7 +158,6 @@ class ToolCard(QWidget):
             page.refresh_sc_hints()          # 全部卡片提示跟着刷新（含让位的）
 
     def _clear_shortcut(self):
-        from gui.pages_settings import set_tool_shortcut
         set_tool_shortcut(self.tool_name, "")
         w = self.window()
         page = getattr(w, "page_tools", None)

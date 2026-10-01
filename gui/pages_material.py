@@ -536,8 +536,8 @@ class MaterialPage(QWidget):
         rows = self._require_sel()
         if not rows:
             return
-        from gui.pages_output_lib import _pick_product
-        picked = _pick_product(self)
+        from gui.dialogs_product import pick_product
+        picked = pick_product(self)
         if not picked:
             return
         _pid, name = picked
