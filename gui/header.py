@@ -8,7 +8,7 @@ import math
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath, QLinearGradient
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
-                               QSizePolicy)
+                               QSizePolicy, QSpacerItem)
 
 from gui.ui_kit import COLORS, rgba
 
@@ -265,7 +265,9 @@ class KpiCard(Card):
         t.addWidget(name_lbl)
         t.addWidget(self.value)
         head.addLayout(t)
-        self._spacer = head.addStretch(1)
+        # addStretch() 在 PySide6 返回 None（拿不到句柄，日后无法移除）；
+        # 这里握住真正的 QSpacerItem，set_sparkline / hide_sparkline 才能把弹簧收放。
+        self._spacer = self._make_spacer(head)
         self._head = head
         self._spark = None
         self.v.addLayout(head)
@@ -298,6 +300,24 @@ class KpiCard(Card):
         else:
             self._spark.set_values(values, col)
         self._spark.show()
+
+    def _make_spacer(self, layout):
+        """往 layout 尾部加一根横向弹簧并返回其实例（addStretch 不返对象，只能自建）。"""
+        sp = QSpacerItem(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        layout.addItem(sp)
+        return sp
+
+    def hide_sparkline(self):
+        """移掉右侧趋势线、把中部弹簧补回原样。
+        配合 set_sparkline 做「显示 / 隐藏折线」开关；点数不足 2 无法成线时也走这里，
+        免得留下一块 96×42 的空白。没挂过折线的卡片调它是空操作。"""
+        if self._spark is not None:
+            self._head.removeWidget(self._spark)
+            self._spark.setParent(None)
+            self._spark.deleteLater()
+            self._spark = None
+        if self._spacer is None:
+            self._spacer = self._make_spacer(self._head)
 
     def paintEvent(self, e):
         super().paintEvent(e)

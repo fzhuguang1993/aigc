@@ -249,6 +249,18 @@ class DashboardPage(QWidget):
                                       and 0 <= saved < len(self._RANGES) else 1)
         self.cb_range.currentIndexChanged.connect(self._on_range)
         head.addWidget(self.cb_range)
+        # 趋势折线开关：只影响总览 KPI 卡右侧的小折线，开关状态持久化。
+        # 用 ChipBtn（选中填主蓝）而非新造控件——组件库里已有同款胶囊。
+        saved_spark = app_state.get("dash_spark")
+        self._spark_on = saved_spark if isinstance(saved_spark, bool) else True
+        self.b_spark = QPushButton("📈 趋势折线")
+        self.b_spark.setObjectName("ChipBtn")
+        self.b_spark.setCheckable(True)
+        self.b_spark.setChecked(self._spark_on)
+        self.b_spark.setToolTip("KPI 卡右侧迷你走势线（按当前时间范围逐日统计）；\n"
+                                "关掉后卡片只留数字与环比。单日/累计无足够点位时自动不画。")
+        self.b_spark.toggled.connect(self._on_spark)
+        head.addWidget(self.b_spark)
         self.b_report = QPushButton("📋 今日汇报")
         self.b_report.setObjectName("GhostBtn")
         self.b_report.setToolTip("今日截至目前 vs 昨日同时段的进度汇报；\n"
@@ -636,6 +648,8 @@ class DashboardPage(QWidget):
                 + (f"；本期平均排队 {secs(q)}" if q else "；本期没采到排队时间")
                 + "\n没拆分（早期提交）的记录按总用时计，可用回填脚本补")
 
+        self._apply_kpi_sparklines(st["daily"])
+
         self.trend.title = f"每日执行趋势 · {scope}（成功/失败/取消 堆叠）"
         self.trend.set_data(st["daily"])
         self.donut.set_data(
@@ -677,6 +691,36 @@ class DashboardPage(QWidget):
         # 自定义页签同样吃顶部时间范围
         for view in self._custom_views.values():
             view.refresh(days)
+
+    def _on_spark(self, on):
+        """折线开关：存下偏好，拿本次已缓存的 daily 直接重绘，不必重新查库。"""
+        self._spark_on = on
+        app_state.set_value("dash_spark", on)
+        st = getattr(self, "_st", None)
+        if st:
+            self._apply_kpi_sparklines(st.get("daily") or [])
+
+    def _apply_kpi_sparklines(self, daily):
+        """给有按天序列的 5 张 KPI 卡接/摘迷你走势线。
+        正在运行（瞬时值）/平均时长（daily 行里没每日均值）无按天序列，始终不画。
+        开关闭合、或某天数据不足 2 点（如今日）时，统一 hide_sparkline 把弹簧补回。"""
+        def series(fn):
+            return [fn(r) for r in daily]
+        cards = [                      # (卡片, 取每日值的函数)
+            (self.k_total, lambda r: r["total"]),
+            (self.k_ok,    lambda r: r["ok"]),
+            (self.k_rate,  lambda r: (r["ok"] / r["total"] * 100) if r["total"] else 0.0),
+            (self.k_fail,  lambda r: r["fail"]),
+            (self.k_cancel, lambda r: r["cancel"]),
+        ]
+        for card in [c for c, _ in cards] + [self.k_run, self.k_dur]:
+            card.hide_sparkline()      # 先全部收回，避免切时间范围后残留上一条线
+        if not self._spark_on:
+            return
+        for card, fn in cards:
+            vals = series(fn)
+            if len(vals) >= 2:         # 不足 2 点画不成线，保持隐藏
+                card.set_sparkline(vals)
 
     def _refresh_extra(self, days, st, cur):
         """「其他图表」页签的五图：吃同一份时间范围，跟着 refresh 一起刷"""
