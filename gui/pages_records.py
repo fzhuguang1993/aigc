@@ -15,7 +15,7 @@ from gui.formatting import secs
 from gui.header import page_header, Card
 from gui.widgets import LoadingOverlay
 from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
-                          SecsItem)
+                          SecsItem, mount_header_checkbox)
 from gui.kit import TableColumnKit, DateRangePicker
 
 DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间",
@@ -119,6 +119,9 @@ class RecordsPage(QWidget):
         # 复用 gui.kit.TableColumnKit：只接管「表头右键」这一个入口，不改本页
         # 的选择模式 / 排序 / 字段管理 / 勾选导出等既有行为（实例随表析构）。
         TableColumnKit(self.table)
+        # 勾选列表头挂一枚可见的全选框（三态），与任务中心同口径：本页全选/清空当前可见记录
+        self._hdr_check = mount_header_checkbox(
+            self.table, CHECK_COL, self._on_check_all_toggle, self._check_all_state)
 
         content.v.addWidget(QLabel("实时日志"))
         self.log = QPlainTextEdit()
@@ -217,6 +220,9 @@ class RecordsPage(QWidget):
         self.table.sortItems(sort_col, sort_order)
         self._syncing = False
         self.lbl_count.setText(f"显示 {shown}/{len(rows)} 条 · 已勾选 {len(self._checked_rows)}")
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
         for m in log_sink.drain():
             self.log.appendPlainText(m)
 
@@ -260,6 +266,46 @@ class RecordsPage(QWidget):
         else:
             self._checked_rows.pop(rid, None)
         self.lbl_count.setText(f"已勾选 {len(self._checked_rows)}")
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
+
+    def _check_items(self):
+        return [self.table.item(r, CHECK_COL)
+                for r in range(self.table.rowCount())
+                if self.table.item(r, CHECK_COL) is not None]
+
+    def _check_all_state(self):
+        """表头全选框三态：本页全选=Checked、部分=Partially、全不选=Unchecked。"""
+        items = self._check_items()
+        if not items:
+            return Qt.CheckState.Unchecked
+        n = sum(1 for i in items if i.checkState() == Qt.CheckState.Checked)
+        if n == 0:
+            return Qt.CheckState.Unchecked
+        if n == len(items):
+            return Qt.CheckState.Checked
+        return Qt.CheckState.PartiallyChecked
+
+    def _on_check_all_toggle(self, state):
+        """表头全选框被点：点成 Checked→勾选本页可见记录；否则→取消本页可见勾选。
+        只动当前可见行，不影响其它筛选下已保在 _checked_rows 里的记录。"""
+        select = (state == Qt.CheckState.Checked)
+        byid = {r["id"]: r for r in task_store.list_runs()} if select else None
+        self._syncing = True
+        for it in self._check_items():
+            rid = it.data(Qt.ItemDataRole.UserRole)
+            it.setCheckState(Qt.CheckState.Checked if select
+                             else Qt.CheckState.Unchecked)
+            if select and rid in byid:
+                self._checked_rows[rid] = byid[rid]
+            elif not select:
+                self._checked_rows.pop(rid, None)
+        self._syncing = False
+        self.lbl_count.setText(f"已勾选 {len(self._checked_rows)}")
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
 
 
 from gui.window_frame import apply_rounded

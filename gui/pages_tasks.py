@@ -33,8 +33,8 @@ from gui.widgets import VideoPlayerDialog, HoverPreview, Toast, FlowLayout
 from gui.header import page_header, Card, kpi_row
 from gui.menus import StyledMenu
 from gui.tablekit import (FieldManagerDialog, apply_field_layout,
-                          enable_drag_with_lock, SecsItem)
-from gui.kit import TableColumnKit, DateRangePicker
+                          enable_drag_with_lock, SecsItem, mount_header_checkbox)
+from gui.kit import TableColumnKit, DateRangePicker, SortableTableHeader
 from gui.theme import tokenize
 
 STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
@@ -623,6 +623,12 @@ class TasksPage(QWidget):
         # ---------- 表格 ----------
         self.table = QTableWidget(0, len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
+        # 每列都带排序箭头的表头（默认降序、窄列不重合）：在建表之初就换上，
+        # 之后所有逐列配置（列宽 / resize 模式 / 可拖动 / sectionClicked 连线）都落在
+        # 这张表头上，避免事后替换表头把既有连线冲掉。勾选列（CHECK_COL）不画箭头。
+        _hdr = SortableTableHeader()
+        _hdr.set_no_arrow_cols([CHECK_COL])
+        self.table.setHorizontalHeader(_hdr)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # 不再 NoSelection：启用 Qt 自带的鼠标按住拖框选（橡皮筋），框到的行
@@ -665,6 +671,10 @@ class TasksPage(QWidget):
         # 复用 gui.kit.TableColumnKit：只接管「表头右键」这一个入口，不动本页的
         # 进度条委托 / 框选勾选 / 排序 / 字段管理 / 单元格业务菜单等既有行为。
         TableColumnKit(self.table)
+        # 勾选列表头挂一枚可见的全选框（三态：本页全选/部分/全不选）：
+        # 以前只能点那一格才全选、格子上没框，用户不知道能全选、也不知去哪勾。
+        self._hdr_check = mount_header_checkbox(
+            self.table, CHECK_COL, self._on_check_all_toggle, self._check_all_state)
         self._build_empty_state()        # 空表时盖在表格上的引导层（导入/新建 或 清除筛选）
 
         # ---------- 分页栏 ----------
@@ -1201,6 +1211,9 @@ class TasksPage(QWidget):
         self.b_next.setEnabled(self._page < self._page_count())
         self._update_sel_label()
         self._update_run_summary(actives)
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
 
     def _make_item(self, tid, row, r, c, ats, status, out_path):
         item = SecsItem(0) if c in SECS_COLS else QTableWidgetItem()
@@ -1359,6 +1372,9 @@ class TasksPage(QWidget):
         else:
             self._selected_ids.discard(tid)
         self._update_sel_label()
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
 
     def _on_rubber_band(self):
         """把框到的行【取反】：没勾的勾上，已经勾上的取消勾选。
@@ -1388,29 +1404,61 @@ class TasksPage(QWidget):
         self.table.clearSelection()
         self._syncing = False
         self._update_sel_label()
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
 
     def _on_header_clicked(self, logical):
         """点列头：记下用户排序意图（聚集排序让位于手动排序）；
-        点勾选列表头 = 全选/取消本页"""
+        点勾选列表头 = 全选/取消本页（表头那枚全选框走 _on_check_all_toggle）"""
         if logical != CHECK_COL:
             self._user_sort_col = logical
             self._gather_ids = set()
             return
-        if self.table.rowCount() == 0:
+        items = self._check_items()
+        if not items:
             return
-        items = [self.table.item(r, CHECK_COL) for r in range(self.table.rowCount())]
         all_on = all(i.checkState() == Qt.CheckState.Checked for i in items)
+        self._apply_all_page(not all_on)
+
+    def _check_items(self):
+        return [self.table.item(r, CHECK_COL)
+                for r in range(self.table.rowCount())
+                if self.table.item(r, CHECK_COL) is not None]
+
+    def _check_all_state(self):
+        """表头全选框三态：本页全选=Checked、部分=Partially、全不选=Unchecked。"""
+        items = self._check_items()
+        if not items:
+            return Qt.CheckState.Unchecked
+        n = sum(1 for i in items if i.checkState() == Qt.CheckState.Checked)
+        if n == 0:
+            return Qt.CheckState.Unchecked
+        if n == len(items):
+            return Qt.CheckState.Checked
+        return Qt.CheckState.PartiallyChecked
+
+    def _apply_all_page(self, select):
+        """把本页所有行勾选框设成 select（True 全选 / False 清空），并同步跨页选中集。"""
         self._syncing = True
-        for i in items:
-            i.setCheckState(Qt.CheckState.Unchecked if all_on
-                            else Qt.CheckState.Checked)
+        ids = set()
+        for it in self._check_items():
+            it.setCheckState(Qt.CheckState.Checked if select
+                             else Qt.CheckState.Unchecked)
+            ids.add(it.data(Qt.ItemDataRole.UserRole))
         self._syncing = False
-        page_ids = {i.data(Qt.ItemDataRole.UserRole) for i in items}
-        if all_on:
-            self._selected_ids -= page_ids
+        if select:
+            self._selected_ids |= ids
         else:
-            self._selected_ids |= page_ids
+            self._selected_ids -= ids
         self._update_sel_label()
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
+
+    def _on_check_all_toggle(self, state):
+        """表头全选框被点：用户点成 Checked→全选本页；其余（含从部分点过来）→清空本页。"""
+        self._apply_all_page(state == Qt.CheckState.Checked)
 
     def _clear_selection(self):
         self._selected_ids.clear()
@@ -1419,6 +1467,9 @@ class TasksPage(QWidget):
             self.table.item(r, CHECK_COL).setCheckState(Qt.CheckState.Unchecked)
         self._syncing = False
         self._update_sel_label()
+        box = getattr(self, "_hdr_check", None)
+        if box is not None:
+            box.sync_state()
 
     def _update_sel_label(self):
         self.lbl_sel.setText(f"已选 {len(self._selected_ids)} 个")
@@ -1483,15 +1534,7 @@ class TasksPage(QWidget):
     def _select_all_page(self):
         if self.table.rowCount() == 0:
             return
-        self._syncing = True
-        ids = set()
-        for r in range(self.table.rowCount()):
-            it = self.table.item(r, CHECK_COL)
-            it.setCheckState(Qt.CheckState.Checked)
-            ids.add(it.data(Qt.ItemDataRole.UserRole))
-        self._syncing = False
-        self._selected_ids |= ids
-        self._update_sel_label()
+        self._apply_all_page(True)
 
     def _setup_shortcuts(self):
         self._shortcuts = []

@@ -4,11 +4,10 @@ gui/tablekit.py —— 表格通用能力：勾选框列 + 字段管理（显示
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QHBoxLayout,
-                               QListWidget, QListWidgetItem, QVBoxLayout,
-                               QTableWidgetItem, QCheckBox, QGroupBox,
-                               QScrollArea, QWidget, QPushButton)
+                               QVBoxLayout, QTableWidgetItem, QPushButton, QCheckBox)
 
 from gui.formatting import secs
+from gui.kit import FieldManager
 from gui.window_frame import apply_rounded
 
 
@@ -44,15 +43,16 @@ class SecsItem(QTableWidgetItem):
 
 
 class FieldManagerDialog(QDialog):
-    """字段管理弹窗（对标推广后台）：左＝按分类勾选要显示的字段，右＝拖动调整列顺序。
+    """字段管理弹窗：薄封装 UI 库组件 FieldManager（左分类勾选 / 右流式拖拽排序）。
 
-    columns: [(logical, 标题), ...]  需要管理的列（不含锁定列，锁定列由
-             apply_field_layout 的 first_locked 保护，这里传进来的都是可管列）
-    order:   [logical, ...]          当前可见列从左到右的顺序（隐藏列可不传）
-    hidden:  {logical, ...}          当前隐藏的列
-    categories: [(分类名, [标题, ...]), ...]  给了左侧就分组，否则单组平铺
-    default_order / default_hidden：  给了才显示「↺ 恢复默认」按钮
-    结果属性：.order（确认后最终可见列顺序） .hidden（隐藏列集合）
+    对外契约保持不变：构造签名、结果属性 .order（确认后最终可见列顺序）/.hidden
+    （隐藏列集合）与 apply_field_layout 直接对接；三个调用方无需改动。
+
+    columns: [(logical, 标题), ...] 需要管理的列（不含锁定列）
+    order:   [logical, ...] 当前可见列从左到右顺序
+    hidden:  {logical, ...} 当前隐藏的列
+    categories: [(分类名, [标题, ...]), ...] 给了左侧按分类分组，否则单组平铺
+    default_order / default_hidden：给了才显示「↺ 恢复默认」按钮
     """
 
     def __init__(self, parent, columns, order, hidden, categories=None,
@@ -61,14 +61,10 @@ class FieldManagerDialog(QDialog):
                  tip="勾选要显示的字段 · 右侧拖动调整列顺序 · 点「确定」应用"):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(560, 460)
-        self._title = dict(columns)              # logical → 标题
-        self._col_by_name = {t: c for c, t in columns}
-        self._all_cols = [c for c, _ in columns]
-        self._def_order = default_order
-        self._def_hidden = set(default_hidden or ())
-        self._syncing = False
-        self._boxes = {}                         # logical → QCheckBox
+        self.resize(620, 460)
+
+        fields, cats = self._to_fields(columns, categories)
+        self.fm = FieldManager(fields, order, hidden, categories=cats)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(16, 14, 16, 12)
@@ -77,71 +73,22 @@ class FieldManagerDialog(QDialog):
         head.setObjectName("PageTip")
         head.setWordWrap(True)
         v.addWidget(head)
+        v.addWidget(self.fm, 1)
 
-        body = QHBoxLayout()
-        body.setSpacing(14)
-        # ---------- 左：分类勾选（显示 / 隐藏）----------
-        left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(8)
-        groups = categories or [("全部字段", [t for _, t in columns])]
-        for gname, names in groups:
-            box = QGroupBox(gname)
-            gv = QVBoxLayout(box)
-            gv.setContentsMargins(10, 6, 10, 8)
-            gv.setSpacing(4)
-            for name in names:
-                col = self._col_by_name.get(name)
-                if col is None:
-                    continue
-                cb = QCheckBox(name)
-                cb.setChecked(col not in hidden)
-                cb.setCursor(Qt.CursorShape.PointingHandCursor)
-                cb.toggled.connect(lambda _on, c=col: self._on_toggle(c))
-                gv.addWidget(cb)
-                self._boxes[col] = cb
-            lv.addWidget(box)
-        lv.addStretch(1)
-        lscroll = QScrollArea()
-        lscroll.setWidgetResizable(True)
-        lscroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        lscroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
-        lscroll.setWidget(left)
-        lscroll.setFixedWidth(240)
-        body.addWidget(lscroll)
-
-        # ---------- 右：顺序预览（拖动 = 表格列最终顺序）----------
-        rbox = QVBoxLayout()
-        rbox.setSpacing(4)
-        rlabel = QLabel("显示顺序 · 上下拖动调整")
-        rlabel.setObjectName("PageTip")
-        rbox.addWidget(rlabel)
-        self.lst = QListWidget()
-        self.lst.setDragDropMode(QListWidget.DragDropMode.InternalMove)
-        self.lst.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.lst.setToolTip("这里就是表格列的最终顺序：拖动条目调整，点「确定」应用")
-        for col in order:
-            if col in self._title and col not in hidden:
-                self._add_item(col)
-        rbox.addWidget(self.lst, 1)
-        body.addLayout(rbox, 1)
-        v.addLayout(body, 1)
-
-        # ---------- 底部：全选 / 全不选 / 恢复默认 + 确定 / 取消 ----------
         foot = QHBoxLayout()
         b_all = QPushButton("全选")
         b_all.setObjectName("GhostBtn")
-        b_all.clicked.connect(lambda: self._set_all(True))
+        b_all.clicked.connect(lambda: self.fm.set_all(True))
         b_none = QPushButton("全不选")
         b_none.setObjectName("GhostBtn")
-        b_none.clicked.connect(lambda: self._set_all(False))
+        b_none.clicked.connect(lambda: self.fm.set_all(False))
         foot.addWidget(b_all)
         foot.addWidget(b_none)
         if default_order is not None:
             b_reset = QPushButton("↺ 恢复默认")
             b_reset.setObjectName("GhostBtn")
-            b_reset.clicked.connect(self._reset_default)
+            b_reset.clicked.connect(
+                lambda: self.fm.reset(default_order, default_hidden))
             foot.addWidget(b_reset)
         foot.addStretch(1)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
@@ -155,56 +102,34 @@ class FieldManagerDialog(QDialog):
         self.hidden = set(hidden)
         apply_rounded(self, show_min=False, show_max=False)
 
-    def _add_item(self, col):
-        it = QListWidgetItem(self._title.get(col, str(col)))
-        it.setData(Qt.ItemDataRole.UserRole, col)
-        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsDragEnabled)
-        self.lst.addItem(it)
-
-    def _row_of(self, col):
-        for i in range(self.lst.count()):
-            if self.lst.item(i).data(Qt.ItemDataRole.UserRole) == col:
-                return i
-        return None
-
-    def _on_toggle(self, col):
-        """左侧勾选变化：即时增删右侧预览条目（同步期不重入）"""
-        if self._syncing:
-            return
-        self._syncing = True
-        vis = self._boxes[col].isChecked()
-        row = self._row_of(col)
-        if vis and row is None:
-            self._add_item(col)
-        elif not vis and row is not None:
-            self.lst.takeItem(row)
-        self._syncing = False
-
-    def _set_all(self, on):
-        self._syncing = True
-        for col, cb in self._boxes.items():
-            cb.setChecked(on)
-            row = self._row_of(col)
-            if on and row is None:
-                self._add_item(col)
-            elif not on and row is not None:
-                self.lst.takeItem(row)
-        self._syncing = False
-
-    def _reset_default(self):
-        self._syncing = True
-        self.lst.clear()
-        for col in self._all_cols:
-            self._boxes[col].setChecked(col not in self._def_hidden)
-        for col in (self._def_order or []):
-            if col in self._title and col not in self._def_hidden:
-                self._add_item(col)
-        self._syncing = False
+    @staticmethod
+    def _to_fields(columns, categories):
+        """把调用方的 (logical,标题) + [(分类,[标题])] 映射成 FieldManager 的
+        (id,label,category) 字段表与 [(分类,[ids])] 分组；categories 缺省则单组平铺。"""
+        col_by_title = {t: c for c, t in columns}
+        if not categories:
+            return [(c, t, "字段") for c, t in columns], None
+        fields, cats, covered = [], [], set()
+        for gname, titles in categories:
+            ids = []
+            for t in titles:
+                c = col_by_title.get(t)
+                if c is None:
+                    continue
+                ids.append(c)
+                fields.append((c, t, gname))
+                covered.add(c)
+            if ids:
+                cats.append((gname, ids))
+        leftover = [(c, t) for c, t in columns if c not in covered]
+        if leftover:
+            fields += [(c, t, "其他") for c, t in leftover]
+            cats.append(("其他", [c for c, _ in leftover]))
+        return fields, cats
 
     def accept(self):
-        self.order = [self.lst.item(i).data(Qt.ItemDataRole.UserRole)
-                      for i in range(self.lst.count())]
-        self.hidden = {c for c in self._all_cols if c not in self.order}
+        self.order = self.fm.order
+        self.hidden = self.fm.hidden
         super().accept()
 
 
@@ -253,3 +178,54 @@ def enable_drag_with_lock(table, lock_count=1):
             table._ft_moving = False
 
     h.sectionMoved.connect(on_moved)
+
+
+def mount_header_checkbox(table, col, on_toggle, state_provider=None):
+    """在表头某一列挂一枚**可见**的全选勾选框（对标主流后台：勾选列表头就该有个框）。
+
+    为什么需要：以前只有「点表头那一格」才全选，格子上没框，用户根本不知道能全选、
+    也不知去哪全选。这里摆一枚三态框：本页全选=Checked、部分=PartiallyChecked、全不选=Unchecked。
+
+    on_toggle(state): 用户点框后回调（state 为点击后的新勾选态；宿主页据此全选/清空本页）。
+    state_provider(): 返回当前应有的三态；调用方在数据变化后调 cb.sync_state() 同步框态。
+    返回的 QCheckBox 以表头为父，随列宽 / 移动 / 横向滚动自动重定位；并带两个便捷方法：
+    reposition() 重新摆位、sync_state() 按 provider 刷新三态。
+    """
+    header = table.horizontalHeader()
+    cb = QCheckBox(header)
+    cb.setCursor(Qt.CursorShape.PointingHandCursor)
+    cb.setText("")                       # 只要那个方框，别占文字位
+    guard = {"on": False}
+
+    def reposition():
+        if header.isSectionHidden(col):
+            cb.hide()
+            return
+        w, h = header.sectionSize(col), header.height()
+        x = header.sectionViewportPosition(col)
+        box = 18                          # 紧凑方框，在该列里水平/垂直居中
+        cb.setGeometry(x + max(0, (w - box) // 2), max(0, (h - box) // 2), box, box)
+        cb.show()
+        cb.raise_()
+
+    def sync_state():
+        if state_provider is None:
+            return
+        guard["on"] = True               # 程序设态不触发 on_toggle（否则会误全选/清空）
+        cb.setCheckState(state_provider())
+        guard["on"] = False
+
+    def _changed(_state):
+        if guard["on"]:
+            return
+        on_toggle(cb.checkState())
+        sync_state()                       # 宿主改完行勾选后回写真实三态
+
+    cb.stateChanged.connect(_changed)
+    cb.reposition = reposition
+    cb.sync_state = sync_state
+    for sig in (header.sectionResized, header.sectionMoved, header.geometriesChanged):
+        sig.connect(lambda *a: reposition())
+    table.horizontalScrollBar().valueChanged.connect(lambda *a: reposition())
+    reposition()
+    return cb

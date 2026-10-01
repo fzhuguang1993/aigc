@@ -10,12 +10,15 @@ CompactCalendar）、浮动气泡滑块 KitSlider、可自由拉伸多行文本 
 定宽 KPI 卡 _FlowKpiCard，以及标题/对比色/取色等小工具。画廊页与后续各业务页都从
 这里复用，保证「同一套组件、同一口径」；颜色 / 字号 / 圆角一律吃 gui/ui_kit 令牌。
 """
+import json
+
 from PySide6.QtCore import (Qt, QDate, QTimer, QPoint, QRect, QSize, QEvent,
                             QRectF, QPointF, Property, QPropertyAnimation,
-                            QEasingCurve, QSortFilterProxyModel, QObject, Signal)
+                            QEasingCurve, QSortFilterProxyModel, QObject, Signal,
+                            QMimeData)
 from PySide6.QtGui import (QColor, QCursor, QGuiApplication, QPainter, QPen, QBrush,
                            QPainterPath, QFont, QPolygonF, QLinearGradient,
-                           QStandardItemModel, QStandardItem, QKeySequence)
+                           QStandardItemModel, QStandardItem, QKeySequence, QDrag)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QPlainTextEdit, QComboBox,
                                QSpinBox, QDoubleSpinBox, QDateEdit, QCheckBox,
@@ -25,7 +28,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QMessageBox, QFormLayout, QSplitter, QCalendarWidget,
                                QTreeView, QAbstractItemView, QStyle, QMenu,
                                QStyleOptionSlider, QDialog, QApplication,
-                               QTableWidgetSelectionRange, QStyledItemDelegate)
+                               QTableWidgetSelectionRange, QStyledItemDelegate,
+                               QGroupBox)
 
 from gui import ui_kit
 from gui.header import page_header, Card, KpiCard
@@ -1234,13 +1238,201 @@ class _KitItemDelegate(QStyledItemDelegate):
         editor.setGeometry(r.left(), r.top(), w, max(r.height(), 28))
 
 
+class SortableTableHeader(QHeaderView):
+    """每列都画排序箭头的表头（对标飞书 / Excel）：
+    · 默认可见——非活动列画淡灰 ▼（表示「这列默认按降序」），当前排序列画主蓝 ▼/▲；
+    · 右缘预留 ARROW_W 给箭头，文字在其左侧省略号截断——列再窄也不与文字重合；
+    · 勾选 / 锁定列（no_arrow_cols）不画箭头、文字占满整格；
+    · 首点某列＝按降序（Qt 默认新列升序，这里翻转成符合直觉的降序），再点同一列才翻转。
+
+    只做「绘制 + 首点降序」两件事：点击 / 拖动 / 调整列宽 / sectionClicked 等一律沿用
+    QHeaderView 内建行为（不覆写 mousePress），因此接入方已有的排序、列锁定、点表头
+    全选等逻辑完全不受影响。排序方向直接读内建 sortIndicatorSection()/sortIndicatorOrder()，
+    与宿主 setSortIndicator/sortItems 单一真源。"""
+
+    ARROW_W = 16          # 右缘留给箭头的宽度
+    PAD_L = 8             # 文字左内边距（对齐 QSS QHeaderView::section 的 padding）
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.setSectionsClickable(True)
+        self.setHighlightSections(False)
+        # 关掉内建箭头，箭头一律由本类自绘（否则窄列会与文字挤在一起、且只有当前列有箭头）
+        self.setSortIndicatorShown(False)
+        self._no_arrow = set()        # 不画箭头的列（勾选 / 锁定）
+        self._last_col = None         # 上一次点过的排序列（决定「同列翻转 / 新列降序」）
+
+    def set_no_arrow_cols(self, cols):
+        self._no_arrow = set(cols)
+
+    def handle_section_click(self, logical):
+        """点某列文本区 → 该列成为当前排序列并定方向：
+        · 首次点这列（或点了新列）＝降序（符合「默认降序」直觉；Qt 内建对新列默认升序，这里翻正）；
+        · 连着点同一列＝在降/升之间翻转。
+        自持 _last_col 判定，不依赖基类是否在点击时改动指示列——本类把 setSortIndicatorShown(False)
+        关掉了内建箭头，基类松开鼠标时并不会自动拨动指示列，早期「读 super 前后差值」的判据在这张
+        表头上永远不成立（首点 / 翻转全失效）。勾选 / 锁定列（no_arrow_cols）直接跳过：它们的点击
+        交给宿主（如点勾选列表头全选）。"""
+        if logical is None or logical < 0 or logical >= self.count():
+            return
+        if logical in self._no_arrow:
+            return
+        if logical == self._last_col:
+            cur = self.sortIndicatorOrder()
+            new = (Qt.SortOrder.AscendingOrder
+                   if cur == Qt.SortOrder.DescendingOrder
+                   else Qt.SortOrder.DescendingOrder)
+        else:
+            new = Qt.SortOrder.DescendingOrder
+        self._last_col = logical
+        self.setSortIndicator(logical, new)
+        return new
+
+    def mouseReleaseEvent(self, e):
+        """松开：先让基类跑完内建点击 / 拖列 / sectionClicked 语义，再据「点的是文本、不是拖动列
+        边界」自订方向。sectionOffset 非 0 表示这是一次拖动改列位，不当成排序点击。"""
+        logical = (self.logicalIndexAt(e.position().toPoint())
+                   if e.button() == Qt.MouseButton.LeftButton else -1)
+        was_move = self.sectionOffset() != 0
+        super().mouseReleaseEvent(e)
+        if logical >= 0 and not was_move and self.sectionsClickable():
+            self.handle_section_click(logical)
+
+    def _text(self, logical_index):
+        h = self.model().headerData(logical_index, self.orientation(),
+                                    Qt.ItemDataRole.DisplayRole)
+        # PySide6 会把 headerData 直接转成 Python 值（多为 str）；兼容 QVariant 旧行为
+        if h is None:
+            return ""
+        if isinstance(h, str):
+            return h
+        return h.toString() if hasattr(h, "toString") else str(h)
+
+    def paintSection(self, painter, rect, logical_index):
+        # 勾选 / 锁定列：不画箭头、文字占满整格，交给基类原样渲染
+        if logical_index in self._no_arrow:
+            super().paintSection(painter, rect, logical_index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # 背景铺满整格（含箭头带），复刻 QSS：浅底 + 底部 1px 分隔线（悬停略深一档）
+        bg = C["bg_field"] if self.underMouse() else C["disabled_bg"]
+        painter.fillRect(rect, QColor(bg))
+        painter.setPen(QColor(C["border_popup"]))
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+        # 文字：只在「去掉箭头带」的左区绘制并右侧省略，从根上杜绝与箭头重合
+        text_rect = QRect(rect.left(), rect.top(), rect.width() - self.ARROW_W, rect.height())
+        painter.setPen(QColor(C["table_head"]))
+        fm = painter.fontMetrics()
+        avail = max(0, text_rect.width() - self.PAD_L - 2)
+        elided = fm.elidedText(self._text(logical_index),
+                               Qt.TextElideMode.ElideRight, avail)
+        painter.drawText(text_rect.adjusted(self.PAD_L, 0, -2, 0),
+                         int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                         elided)
+        # 箭头：当前排序列=主蓝、方向随内建指示；其余列=淡灰 ▼（默认降序示意）
+        active = self.sortIndicatorSection()
+        if logical_index == active:
+            up = (self.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder)
+            color = QColor(C["primary"])
+        else:
+            up = False
+            color = QColor(C["weak"])
+        self._draw_arrow(painter, rect, up, color)
+        painter.restore()
+
+    def _draw_arrow(self, painter, rect, up, color):
+        cx = rect.right() - self.ARROW_W // 2
+        cy = rect.center().y()
+        w, h = 4, 3
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        if up:
+            poly = QPolygonF([QPointF(cx - w, cy + h), QPointF(cx + w, cy + h),
+                              QPointF(cx, cy - h)])
+        else:
+            poly = QPolygonF([QPointF(cx - w, cy - h), QPointF(cx + w, cy - h),
+                              QPointF(cx, cy + h)])
+        painter.drawPolygon(poly)
+
+
+class _MarqueeLayer(QWidget):
+    """复制后在选区外画 Excel 式「行走的虚线框」；也可平时给当前选区画一圈实线环。
+    做成 viewport 的透明叠层子控件：任何 QTableWidget 都能获得（不必是 KitTable），
+    TableColumnKit attach 时自动挂上——把复制反馈从 KitTable 私有变成全站通用。"""
+
+    def __init__(self, table, show_selection_ring=False, parent=None):
+        super().__init__(table.viewport())
+        self._t = table
+        self._ring = show_selection_ring
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self._ranges = []
+        self._phase = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(220)
+        self._timer.timeout.connect(self._tick)
+        self.setGeometry(table.viewport().rect())
+        self.show()
+
+    def start(self, ranges):
+        self._ranges = list(ranges)
+        self.raise_()
+        self.sync()
+        self._timer.start()
+
+    def stop(self):
+        if self._ranges:
+            self._ranges = []
+            self._timer.stop()
+            self.update()
+
+    def sync(self):
+        self.setGeometry(self._t.viewport().rect())
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 1) % 8
+        self.update()
+
+    def _rect(self, rng):
+        m = self._t.model()
+        tl = self._t.visualRect(m.index(rng.topRow(), rng.leftColumn()))
+        br = self._t.visualRect(m.index(rng.bottomRow(), rng.rightColumn()))
+        return QRect(tl.left(), tl.top(),
+                     br.right() - tl.left() + 1, br.bottom() - tl.top() + 1)
+
+    def paintEvent(self, e):
+        if not self._ranges and not self._ring:
+            return
+        p = QPainter(self)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if self._ranges:
+            pen = QPen(QColor(C["text"]))
+            pen.setWidthF(1.2)
+            pen.setDashPattern([3, 3])
+            pen.setDashOffset(self._phase * 0.75)   # 逐帧偏移→虚线“行走”
+            p.setPen(pen)
+            for rng in self._ranges:
+                p.drawRect(self._rect(rng))
+        elif self._ring:
+            pen = QPen(QColor(C["primary"]))
+            pen.setWidthF(1.2)
+            p.setPen(pen)
+            for rng in self._t.selectedRanges():
+                p.drawRect(self._rect(rng))
+        p.end()
+
+
 class TableColumnKit(QObject):
-    """表头右键 → 本列靠左/居中/靠右 / 垂直居中 / 自动换行：把这套列对齐+换行交互做成
-    可复用装配器。既能被 KitTable 复用（单一真源），也能 attach 到任意已有 QTableWidget，
-    给全站列表表格补上同一套列交互——且只接管「表头右键」这一个入口，绝不触碰各表自己的
-    委托、选择模式、排序、单元格右键业务菜单等配置（零行为变更）。
-    用法：TableColumnKit(table, baseline_h=None)；实例以 table 为父，生命周期随表，无需另存引用。
-    baseline_h 缺省取表格当前默认行高，作为「关换行」逐行复位的基准。"""
+    """可复用表格装配器，attach 到任意 QTableWidget 补上两件事（被 KitTable 复用=单一真源）：
+    ① 表头右键 → 本列靠左/居中/靠右 / 垂直居中 / 自动换行；
+    ② Ctrl+C 复制选中区（制表符分隔）并在选区外画 Excel 式「行走的虚线框」，Esc 取消；
+      可选 show_selection_ring=True 时平时给选区画一圈实线环（KitTable 用）。
+    除表头右键与 Copy/Esc 两个键外，绝不触碰各表自己的委托、选择模式、排序、单元格
+    右键业务菜单等配置。用法：TableColumnKit(table, baseline_h=None, show_selection_ring=False)；
+    实例以 table 为父，生命周期随表。baseline_h 缺省取默认行高，作为「关换行」复位基准。"""
 
     # 对齐位掩码：水平位与垂直位分开管理，切换行 / 只改某一个方向时另一方向不受影响
     _HMASK = (int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignRight)
@@ -1248,7 +1440,7 @@ class TableColumnKit(QObject):
     _VMASK = (int(Qt.AlignmentFlag.AlignTop) | int(Qt.AlignmentFlag.AlignVCenter)
               | int(Qt.AlignmentFlag.AlignBottom))
 
-    def __init__(self, table, baseline_h=None):
+    def __init__(self, table, baseline_h=None, show_selection_ring=False):
         super().__init__(table)
         self._t = table
         self._wrap = table.wordWrap()   # 跟随表格现状，菜单首项文案才准确
@@ -1260,6 +1452,15 @@ class TableColumnKit(QObject):
         hh = table.horizontalHeader()
         hh.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         hh.installEventFilter(self)
+        # 复制行走虚线框（+ 可选选区实线环）：做成 viewport 叠层，任何表都能获得
+        self._marquee = _MarqueeLayer(table, show_selection_ring)
+        table.installEventFilter(self)              # 捕获 Ctrl+C / Esc
+        table.viewport().installEventFilter(self)   # 视口尺寸变化时同步叠层
+        table.selectionModel().selectionChanged.connect(self._marquee.update)
+        hh.sectionResized.connect(lambda *a: self._marquee.sync())
+        hh.sectionMoved.connect(lambda *a: self._marquee.sync())
+        table.verticalScrollBar().valueChanged.connect(lambda *a: self._marquee.sync())
+        table.horizontalScrollBar().valueChanged.connect(lambda *a: self._marquee.sync())
 
     def set_col_align(self, col, halign):
         # 只改水平对齐（左/中/右）：存进 _col_h 的水平位，垂直位与换行位一律不动
@@ -1318,13 +1519,48 @@ class TableColumnKit(QObject):
         return self._wrap
 
     def eventFilter(self, obj, ev):
-        if obj is self._t.horizontalHeader() and ev.type() == QEvent.Type.ContextMenu:
-            hh = self._t.horizontalHeader()
-            col = hh.logicalIndexAt(ev.pos())
+        t = ev.type()
+        if obj is self._t.horizontalHeader() and t == QEvent.Type.ContextMenu:
+            col = self._t.horizontalHeader().logicalIndexAt(ev.pos())
             if col >= 0:
                 self._show_header_menu(col, ev.globalPos())
                 return True
+        elif obj is self._t and t == QEvent.Type.KeyPress:
+            if ev.matches(QKeySequence.StandardKey.Copy):
+                self._copy_selection()
+                return True
+            if ev.key() == Qt.Key.Key_Escape:      # Esc 取消“行走的虚线框”
+                self._marquee.stop()
+        elif obj is self._t.viewport() and t == QEvent.Type.Resize:
+            self._marquee.sync()
         return False
+
+    def _copy_selection(self):
+        """选中区拼成制表符文本写剪贴板（多行多列都行）；无选中则复制当前格。
+        复制后让叠层在选区外画「行走的虚线框」（Esc 或重新选中会停）。"""
+        t = self._t
+        app = QApplication.instance()
+        if app is None:
+            return
+        ranges = t.selectedRanges()
+        if not ranges:
+            it = t.currentItem()
+            if it is not None:
+                app.clipboard().setText(it.text())
+                ranges = [QTableWidgetSelectionRange(it.row(), it.column(),
+                                                     it.row(), it.column())]
+            else:
+                return
+        lines = []
+        for r in ranges:
+            for row in range(r.topRow(), r.bottomRow() + 1):
+                cells = []
+                for col in range(r.leftColumn(), r.rightColumn() + 1):
+                    it = t.item(row, col)
+                    cells.append(it.text() if it is not None else "")
+                lines.append("\t".join(cells))
+        app.clipboard().setText("\n".join(lines))
+        self._marquee.start(ranges)
 
     def _show_header_menu(self, col, gpos):
         menu = StyledMenu(self._t)
@@ -1350,6 +1586,44 @@ class TableColumnKit(QObject):
             self.set_col_valign(col, A.AlignVCenter)
         elif chosen is a_w:
             self.toggle_wrap()
+
+    def enable_sort_arrows(self, no_arrow_cols=(0,)):
+        """把表格当前水平表头换成 SortableTableHeader（每列画排序箭头）：
+        迁移全局开关 / 默认对齐 / 逐列 resize 模式与列宽 / 可拖动开关，重挂表头右键
+        过滤器与叠层同步信号（旧表头已随之析构），并把 no_arrow_cols 列排除箭头。
+
+        供「想默认开排序箭头、又不想在建表时手写表头」的页面在建表配置完成后调用一次；
+        不需要首点降序以外的排序行为——点击 / 拖列 / 改列宽 / sectionClicked 全沿用内建。
+        返回新表头，供调用方进一步接线（如挂全选框 / 连自定义排序槽）。"""
+        table = self._t
+        old = table.horizontalHeader()
+        ncol = table.columnCount()
+        modes = [old.sectionResizeMode(c) for c in range(ncol)]
+        widths = [table.columnWidth(c) for c in range(ncol)]
+        new = SortableTableHeader()
+        new.setSectionsClickable(old.sectionsClickable())
+        new.setSectionsMovable(old.sectionsMovable())
+        new.setHighlightSections(old.highlightSections())
+        new.setDefaultAlignment(old.defaultAlignment())
+        new.setStretchLastSection(old.stretchLastSection())
+        new.setTextElideMode(old.textElideMode())
+        new.setDefaultSectionSize(old.defaultSectionSize())
+        new.setSortIndicatorShown(False)
+        # 换掉表头（旧表头交给视图销毁）：先装新头，再把逐列配置搬回去
+        table.setHorizontalHeader(new)
+        new.set_no_arrow_cols(no_arrow_cols)
+        for c, m in enumerate(modes):
+            new.setSectionResizeMode(c, m)
+        for c, (m, w) in enumerate(zip(modes, widths)):
+            if m != QHeaderView.ResizeMode.Stretch:      # Stretch 列宽由视图自管，别硬设
+                table.setColumnWidth(c, w)
+        # 本 kit 的表头右键过滤器原装在旧表头上（已析构）：重装到新表头
+        new.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        new.installEventFilter(self)
+        # 复制叠层原连在旧表头的 sectionResized/Moved 上：一并接到新表头，列变动作照同步
+        new.sectionResized.connect(lambda *a: self._marquee.sync())
+        new.sectionMoved.connect(lambda *a: self._marquee.sync())
+        return new
 
 
 class KitTable(QTableWidget):
@@ -1381,18 +1655,10 @@ class KitTable(QTableWidget):
                              | QAbstractItemView.EditTrigger.EditKeyPressed)
         # 编辑提交后把 tooltip 同步成最新内容，悬停才能看到改后的全文（等值守卫防信号回环）
         self.itemChanged.connect(self._sync_tooltip)
-        # 复制后的 Excel 式“行走的虚线框”（marching ants）
-        self._marching = []
-        self._marquee_phase = 0
-        self._marquee_timer = QTimer(self)
-        self._marquee_timer.setInterval(220)
-        self._marquee_timer.timeout.connect(self._tick_marquee)
-        # 另选其它单元格时清掉虚线框（复制本身不改选区，不影响刚启动的动画）
-        self.selectionModel().selectionChanged.connect(self._stop_marching)
-        # 列对齐 / 换行交互交给可复用装配器（单一真源）：表头右键菜单 + 逐列对齐状态
-        # 都在 TableColumnKit 里，KitTable 仅复用、不再自带一份实现。放在 wordWrap 已置
+        # 列对齐 / 换行 / 复制行走虚线框 / 选区实线环 全部交给可复用装配器（单一真源）：
+        # 都在 TableColumnKit 里，KitTable 仅复用、不再自带一份。放在 wordWrap 已置
         # False 之后创建，装配器读到的初始 _wrap 才与实际一致。
-        self._colkit = TableColumnKit(self, baseline_h=38)
+        self._colkit = TableColumnKit(self, baseline_h=38, show_selection_ring=True)
 
     def _sync_tooltip(self, it):
         # setToolTip 也会触发 dataChanged→itemChanged，不同值才写，避免无限回环
@@ -1409,86 +1675,8 @@ class KitTable(QTableWidget):
     def toggle_wrap(self):
         return self._colkit.toggle_wrap()
 
-    def _copy_selection(self):
-        """把选中区拼成制表符分隔文本复制到剪贴板（多行多列都行）；无选中则复制当前格。
-        复制后记住这片区域，在它周围画 Excel 式“行走的虚线框”。"""
-        app = QApplication.instance()
-        if app is None:
-            return
-        ranges = self.selectedRanges()
-        if not ranges:
-            it = self.currentItem()
-            if it is not None:
-                app.clipboard().setText(it.text())
-                ranges = [QTableWidgetSelectionRange(it.row(), it.column(),
-                                                     it.row(), it.column())]
-            else:
-                return
-        lines = []
-        for r in ranges:
-            for row in range(r.topRow(), r.bottomRow() + 1):
-                cells = []
-                for col in range(r.leftColumn(), r.rightColumn() + 1):
-                    it = self.item(row, col)
-                    cells.append(it.text() if it is not None else "")
-                lines.append("\t".join(cells))
-        app.clipboard().setText("\n".join(lines))
-        # 记住刚复制的区域，启动虚线框动画（按 Esc 或重新选中会停）
-        self._start_marching(ranges)
-
-    def _start_marching(self, ranges):
-        self._marching = list(ranges)
-        self._marquee_phase = 0
-        self._marquee_timer.start()
-        self.viewport().update()
-
-    def _stop_marching(self):
-        if self._marching:
-            self._marching = []
-            self._marquee_timer.stop()
-            self.viewport().update()
-
-    def _tick_marquee(self):
-        self._marquee_phase = (self._marquee_phase + 1) % 8
-        self.viewport().update()
-
-    def _marching_rect(self, rng):
-        """把选中区映射成视口坐标矩形（visualRect 返回的就是视口坐标）。"""
-        tl = self.visualRect(self.model().index(rng.topRow(), rng.leftColumn()))
-        br = self.visualRect(self.model().index(rng.bottomRow(), rng.rightColumn()))
-        return QRect(tl.left(), tl.top(),
-                     br.right() - tl.left() + 1, br.bottom() - tl.top() + 1)
-
-    def paintEvent(self, e):
-        super().paintEvent(e)
-        p = QPainter(self.viewport())
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        if self._marching:
-            # 复制后：整片选区外圈画“行走的虚线框”（Excel marching ants）
-            pen = QPen(QColor(C["text"]))
-            pen.setWidthF(1.2)
-            pen.setDashPattern([3, 3])
-            pen.setDashOffset(self._marquee_phase * 0.75)   # 逐帧偏移→虚线“行走”
-            p.setPen(pen)
-            for rng in self._marching:
-                p.drawRect(self._marching_rect(rng))
-        else:
-            # 平时选中：画一圈与整格等大的实线框（和复制后的虚线框同尺寸，只是实→虚）
-            pen = QPen(QColor(C["primary"]))
-            pen.setWidthF(1.2)
-            p.setPen(pen)
-            for rng in self.selectedRanges():
-                p.drawRect(self._marching_rect(rng))
-        p.end()
-
-    def keyPressEvent(self, e):
-        if e.matches(QKeySequence.StandardKey.Copy):
-            self._copy_selection()
-            return
-        if e.key() == Qt.Key.Key_Escape:      # Esc 取消“行走的虚线框”
-            self._stop_marching()
-            return
-        super().keyPressEvent(e)
+    # 复制行走虚线框 / 选区实线环 / 表头右键列对齐 均由 self._colkit（TableColumnKit）承担，
+    # KitTable 不再自带一份。_edit_cell 保留备用。
 
     def _edit_cell(self, row, col):
         """已改为 Excel 式双击内联编辑，此弹框编辑保留备用（当前不接线）。"""
@@ -1598,3 +1786,371 @@ class _FlowKpiCard(KpiCard):
 
     def minimumSizeHint(self):
         return QSize(self._fw, self._minh)
+
+
+# --------------------------------------------------------------------
+# 字段管理组件：左分类勾选 / 右流式拖拽排序（从任务中心抽进组件库，全站复用）
+#   · 左：按 category 分组勾选，勾选即自动追加到右侧；也可按住 ☰ 拖到右侧落点插入
+#   · 右：FlowLayout 按胶囊实际宽度自动换行排布；☰ 把手 + 跟随光标拖拽调序；× 移除
+# 数据用 (id, label, category) 三元组，id 由调用方给（如逻辑列号），组件不解释语义。
+# --------------------------------------------------------------------
+_FM_MIME = "application/x-aigc-fieldmgr"
+
+
+class _FMDrag:
+    """拖拽跟随：按住超过阈值即把控件 grab 成图跟随光标拖出，MIME 携带 {src,id,index}。"""
+
+    def _fm_press_ev(self, e):
+        self._fm_press = (e.position().toPoint()
+                          if e.button() == Qt.MouseButton.LeftButton else None)
+
+    def _fm_try_drag(self, e, src, fid, index=0):
+        if (getattr(self, "_fm_press", None) is not None
+                and (e.buttons() & Qt.MouseButton.LeftButton)
+                and (e.position().toPoint() - self._fm_press).manhattanLength()
+                >= QApplication.startDragDistance()):
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(_FM_MIME, json.dumps(
+                {"src": src, "id": fid, "index": index}).encode("utf-8"))
+            drag.setMimeData(mime)
+            target = self.parentWidget() if isinstance(self, _FMHandle) else self
+            pm = target.grab()
+            drag.setPixmap(pm)
+            drag.setHotSpot(QPoint(pm.width() // 2, pm.height() // 2))
+            self._fm_press = None
+            drag.exec(Qt.DropAction.MoveAction)
+            return True
+        return False
+
+
+class _FMHandle(_FMDrag, QLabel):
+    """池行左侧的 ☰ 拖拽把手：按住拖到右侧即把该字段插入落点。"""
+
+    def __init__(self, mgr, fid, src="pool", parent=None):
+        super().__init__("☰", parent)
+        self.mgr, self.fid, self.src = mgr, fid, src
+        self.setObjectName("FMGrip")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setFixedWidth(14)
+
+    def mousePressEvent(self, e):
+        self._fm_press_ev(e)
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._fm_try_drag(e, self.src, self.fid):
+            e.accept()
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._fm_press = None
+        super().mouseReleaseEvent(e)
+
+
+class _FMPoolRow(QWidget):
+    """左侧一条字段：[☰ 把手][勾选框]。勾选＝追加到右侧；按住把手＝拖到右侧落点插入。"""
+
+    def __init__(self, fid, mgr, parent=None):
+        super().__init__(parent)
+        self.fid, self.mgr = fid, mgr
+        h = QHBoxLayout(self)
+        h.setContentsMargins(2, 0, 4, 0)
+        h.setSpacing(6)
+        h.addWidget(_FMHandle(mgr, fid))
+        self.cb = QCheckBox(mgr.label_of(fid))
+        self.cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cb.toggled.connect(lambda on, f=fid: mgr.toggle(f, on))
+        h.addWidget(self.cb, 1)
+        mgr._boxes[fid] = self.cb
+
+
+class _FMOrderChip(_FMDrag, QFrame):
+    """右侧一枚已选字段：[☰ 把手][名称][×]。整枚可拖（跟随光标）调序；× 移除并回勾左框。"""
+
+    def __init__(self, fid, mgr, index, parent=None):
+        super().__init__(parent)
+        self.fid, self.mgr, self.index = fid, mgr, index
+        self.setObjectName("FMChip")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(8, 3, 6, 3)
+        h.setSpacing(5)
+        g = QLabel("☰")
+        g.setObjectName("FMGrip")
+        h.addWidget(g)
+        t = QLabel(mgr.label_of(fid))
+        t.setObjectName("FMChipText")
+        h.addWidget(t)
+        x = QPushButton("×")
+        x.setObjectName("FMChipX")
+        x.setFixedSize(15, 15)
+        x.setCursor(Qt.CursorShape.PointingHandCursor)
+        x.clicked.connect(lambda: mgr.remove(fid))
+        h.addWidget(x)
+        self._fm_press = None
+
+    def mousePressEvent(self, e):
+        self._fm_press_ev(e)
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._fm_try_drag(e, "order", self.fid, self.index):
+            e.accept()
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._fm_press = None
+        super().mouseReleaseEvent(e)
+
+
+class _FMOrderBar(QWidget):
+    """右侧流式容器：装顺序胶囊，接受「池拖入 / 内部重排」。"""
+
+    def __init__(self, mgr, parent=None):
+        super().__init__(parent)
+        self.mgr = mgr
+        self.setObjectName("FMOrderBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(140)
+        self._flow = FlowLayout(self, hgap=6, vgap=6)
+        self._flow.setContentsMargins(8, 8, 8, 8)
+
+    def _chips(self):
+        out = []
+        for i in range(self._flow.count()):
+            it = self._flow.itemAt(i)
+            w = it.widget() if it is not None else None
+            if isinstance(w, _FMOrderChip):
+                out.append((i, w))
+        return out
+
+    def insert_index_at(self, pt):
+        """把落点换算成扁平序列插入位：按行（top）分组，同行按 x。"""
+        chips = self._chips()
+        if not chips:
+            return 0
+        rows = {}
+        for idx, c in chips:
+            rows.setdefault(c.geometry().top(), []).append((idx, c))
+        tops = sorted(rows)
+        target = tops[0]
+        for t in tops:
+            if pt.y() >= t:
+                target = t
+            else:
+                break
+        row = rows[target]
+        for idx, c in row:
+            if pt.x() < c.geometry().center().x():
+                return idx
+        return row[-1][0] + 1
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(_FM_MIME):
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasFormat(_FM_MIME):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        if e.mimeData().hasFormat(_FM_MIME):
+            self.mgr.handle_drop(e.position().toPoint(), e)
+            e.acceptProposedAction()
+
+
+class FieldManager(QWidget):
+    """字段管理：左分类勾选 / 右流式拖拽排序。字段用 (id,label,category)。"""
+
+    changed = Signal()
+
+    def __init__(self, fields, order, hidden, categories=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("FieldManager")
+        self._fields = list(fields)
+        self._labels = {fid: lab for fid, lab, _ in self._fields}
+        self._ids = [fid for fid, _, _ in self._fields]
+        hid = set(hidden or ())
+        self._order = [f for f in (order or []) if f in self._labels and f not in hid]
+        if categories:
+            self._groups = [(nm, [f for f in ids if f in self._labels])
+                            for nm, ids in categories]
+        else:
+            bucket, seq = {}, []
+            for fid, _, cat in self._fields:
+                if cat not in bucket:
+                    bucket[cat] = []
+                    seq.append(cat)
+                bucket[cat].append(fid)
+            self._groups = [(c, bucket[c]) for c in seq]
+        self._boxes = {}
+        self._syncing = False
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+
+        left_host = QWidget()
+        lv = QVBoxLayout(left_host)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
+        for gname, ids in self._groups:
+            box = QGroupBox(gname)
+            gv = QVBoxLayout(box)
+            gv.setContentsMargins(10, 6, 10, 8)
+            gv.setSpacing(3)
+            for fid in ids:
+                if fid in self._labels:
+                    gv.addWidget(_FMPoolRow(fid, self))
+            lv.addWidget(box)
+        lv.addStretch(1)
+        lscroll = QScrollArea()
+        lscroll.setWidgetResizable(True)
+        lscroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        lscroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        lscroll.setWidget(left_host)
+        lscroll.setFixedWidth(220)
+        outer.addWidget(lscroll)
+
+        right = QVBoxLayout()
+        right.setSpacing(4)
+        rl = QLabel("显示顺序 · 拖动 ☰ 调序，× 移除")
+        rl.setObjectName("FMHint")
+        right.addWidget(rl)
+        self._bar = _FMOrderBar(self)
+        right.addWidget(self._bar, 1)
+        outer.addLayout(right, 1)
+
+        self._apply_style()
+        self._sync_boxes()
+        self._rebuild_bar()
+
+    # ---------- 对外 ----------
+    def label_of(self, fid):
+        return self._labels.get(fid, str(fid))
+
+    @property
+    def order(self):
+        return list(self._order)
+
+    @property
+    def hidden(self):
+        return {f for f in self._ids if f not in self._order}
+
+    def set_all(self, on):
+        self._syncing = True
+        for fid in self._ids:
+            self._boxes[fid].setChecked(on)
+        self._order = list(self._ids) if on else []
+        self._syncing = False
+        self._rebuild_bar()
+        self.changed.emit()
+
+    def reset(self, default_order, default_hidden):
+        dh = set(default_hidden or ())
+        self._syncing = True
+        for fid in self._ids:
+            self._boxes[fid].setChecked(fid not in dh)
+        self._order = [f for f in (default_order or [])
+                       if f in self._labels and f not in dh]
+        self._syncing = False
+        self._rebuild_bar()
+        self.changed.emit()
+
+    # ---------- 交互 ----------
+    def toggle(self, fid, on):
+        if self._syncing:
+            return
+        if on and fid not in self._order:
+            self._order.append(fid)
+        elif not on and fid in self._order:
+            self._order.remove(fid)
+        self._rebuild_bar()
+        self.changed.emit()
+
+    def remove(self, fid):
+        if fid in self._order:
+            self._order.remove(fid)
+        b = self._boxes.get(fid)
+        if b is not None:
+            b.blockSignals(True)
+            b.setChecked(False)
+            b.blockSignals(False)
+        self._rebuild_bar()
+        self.changed.emit()
+
+    def handle_drop(self, pt, event):
+        try:
+            payload = json.loads(bytes(event.mimeData().data(_FM_MIME)).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        src, fid = payload.get("src"), payload.get("id")
+        if fid not in self._labels:
+            return
+        pos = self._bar.insert_index_at(pt)
+        if src == "pool":
+            if fid in self._order:
+                self._order.remove(fid)
+            self._order.insert(max(0, min(pos, len(self._order))), fid)
+            b = self._boxes.get(fid)
+            if b is not None and not b.isChecked():
+                b.blockSignals(True)
+                b.setChecked(True)
+                b.blockSignals(False)
+        elif src == "order":
+            frm = int(payload.get("index", 0))
+            if 0 <= frm < len(self._order) and self._order[frm] == fid:
+                self._order.pop(frm)
+                if pos > frm:
+                    pos -= 1
+                self._order.insert(max(0, min(pos, len(self._order))), fid)
+        self._rebuild_bar()
+        self.changed.emit()
+        event.acceptProposedAction()
+
+    # ---------- 内部 ----------
+    def _sync_boxes(self):
+        self._syncing = True
+        for fid in self._ids:
+            self._boxes[fid].setChecked(fid in self._order)
+        self._syncing = False
+
+    def _rebuild_bar(self):
+        while self._bar._flow.count():
+            it = self._bar._flow.takeAt(0)
+            w = it.widget() if it is not None else None
+            if w is not None:
+                w.deleteLater()
+        for i, fid in enumerate(self._order):
+            self._bar._flow.addWidget(_FMOrderChip(fid, self, i))
+        self._bar.updateGeometry()
+
+    def _apply_style(self):
+        soft = ui_kit.rgba(C["primary"], 0.10)
+        hover = ui_kit.rgba(C["primary"], 0.18)
+        line = ui_kit.rgba(C["primary"], 0.35)
+        self.setStyleSheet(
+            f"#FieldManager QGroupBox{{border:1px solid {C['border']};"
+            f"border-radius:{ui_kit.RADIUS['md']}px;margin-top:8px;padding-top:4px;"
+            f"font-weight:600;color:{C['sub']};background:transparent;}}"
+            f"#FieldManager QGroupBox::title{{subcontrol-origin:margin;left:10px;"
+            f"padding:0 4px;}}"
+            f"#FieldManager QCheckBox{{color:{C['text']};font-size:13px;background:transparent;}}"
+            f"#FMGrip{{color:{C['weak']};font-size:12px;background:transparent;}}"
+            f"#FMHint{{color:{C['weak']};font-size:12px;background:transparent;}}"
+            f"#FMOrderBar{{background:{C['bg_field']};border:1px solid {C['border']};"
+            f"border-radius:{ui_kit.RADIUS['card']}px;}}"
+            f"#FMChip{{background:{soft};border:1px solid {line};"
+            f"border-radius:{ui_kit.RADIUS['pill']}px;}}"
+            f"#FMChip:hover{{background:{hover};border:1px solid {C['primary']};}}"
+            f"#FMChip #FMChipText{{color:{C['text']};font-size:13px;"
+            f"background:transparent;border:none;}}"
+            f"#FMChip #FMGrip{{color:{C['sub']};}}"
+            f"#FMChipX{{background:transparent;border:none;color:{C['weak']};"
+            f"font-weight:700;padding:0;}}"
+            f"#FMChipX:hover{{color:{C['danger']};}}")

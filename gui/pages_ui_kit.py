@@ -37,7 +37,7 @@ C = ui_kit.COLORS
 from gui.kit import (_section_title, _sub_title, _hint, _contrast_text, _row,
                     _lighten, hover_tip, KitButton, TreeSelect, ModernDateEdit,
                     DateRangePicker, KitSlider, ResizableTextEdit, KitTable,
-                    _FlowKpiCard, _round_dialog)
+                    FieldManager, _FlowKpiCard, _round_dialog)
 
 
 class UiKitPage(QWidget):
@@ -321,6 +321,10 @@ class UiKitPage(QWidget):
         tb.setMinimumHeight(180)
         v.addWidget(tb)
 
+        v.addWidget(_sub_title("字段管理 FieldManager（左按分类勾选→自动加到右侧；也可直接拖到右侧落点；"
+                               "右侧流式排列，按住 ☰ 跟随光标拖动调序，点 × 移除；.order/.hidden 实时可取）"))
+        v.addWidget(self._field_manager_demo())
+
         v.addWidget(_sub_title("KPI 卡片 KpiCard（吃 KPI_PALETTE；右侧空白放小折线 sparkline）"))
         # 定宽 KPI 带：每卡固定 _KPI_W 宽、不拉伸；普通窗口一行 4 张，最大化行宽能容纳
         # 6 张则一行 6 张，卡片数超过一行自动折到下一行（FlowLayout 按实际可用宽换行）。
@@ -394,6 +398,35 @@ class UiKitPage(QWidget):
                 f"border-radius:{r}px;padding:5px 14px;")
             chip.setToolTip(f"字段 {key}｜扁平款｜主题色 {acc}")
         return chip
+
+    def _field_manager_demo(self):
+        """字段管理组件演示：直接嵌一个 FieldManager，下方实时回显当前 .order/.hidden。
+        数据用与任务中心同构的样例字段（分类 + 逻辑号），只读展示、不回写任何表。"""
+        host = Card()
+        fields = [
+            (1, "任务ID", "标识"), (2, "编号", "标识"), (3, "账号", "标识"),
+            (4, "品名", "内容"), (5, "标签", "内容"), (6, "备注", "内容"),
+            (7, "提示词", "内容"), (8, "脚本", "内容"),
+            (9, "状态", "运行"), (10, "开始时间", "运行"), (11, "生成用时", "运行"),
+        ]
+        cats = [("标识", [1, 2, 3]), ("内容", [4, 5, 6, 7, 8]), ("运行", [9, 10, 11])]
+        fm = FieldManager(fields, order=[1, 4, 7, 9], hidden={2, 3, 5, 6, 8, 10, 11},
+                          categories=cats)
+        fm.setMinimumHeight(320)
+        status = QLabel("")
+        status.setObjectName("PageTip")
+        status.setWordWrap(True)
+
+        def _refresh(*_a):
+            labels = [fm.label_of(i) for i in fm.order]
+            hid = [fm.label_of(i) for i in sorted(fm.hidden)]
+            status.setText("当前顺序：" + " · ".join(labels)
+                           + ("\n已隐藏：" + " · ".join(hid) if hid else "\n已隐藏：无"))
+        fm.changed.connect(_refresh)
+        _refresh()
+        host.v.addWidget(fm, 1)
+        host.v.addWidget(status)
+        return host
 
     # ================= Tab：弹层 =================
     def _tab_overlay(self):
