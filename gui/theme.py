@@ -8,7 +8,8 @@ QSS 管不到的三处下拉框顽疾，由本文件的 _ComboTweak 在运行时
 - 选中项左侧的「对钩」及其占位（样式绘制，QSS 屏蔽不了）；
 - 弹层宽度不跟随内容，长文字被截一半。
 
-原生 tooltip 黑底顽疾由 _TipPolish 统一兜底（详见类注释）。
+原生 tooltip 由 apply_theme 装的全站接管（gui.kit.install_tip_bubble：拦截
+QEvent.ToolTip 转投单例圆角气泡 TipBubble）——修「方窗套圆角」与「两层弹叠」。
 
 复选框对钩/单选圆点/数字框箭头在 windowsvista 下画不了纯 QSS（会被
 原生样式接管），由 _icon_assets() 启动时在临时目录生成几张透明小图，
@@ -198,62 +199,6 @@ class _ComboTweak(QObject):
             container.setPalette(cpal)
 
 
-class _TipPolish(QObject):
-    """原生 tooltip 保底美化：实测 Win10 上部分环境里，app 级 QSS 的 QToolTip
-    规则与 app palette 两条渠道都管不住原生 tooltip 窗口（QTipLabel），弹出来
-    黑底白字几乎不可读——这就是“图表上那个黑窗口”的根因（它来自控件级
-    setToolTip，不走图表自绘的 _ChartTip）。
-    解法：趁它即将显示的 Show 事件里，给这个窗口本体直接挂控件级样式表 +
-    局部 palette——控件自己的样式表优先级最高，原生样式盖不掉。全站所有
-    残留的原生 tooltip（按钮/表格单元格/标题栏…）一并被拉回浅色。"""
-
-    TIP_QSS = ("background-color:#FFFFFF; color:#1F2329;"
-               " border:1px solid #DEE0E3; border-radius:8px;"
-               " padding:6px 9px; font-size:12px;")
-
-    def eventFilter(self, obj, ev):
-        # 只认原生 tooltip 标签本体（QTipLabel）本身。刻意不去碰它的祖先窗口：
-        # 之前给 window() 也钉样式 + setAutoFillBackground(True)，一旦某个带
-        # ToolTip 标志的窗口解析到主窗体，就会把主窗刷成不透明白底——透明圆角
-        # 窗被盖成一个实心矩形，看着就是「软件外层套了个框」。改回只治 QTipLabel。
-        # Show：给即将弹出的本体钉上白底圆角样式 + 浅色 palette（即时、不重建窗口）。
-        # Hide：趁窗口已收起，一次性补上“逐像素透明 + 关系统投影”——这两个属性要在
-        # 窗口隐藏时设才能在下次创建时真正生效（Show 时改 flags 会把当前 tooltip 打断）。
-        if isinstance(obj, QWidget) and obj.metaObject().className() == "QTipLabel":
-            t = ev.type()
-            if t == QEvent.Show:
-                self._polish(obj)
-            elif t == QEvent.Hide:
-                self._prep_rounded(obj)
-        return False
-
-    def _polish(self, w):
-        # 控件级样式表（优先级最高）+ palette 多角色钉浅色：白底圆角卡由 QSS 画。
-        w.setStyleSheet(tokenize(self.TIP_QSS))
-        from PySide6.QtGui import QPalette, QColor
-        base, ink = QColor(COLORS["card"]), QColor(COLORS["text"])
-        pal = w.palette()
-        for role in (QPalette.ColorRole.ToolTipBase, QPalette.ColorRole.Base,
-                    QPalette.ColorRole.Window):
-            pal.setColor(role, base)
-        for role in (QPalette.ColorRole.ToolTipText, QPalette.ColorRole.Text,
-                    QPalette.ColorRole.WindowText):
-            pal.setColor(role, ink)
-        w.setPalette(pal)
-
-    def _prep_rounded(self, w):
-        """tooltip 收起时对复用单例做一次窗口级设置，让下一次弹出就是干净的圆角：
-        ① WA_TranslucentBackground——圆角外四角透出背景而不是被填成黑角；
-        ② NoDropShadowWindowHint——Windows 会给 ToolTip 顶层窗加一层 DWM 方形投影，
-           叠在圆角透明上就表现为“圆角外面套一圈直角黑边”，关掉它。"""
-        if getattr(w, "_aigc_tip_rounded", False):
-            return
-        w._aigc_tip_rounded = True
-        w.setAutoFillBackground(False)
-        w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        w.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
-
-
 QSS = """
 QWidget { font-family: "Microsoft YaHei UI", "Microsoft YaHei"; font-size: 13px; color: #1F2329; }
 QMainWindow, QDialog { background: #F2F3F5; }
@@ -407,11 +352,10 @@ QPushButton#SideBtn { background: #243144; color: #D5E0F0; border: 1px solid #33
     border-radius: 8px; padding: 7px 10px; margin: 4px 8px; }
 QPushButton#SideBtn:hover { background: #3370FF; color: #FFFFFF; }
 
-/* 悬停提示：① 必须用 background-color— Windows 深色模式下写 background 简写
-   会被原生样式盖成黑底；② 刻意不写 border-radius——Windows 10 的 QToolTip 是
-   矩形弹窗、没有逐像素透明，圆角外的四个角会被填成黑色（“黑角”到处都是）。
-   注意：这两条+app palette 在部分机器上仍压不住黑底，真正的兜底是
-   apply_theme 里挂的 _TipPolish（在 tooltip 窗口 Show 时直接给它本体钉样式） */
+/* 悬停提示（兜底保留）：全站 tooltip 已被 gui.kit 的 _TipRouter 在事件层接管，
+   原生 QTipLabel 正常不再露面；这两条只在极端路径下兼作浅色保险：
+   ① 必须用 background-color——Windows 深色模式下写 background 简写会被原生样式盖成黑底；
+   ② 刻意不写 border-radius——原生 QToolTip 是矩形窗没有逐像素透明，圆角外会被填角 */
 QToolTip { background-color: #FFFFFF; color: #1F2329; border: 1px solid #DEE0E3;
     padding: 6px 9px; font-size: 12px; }
 
@@ -558,9 +502,7 @@ def _arrow_pixmap(color: str):
 
 def apply_theme(app):
     app.setStyleSheet(build_qss())
-    # tooltip 调色板兜底：部分 Windows 环境 QSS 管不住原生 tooltip（黑底白字），
-    # palette 把底色钉成浅色后两条渠道都是白底；仍不够——再挂 _TipPolish
-    # 在 tooltip 窗口弹出的瞬间直接给它本体钉上浅色样式（最终兜底）
+    # tooltip 调色板兜底（原生弹层被接管后基本不露面，极端路径下仍是浅色保险）
     from PySide6.QtGui import QPalette, QColor
     pal = app.palette()
     pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(COLORS["card"]))
@@ -568,13 +510,15 @@ def apply_theme(app):
     # 输入框占位文字统一弱文灰（QSS 无 placeholder 伪元素，只能走 palette）
     pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(COLORS["weak"]))
     app.setPalette(pal)
-    app.installEventFilter(_TipPolish(app))
     app.installEventFilter(_ComboTweak(app))   # 全局修下拉：单箭头覆盖层、无对钩、宽度自适应
-    # 统一消息弹窗：把 QMessageBox 四个静态便捷方法接管成 _round_dialog 圆角浮层
+    # 统一消息弹窗与 tooltip：QMessageBox 四个静态便捷方法接管成 _round_dialog 圆角浮层；
+    # tooltip 接管成单例 TipBubble（拦 QEvent.ToolTip，原生方窗不再露面，全站同一时刻只弹
+    # 一个圆角软阴影气泡）。
     # （延迟导入避开 theme↔kit 模块级循环；kit 已是运行期依赖，不增加启动开销）。
-    # 任何异常都吞掉：最坏只是弹窗回到原生方角，不拖垮整体主题装配。
+    # 任何异常都吞掉：最坏只是弹层回到原生方角，不拖垮整体主题装配。
     try:
-        from gui.kit import install_rounded_messagebox
+        from gui.kit import install_rounded_messagebox, install_tip_bubble
         install_rounded_messagebox()
+        install_tip_bubble(app)
     except Exception:
         pass

@@ -399,16 +399,18 @@ class UiKitPage(QWidget):
     def _tab_overlay(self):
         sa, v = self._tab_shell(
             "浮层：右键菜单 StyledMenu / 悬停 Tooltip / 对话框 QMessageBox。这几颗点了就是真的弹，"
-            "所见即所得，顺便核对 tooltip / 菜单是不是浅色（黑底即需修）。")
+            "所见即所得；tooltip 全站接管成单例圆角白卡（淡灰软阴影），同一时刻只会弹一个。")
         m = KitButton("🖱 点开右键菜单", kind="ghost", obj_name="GhostBtn",
                       desc="演示：弹出全站统一的 StyledMenu 右键菜单（真圆角 + 自绘软阴影）。",
                       explain=False)
         m.clicked.connect(self._show_menu_demo)
         tipb = KitButton("☝ 悬停看 Tooltip", kind="ghost", obj_name="GhostBtn",
-                         desc="演示：悬停弹出 tooltip，应白底深字。", explain=False)
-        tipb.setToolTip("多行 tooltip 示例：\n第一行说明，第二行补充；\n应白底深字、淡描边。")
-        # 接管悬停时机：350ms 即弹，不等系统默认延时，修“悬停没反应”的观感
-        hover_tip(tipb, "悬停即显：\n这条 tooltip 由 _ShowTip 接管，\n350ms 就弹出，不用等系统默认那么久。")
+                         desc="演示：悬停弹出圆角 tooltip 气泡。", explain=False)
+        # 只留一份文案：hover_tip 350ms 即弹，内容就用 widget 自己的 toolTip；
+        # 原生 tooltip 已被 _TipRouter 拦截转投同一颗气泡，不会再“第二个盖第一个”
+        tipb.setToolTip("多行 tooltip 示例：\n第一行说明，第二行补充；\n"
+                        "白底深字、真圆角、淡灰软阴影。")
+        hover_tip(tipb)
         dlg = KitButton("🗨 弹出对话框", kind="primary",
                         desc="演示：弹出一颗真圆角 QMessageBox（顶层去框 + 逐像素透明）。", explain=False)
         dlg.clicked.connect(self._demo_dialog)

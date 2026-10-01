@@ -3,7 +3,8 @@ gui/kit.py —— 全站共享 UI 组件底座（单一真源）
 
 从「UI 组件库」画廊页 gui/pages_ui_kit.py 抽出的、可复用且无页面依赖的成品组件：
 动效按钮 KitButton、交互表格 KitTable + 单元格委托、真圆角弹窗家族
-（_draw_rounded_card / _RoundPopup / _DialogCardPainter / _round_dialog）、多级树下拉
+（_draw_rounded_card / _RoundPopup / _DialogCardPainter / _round_dialog）、全站圆角
+tooltip 气泡 TipBubble（_TipRouter 拦截原生 tooltip，单例只弹一个）、多级树下拉
 TreeSelect、日期选择器族（ModernDatePicker / DateRangePicker / ModernDateEdit /
 CompactCalendar）、浮动气泡滑块 KitSlider、可自由拉伸多行文本 ResizableTextEdit、
 定宽 KPI 卡 _FlowKpiCard，以及标题/对比色/取色等小工具。画廊页与后续各业务页都从
@@ -12,7 +13,7 @@ CompactCalendar）、浮动气泡滑块 KitSlider、可自由拉伸多行文本 
 from PySide6.QtCore import (Qt, QDate, QTimer, QPoint, QRect, QSize, QEvent,
                             QRectF, QPointF, Property, QPropertyAnimation,
                             QEasingCurve, QSortFilterProxyModel, QObject, Signal)
-from PySide6.QtGui import (QColor, QCursor, QPainter, QPen, QBrush,
+from PySide6.QtGui import (QColor, QCursor, QGuiApplication, QPainter, QPen, QBrush,
                            QPainterPath, QFont, QPolygonF, QLinearGradient,
                            QStandardItemModel, QStandardItem, QKeySequence)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -22,8 +23,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QScrollArea, QFrame, QButtonGroup, QSizePolicy,
                                QMessageBox, QFormLayout, QSplitter, QCalendarWidget,
-                               QTreeView, QAbstractItemView, QStyle,
-                               QStyleOptionSlider, QDialog, QApplication, QToolTip,
+                               QTreeView, QAbstractItemView, QStyle, QMenu,
+                               QStyleOptionSlider, QDialog, QApplication,
                                QTableWidgetSelectionRange, QStyledItemDelegate)
 
 from gui import ui_kit
@@ -135,6 +136,133 @@ class _RoundPopup(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         _draw_rounded_card(p, self.rect(), self.radius, self.SHADOW)
         p.end()
+
+
+class TipBubble(_RoundPopup):
+    """全站唯一的圆角 tooltip 气泡：接管所有 tooltip 的显示（_TipRouter 拦 QEvent.ToolTip）。
+
+    为什么不修原生：QTipLabel 是独立的矩形顶层窗口，QSS 的 border-radius 只是在方窗里
+    画了个圆角文本框（外直角内圆角）；而逐像素透明这类属性要赶在窗口创建前设才生效，
+    对复用单例永远慢一拍——怎么调都是「直角套圆角」。这里直接换成自家圆角卡片体系：
+    透明顶层 + 自绘白卡＝四角真圆角，自带一圈淡灰软阴影（_draw_rounded_card）。
+
+    单例复用 → 屏幕上同一时刻永远只有一个 tooltip（修「第二个弹层盖掉第一个」）；
+    ToolTip 窗口标志不抢焦点、不抓键盘，悬停即显、离开即隐。"""
+    _INST = None
+    MAX_W = 360
+
+    @classmethod
+    def instance(cls):
+        if cls._INST is None:
+            cls._INST = TipBubble()
+        return cls._INST
+
+    def __init__(self):
+        super().__init__()
+        # 基类默认 Popup（抓鼠标/键盘）；tooltip 要做到不打扰：换成 ToolTip 窗
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+                            | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self._lbl = QLabel()
+        self._lbl.setTextFormat(Qt.TextFormat.PlainText)   # 贴的内容不当 HTML 解析
+        self._lbl.setWordWrap(True)
+        self._lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._lbl.setStyleSheet(f"background:transparent;border:none;"
+                                f"color:{C['text']};font-size:12px;")
+        self.content.addWidget(self._lbl)
+        self._src = None
+        self._watch = QTimer(self)
+        self._watch.setInterval(150)
+        self._watch.timeout.connect(self._tick)
+
+    def show_for(self, text, src=None):
+        """在鼠标旁弹出：src 为发起 tooltip 的控件（用于判断「鼠标是否已离开」）。"""
+        text = str(text or "").strip()
+        if not text:
+            self.hide()
+            return
+        self._src = src
+        self._lbl.setText(text)
+        # 宽度按内容单行宽封顶 MAX_W；高度按换行后的真实需求算
+        w = min(self.MAX_W, max(60, self._lbl.sizeHint().width()))
+        self._lbl.setFixedWidth(w)
+        self._lbl.setFixedHeight(max(self._lbl.heightForWidth(w),
+                                     self._lbl.sizeHint().height()))
+        self.adjustSize()
+        self.move(self._place(QCursor.pos() + QPoint(14, 18)))
+        self.show()
+        self._watch.start()
+
+    def _place(self, pos):
+        """默认跟鼠标右下；贴屏幕边时夹回可视区。"""
+        scr = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
+        av = scr.availableGeometry()
+        x = min(pos.x(), av.right() - self.width() - 4)
+        y = min(pos.y(), av.bottom() - self.height() - 4)
+        return QPoint(max(av.left() + 4, x), max(av.top() + 4, y))
+
+    def _tick(self):
+        """保活判定：鼠标还在气泡里或还在来源控件上→继续挂，否则收起。"""
+        pos = QCursor.pos()
+        if self.geometry().adjusted(-6, -6, 6, 6).contains(pos):
+            return
+        w = self._src
+        if w is not None and w.isVisible() and \
+                QRect(w.mapToGlobal(QPoint(0, 0)), w.size()).contains(pos):
+            return
+        self.hide()
+
+    def hide(self):
+        self._watch.stop()
+        super().hide()
+
+
+class _TipRouter(QObject):
+    """全站原生 tooltip 拦截器：把即将弹出的 ToolTip 事件截下来、自己解析文案转投
+    单例 TipBubble，并吃掉事件（return True）——原生 QTipLabel 方窗从此没机会露面，
+    调用点 setToolTip 一行不改自动获得圆角软阴影；也只弹一颗窗口。
+
+    为什么不能直接读事件里的文案：Qt 发出的 QTipEvent 在 PySide6 没有绑定类
+    （到 Python 侧是光秃秃的 QHelpEvent，没有 text()），只能按 Qt 自己的取值链解析：
+    条目视图→鼠标下指标的 ToolTipRole；菜单→鼠标下动作的 toolTip；其它→控件自身
+    toolTip()。全站 tooltip 文案均来自这三条 setToolTip 途径（无自定义 ToolTip 处理），
+    解析不到就静默隐去（与原生「空文案不弹」一致）。
+    只拦 ToolTip：StatusTip（状态栏提示另一条链）不属 tooltip 弹层，不碰。"""
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.ToolTip:
+            text = self._resolve_text(obj) if isinstance(obj, QWidget) else ""
+            if text:
+                TipBubble.instance().show_for(text, obj)
+            else:
+                TipBubble.instance().hide()
+            return True                       # 吃掉：原生弹层不再露面
+        if t in (QEvent.Type.MouseButtonPress, QEvent.Type.Wheel):
+            TipBubble.instance().hide()       # 按下/滚动即隐（与原生 tooltip 行为一致）
+        return False
+
+    def _resolve_text(self, obj):
+        if isinstance(obj, QMenu):
+            a = obj.actionAt(obj.mapFromGlobal(QCursor.pos()))
+            if a is not None and a.toolTip():
+                return a.toolTip()
+        if isinstance(obj, QAbstractItemView):
+            idx = obj.indexAt(obj.viewport().mapFromGlobal(QCursor.pos()))
+            if idx.isValid():
+                d = idx.data(Qt.ItemDataRole.ToolTipRole)
+                if d:
+                    return str(d)
+        if isinstance(obj, QWidget):
+            return obj.toolTip()
+        return ""
+
+
+def install_tip_bubble(app):
+    """装全站 tooltip 接管（theme.apply_theme 启动时调）。幂等：只装一次。"""
+    if getattr(app, "_aigc_tip_router", None) is None:
+        app._aigc_tip_router = _TipRouter(app)
+        app.installEventFilter(app._aigc_tip_router)
 
 
 _DIALOG_SHADOW = 18   # 无边框对话框四周撑出的阴影带（也是自绘卡片的外边距）
@@ -257,14 +385,14 @@ def install_rounded_messagebox():
 
 
 class _ShowTip(QObject):
-    """“悬停即弹”的 tooltip 加速器：Enter 起 350ms 短延时后直接调 QToolTip.showText，
-    比默认 ~700ms 灵敏，离开/按下即隐——解决画廊里“悬停看 tooltip 没反应”的观感
-    （tooltip 本体配色仍由 _TipPolish 统一兜底，这里只负责“让它确实弹出来”）。"""
+    """“悬停即弹”的 tooltip 加速器：Enter 起 350ms 短延时后直接弹单例 TipBubble，
+    比原生 ~700ms 灵敏，离开/按下即隐。与 _TipRouter 共用同一颗气泡——屏幕上同一
+    时刻永远只有一个 tooltip，不会再出现「第二个弹层盖掉第一个」。"""
 
-    def __init__(self, widget, text):
+    def __init__(self, widget, text=""):
         super().__init__(widget)
         self._w = widget
-        self._text = text
+        self._text = str(text or "")
         self._t = QTimer(widget)
         self._t.setSingleShot(True)
         self._t.setInterval(350)
@@ -273,7 +401,7 @@ class _ShowTip(QObject):
 
     def _show(self):
         if self._w.isVisible() and self._w.underMouse():
-            QToolTip.showText(QCursor.pos(), self._text, self._w)
+            TipBubble.instance().show_for(self._text or self._w.toolTip(), self._w)
 
     def eventFilter(self, obj, ev):
         if obj is self._w:
@@ -281,12 +409,14 @@ class _ShowTip(QObject):
                 self._t.start()
             elif ev.type() in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress):
                 self._t.stop()
-                QToolTip.hideText()
+                TipBubble.instance().hide()
         return False
 
 
-def hover_tip(widget, text):
-    """给 widget 挂一条悬停即显的 tooltip（QSS 里再快也受默认延时，这里直接接管）。"""
+def hover_tip(widget, text=""):
+    """给 widget 挂一条悬停即显的 tooltip（350ms 即弹，不等系统默认延时）。
+    text 省略＝直接用 widget 自己的 toolTip：同一控件别再叠两套不同文案，
+    否则 350ms 先弹加速器文本、原生随后又用 tooltip 文本换掉内容（看着像弹了两个）。"""
     return _ShowTip(widget, text)
 
 

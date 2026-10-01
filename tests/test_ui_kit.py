@@ -66,6 +66,46 @@ def test_rgba_and_palettes():
     assert ui_kit.FIELD_COLORS["seq"] == ui_kit.COLORS["primary"]
 
 
+def test_tooltip_takeover_single_rounded_bubble(qapp):
+    """tooltip 全站接管：ToolTip 事件被 _TipRouter 拦下、文案从控件侧解析后转投单例
+    TipBubble——原生 QTipLabel（矩形窗、直角套圆角的根源）不再露面；再弹第二份内容
+    是同一颗气泡换文案，结构上不可能出现「第二个弹层盖掉第一个」。
+    注：Qt 真实发出的 QTipEvent 在 PySide6 没有绑定类（到 Python 侧无 text()），
+    所以用例发同类型普通 QEvent，验证的正是 router「不读事件、只解析控件」的链。"""
+    from PySide6.QtCore import QPoint, Qt, QEvent
+    from PySide6.QtWidgets import QLabel
+    from gui.theme import apply_theme
+    from gui.kit import TipBubble
+
+    def tip_event():
+        return QEvent(QEvent.Type.ToolTip)
+
+    apply_theme(qapp)                       # 幂等：install_tip_bubble 挂在其内
+    w = QLabel("x")
+    w.setToolTip("第一段内容")
+    qapp.sendEvent(w, tip_event())
+    b = TipBubble.instance()
+    assert b.isVisible() and b._lbl.text() == "第一段内容", "ToolTip 应转投圆角气泡"
+    # 单例复用：换内容不新建窗口
+    w.setToolTip("第二段内容")
+    qapp.sendEvent(w, tip_event())
+    assert TipBubble.instance() is b and b._lbl.text() == "第二段内容"
+    # 原生通道没被触发：不该有任何可见的 QTipLabel 顶层窗
+    labels = [t for t in qapp.topLevelWidgets()
+              if t.metaObject().className() == "QTipLabel"]
+    assert all(not t.isVisible() for t in labels), "原生 tooltip 仍被弹了出来"
+    # 按下即隐（与原生 tooltip 行为一致）
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QMouseEvent
+    qapp.sendEvent(w, QMouseEvent(QEvent.Type.MouseButtonPress,
+                                  QPointF(1, 1), w.mapToGlobal(QPoint(1, 1)),
+                                  Qt.MouseButton.LeftButton,
+                                  Qt.MouseButton.LeftButton,
+                                  Qt.KeyboardModifier.NoModifier))
+    assert not b.isVisible(), "鼠标按下后气泡应收起"
+    b.hide()
+
+
 def test_gallery_page_builds(qapp):
     """UI 画廊页离屏构建：Tab 分类 + 自绘动效按钮 + 单框多级树/日期/滑块/表格/胶囊等新组件都在。"""
     from gui.theme import apply_theme
