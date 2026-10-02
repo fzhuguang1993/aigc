@@ -160,6 +160,81 @@ def test_field_manager_insert_index_at_empty(qapp):
     assert fm._bar.insert_index_at(QPoint(10, 10)) == 0
 
 
+# ------------------------------------------------ 表头右键：三个二级菜单 + 默认展开
+def _kit_table(qapp):
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+    t = QTableWidget(3, 2)
+    t.setHorizontalHeaderLabels(["甲", "乙"])
+    for r, row in enumerate([["10", "x"], ["9", "y"], ["100", "z"]]):
+        for c, v in enumerate(row):
+            t.setItem(r, c, QTableWidgetItem(v))
+    return t
+
+
+def test_header_menu_three_submenus_with_default_expand(qapp):
+    from gui.kit import TableColumnKit
+    kit = TableColumnKit(_kit_table(qapp))
+    plan = kit._build_header_menus(0)
+    assert list(plan) == ["align", "order", "format"]
+    assert {m.title() for m, _ in plan.values()} == {"居中调整", "顺序调整", "字段格式"}
+    texts = {k: [a.text() for a in m.actions() if not a.isSeparator()]
+             for k, (m, _) in plan.items()}
+    assert texts["align"][:4] == ["本列靠左", "本列居中", "本列靠右", "本列垂直居中"]
+    assert texts["order"][:2] == ["升序排列", "降序排列"]
+    assert texts["format"][:3] == ["文本", "数字", "日期"]
+    for k, (m, handlers) in plan.items():
+        expands = [a for a in m.actions() if a.text() == "默认展开"]
+        assert len(expands) == 1 and expands[0] in handlers
+
+
+def test_header_menu_default_expand_toggle(qapp, monkeypatch):
+    from gui.kit import TableColumnKit
+    t = _kit_table(qapp)
+    t.setObjectName("UTMenuTable")
+    saved = {}
+    from store import app_state
+    monkeypatch.setattr(app_state, "get", lambda k, d=None: {})
+    monkeypatch.setattr(app_state, "set_value", lambda k, v: saved.setdefault(k, v))
+    kit = TableColumnKit(t)
+    kit._toggle_default_expand("align")
+    assert kit._expand == "align"
+    assert saved["colkit::UTMenuTable"]["expand"] == "align"
+    # 再点同一个：解除默认
+    kit._toggle_default_expand("align")
+    assert kit._expand is None
+    # 换到另一个：互斥
+    kit._toggle_default_expand("order")
+    kit._toggle_default_expand("format")
+    assert kit._expand == "format"
+
+
+def test_apply_sort_number_moves_whole_rows(qapp):
+    from PySide6.QtCore import Qt
+    from gui.kit import TableColumnKit
+    t = _kit_table(qapp)
+    kit = TableColumnKit(t)
+    kit._set_col_format(0, "number")
+    kit._apply_sort(0, Qt.SortOrder.AscendingOrder)
+    # 数字口径：9 < 10 < 100（文本口径会是 10,100,9）；整行随行迁移
+    assert [t.item(r, 0).text() for r in range(3)] == ["9", "10", "100"]
+    assert [t.item(r, 1).text() for r in range(3)] == ["y", "x", "z"]
+    kit._apply_sort(0, Qt.SortOrder.DescendingOrder)
+    assert [t.item(r, 0).text() for r in range(3)] == ["100", "10", "9"]
+    # 菜单排序不残留激活箭头（-1＝无排序列）
+    assert t.horizontalHeader().sortIndicatorSection() == -1
+
+
+def test_fmt_key_number_and_date(qapp):
+    from gui.kit import _fmt_key
+    assert _fmt_key("1,280", "number") == 1280.0
+    assert _fmt_key("—", "number") == float("-inf")
+    # 中文年月日与 ISO 同轴；个位月日补零不串位
+    assert _fmt_key("2026年9月9日", "date") < _fmt_key("2026-09-19", "date")
+    assert _fmt_key("2026-09-09", "date") == _fmt_key("2026年9月9日", "date")
+    assert _fmt_key("2026-09-19 12:30", "date") > _fmt_key("2026-09-19 09:59", "date")
+    assert _fmt_key("任意", "text") == "任意"
+
+
 # ------------------------------------------------------- FieldManagerDialog 薄封装
 def test_dialog_to_fields_mapping(qapp):
     from gui.tablekit import FieldManagerDialog

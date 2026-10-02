@@ -11,6 +11,7 @@ CompactCalendar）、浮动气泡滑块 KitSlider、可自由拉伸多行文本 
 这里复用，保证「同一套组件、同一口径」；颜色 / 字号 / 圆角一律吃 gui/ui_kit 令牌。
 """
 import json
+import re
 
 from PySide6.QtCore import (Qt, QDate, QTimer, QPoint, QRect, QSize, QEvent,
                             QRectF, QPointF, Property, QPropertyAnimation,
@@ -18,7 +19,8 @@ from PySide6.QtCore import (Qt, QDate, QTimer, QPoint, QRect, QSize, QEvent,
                             QMimeData)
 from PySide6.QtGui import (QColor, QCursor, QGuiApplication, QPainter, QPen, QBrush,
                            QPainterPath, QFont, QPolygonF, QLinearGradient,
-                           QStandardItemModel, QStandardItem, QKeySequence, QDrag)
+                           QStandardItemModel, QStandardItem, QKeySequence, QDrag,
+                           QActionGroup)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QPlainTextEdit, QComboBox,
                                QSpinBox, QDoubleSpinBox, QDateEdit, QCheckBox,
@@ -1425,9 +1427,29 @@ class _MarqueeLayer(QWidget):
         p.end()
 
 
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _fmt_key(s, fmt):
+    """字段格式比较键：number 取首个数字（去千分位逗号）；date 按分隔段拆出数字、
+    逐段补零拼成定长整数（年 4 位、其余 2 位，「2026年9月9日」与「2026-09-09」同轴）；
+    其余按文本。"""
+    if fmt == "number":
+        m = _NUM_RE.search(str(s).replace(",", ""))
+        return float(m.group()) if m else float("-inf")
+    if fmt == "date":
+        parts = [p for p in re.split(r"\D+", str(s)) if p]
+        buf = "".join(p if len(p) == 4 else p.zfill(2) for p in parts)
+        return int((buf + "0" * 14)[:14]) if buf else 0
+    return str(s)
+
+
 class TableColumnKit(QObject):
     """可复用表格装配器，attach 到任意 QTableWidget 补上两件事（被 KitTable 复用=单一真源）：
-    ① 表头右键 → 本列靠左/居中/靠右 / 垂直居中 / 自动换行；
+    ① 表头右键 → 一级菜单：居中调整 / 顺序调整 / 字段格式 三个二级菜单；
+      每个二级菜单尾部带「默认展开」，选中后右键直达该二级菜单（不再出一级菜单）；
+      顺序调整＝升序/降序排列（不画排序箭头提示），字段格式（文本/数字/日期）决定比较口径；
+      选择与列格式经 store.app_state 按页面键持久化（丢了不影响业务）；
     ② Ctrl+C 复制选中区（制表符分隔）并在选区外画 Excel 式「行走的虚线框」，Esc 取消；
       可选 show_selection_ring=True 时平时给选区画一圈实线环（KitTable 用）。
     除表头右键与 Copy/Esc 两个键外，绝不触碰各表自己的委托、选择模式、排序、单元格
@@ -1446,6 +1468,16 @@ class TableColumnKit(QObject):
         self._wrap = table.wordWrap()   # 跟随表格现状，菜单首项文案才准确
         self._col_h = {}                # col → 水平对齐基准（仅水平位）
         self._col_v = {}                # col → 垂直对齐基准（仅垂直位）
+        # 表头右键菜单偏好：列格式（col→text/number/date）与「默认展开」的二级菜单
+        self._col_fmt = {}
+        self._expand = None
+        prefs = self._load_prefs()
+        self._expand = prefs.get("expand") if prefs.get("expand") in ("align", "order", "format") else None
+        try:
+            self._col_fmt = {int(k): v for k, v in (prefs.get("fmt") or {}).items()
+                             if v in ("text", "number", "date")}
+        except (TypeError, ValueError):
+            self._col_fmt = {}
         vh = table.verticalHeader()
         self._row_h0 = (baseline_h if baseline_h is not None
                         else vh.defaultSectionSize())
@@ -1562,30 +1594,165 @@ class TableColumnKit(QObject):
         app.clipboard().setText("\n".join(lines))
         self._marquee.start(ranges)
 
-    def _show_header_menu(self, col, gpos):
-        menu = StyledMenu(self._t)
-        # 对标飞书：菜单项纯文字——不挂箭头 emoji（字形宽窄不一会把文字挤得参差），
-        # 也不带【列名】前缀（本就是从那一列表头右键弹出的，列名是冗余）；去掉后各
-        # 行统一顶到 QMenu::item 的 16px 左内边距，天然左对齐。
-        a_l = menu.addAction("本列靠左")
-        a_c = menu.addAction("本列居中")
-        a_r = menu.addAction("本列靠右")
-        menu.addSeparator()
-        a_v = menu.addAction("本列垂直居中")
-        menu.addSeparator()
-        a_w = menu.addAction("取消自动换行" if self._wrap else "自动换行")
-        chosen = menu.exec(gpos)
+    # ---- 表头右键菜单：一级 = 居中调整 / 顺序调整 / 字段格式 三个二级菜单 ----
+    # 每个二级菜单尾部带「默认展开」：选中后右键直达该二级菜单；直达面板里给
+    # 「打开完整菜单」兑底回退。纯构建（_build_header_menus）不 exec，单测可直接校验结构。
+    _SUB_ORDER = ("align", "order", "format")
+    _SUB_TITLE = {"align": "居中调整", "order": "顺序调整", "format": "字段格式"}
+
+    def _build_header_menus(self, col):
+        """构建三个二级菜单及 action→处理函数映射（不 exec）；返回 {key: (QMenu, handlers)}。"""
         A = Qt.AlignmentFlag
-        if chosen is a_l:
-            self.set_col_align(col, A.AlignLeft)
-        elif chosen is a_c:
-            self.set_col_align(col, A.AlignHCenter)
-        elif chosen is a_r:
-            self.set_col_align(col, A.AlignRight)
-        elif chosen is a_v:
-            self.set_col_valign(col, A.AlignVCenter)
-        elif chosen is a_w:
-            self.toggle_wrap()
+        So = Qt.SortOrder
+        plan = {}
+
+        m = StyledMenu(self._SUB_TITLE["align"])
+        a_l = m.addAction("本列靠左")
+        a_c = m.addAction("本列居中")
+        a_r = m.addAction("本列靠右")
+        m.addSeparator()
+        a_v = m.addAction("本列垂直居中")
+        a_w = m.addAction("取消自动换行" if self._wrap else "自动换行")
+        plan["align"] = (m, {
+            a_l: lambda: self.set_col_align(col, A.AlignLeft),
+            a_c: lambda: self.set_col_align(col, A.AlignHCenter),
+            a_r: lambda: self.set_col_align(col, A.AlignRight),
+            a_v: lambda: self.set_col_valign(col, A.AlignVCenter),
+            a_w: self.toggle_wrap,
+        })
+
+        m = StyledMenu(self._SUB_TITLE["order"])
+        a_asc = m.addAction("升序排列")
+        a_desc = m.addAction("降序排列")
+        plan["order"] = (m, {
+            a_asc: lambda: self._apply_sort(col, So.AscendingOrder),
+            a_desc: lambda: self._apply_sort(col, So.DescendingOrder),
+        })
+
+        m = StyledMenu(self._SUB_TITLE["format"])
+        cur = self._col_fmt.get(col, "text")
+        grp = QActionGroup(m)          # 三选一：同组 checkable 天然互斥
+        handlers = {}
+        for val, label in (("text", "文本"), ("number", "数字"), ("date", "日期")):
+            act = m.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(cur == val)
+            grp.addAction(act)
+            handlers[act] = (lambda v=val: self._set_col_format(col, v))
+        plan["format"] = (m, handlers)
+
+        # 每个二级菜单尾部：默认展开（再点一次可取消，radio 语义自持）
+        for key, (m, handlers) in plan.items():
+            m.addSeparator()
+            act = m.addAction("默认展开")
+            act.setCheckable(True)
+            act.setChecked(self._expand == key)
+            handlers[act] = (lambda k=key: self._toggle_default_expand(k))
+        return plan
+
+    def _exec_full_menu(self, plan, gpos):
+        """一级菜单：按固定顺序挂三个二级菜单，返回被选中的 action（或 None）。"""
+        menu = StyledMenu(self._t)
+        for key in self._SUB_ORDER:
+            menu.addMenu(plan[key][0])
+        return menu.exec(gpos)
+
+    def _show_header_menu(self, col, gpos):
+        plan = self._build_header_menus(col)
+        chosen = None
+        if self._expand in plan:
+            # 右键直达默认展开的二级菜单：附一条「打开完整菜单」回退项（点了即解除默认）
+            sub, _h = plan[self._expand]
+            sub.addSeparator()
+            back = sub.addAction("⋯ 打开完整菜单")
+            chosen = sub.exec(gpos)
+            if chosen is back:
+                self._expand = None
+                self._save_prefs()
+                plan = self._build_header_menus(col)
+                chosen = self._exec_full_menu(plan, gpos)
+        else:
+            chosen = self._exec_full_menu(plan, gpos)
+        if chosen is None:
+            return
+        for _m, handlers in plan.values():
+            fn = handlers.get(chosen)
+            if fn is not None:
+                fn()
+                return
+
+    def _toggle_default_expand(self, key):
+        self._expand = None if self._expand == key else key
+        self._save_prefs()
+
+    def _set_col_format(self, col, fmt):
+        self._col_fmt[col] = fmt
+        self._save_prefs()
+
+    def _apply_sort(self, col, order):
+        """菜单排序：按「字段格式」比大小；不画排序箭头提示（升降序走菜单，箭头让位）。"""
+        t = self._t
+        hdr = t.horizontalHeader()
+        hdr.setSortIndicator(-1, order)      # -1＝清空内建指示，表头不保留激活箭头
+        fmt = self._col_fmt.get(col, "text")
+        if fmt == "text":
+            t.sortItems(col, order)          # 文本：交给 item 比较（SecsItem 等自持 __lt 的照旧生效）
+            return
+        ncol = t.columnCount()
+        was = t.isSortingEnabled()
+        t.setSortingEnabled(False)           # 手动换位期间关掉自动排，免得 setItem 逐格触发重排
+        try:
+            rows = list(range(t.rowCount()))
+            grid = {r: [t.takeItem(r, c) for c in range(ncol)] for r in rows}
+
+            def key(r):
+                it = grid[r][col]
+                return _fmt_key(it.text() if it is not None else "", fmt)
+
+            rows.sort(key=key, reverse=(order == Qt.SortOrder.DescendingOrder))
+            for new_r, old_r in enumerate(rows):
+                for c in range(ncol):
+                    it = grid[old_r][c]
+                    if it is not None:
+                        t.setItem(new_r, c, it)
+        finally:
+            t.setSortingEnabled(was)
+        t.viewport().update()
+
+    # ---- 偏好持久化：按页面类名做键，丢了不影响业务 ----
+    def _pref_key(self):
+        name = self._t.objectName()
+        if name:
+            return f"colkit::{name}"
+        w = self._t.parent()
+        while w is not None:
+            cls = type(w).__name__
+            if cls.endswith("Page"):
+                return f"colkit::{cls}"
+            w = w.parent()
+        return None
+
+    def _load_prefs(self):
+        key = self._pref_key()
+        if not key:
+            return {}
+        try:
+            from store import app_state
+            v = app_state.get(key, {})
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_prefs(self):
+        key = self._pref_key()
+        if not key:
+            return
+        try:
+            from store import app_state
+            app_state.set_value(key, {"expand": self._expand,
+                                      "fmt": {str(c): f for c, f in self._col_fmt.items()}})
+        except Exception:
+            pass
 
     def enable_sort_arrows(self, no_arrow_cols=(0,)):
         """把表格当前水平表头换成 SortableTableHeader（每列画排序箭头）：
@@ -2191,9 +2358,10 @@ class FieldManager(QWidget):
             # 左字段池与右顺序区共用一套圆角外框（浅底 + 1px 边 + card 圆角），两边对称
             f"#FMPool,#FMOrderWrap{{background:{C['bg_field']};"
             f"border:1px solid {C['border']};border-radius:{card_r}px;}}"
-            # 分类标题：外框已给边框，组内不再描边（避免双层框），只留标题文字
+            # 分类标题：外框已给边框，组内不再描边（避免双层框），只留标题文字；
+            # margin-top 给标题留出一条带高（标题画在 margin 区），否则标题会压住首行勾选框
             f"#FieldManager QGroupBox{{border:none;background:transparent;"
-            f"font-weight:600;color:{C['sub']};margin-top:2px;padding:0;}}"
+            f"font-weight:600;color:{C['sub']};margin-top:18px;padding:0;}}"
             f"#FieldManager QGroupBox::title{{subcontrol-origin:margin;left:2px;padding:0;}}"
             f"#FieldManager QCheckBox{{color:{C['text']};font-size:13px;"
             f"background:transparent;spacing:6px;}}"
