@@ -17,16 +17,16 @@ import os
 from PySide6.QtCore import Qt, QThread, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QTableWidget, QTableWidgetItem,
+                               QPushButton, QTableWidgetItem,
                                QHeaderView, QMessageBox, QApplication,
-                               QAbstractItemView, QCheckBox, QFormLayout, QPlainTextEdit,
+                               QCheckBox, QFormLayout, QPlainTextEdit,
                                QScrollArea, QFrame, QFileDialog)
 
 from core.config import CONFIG_JSON, ACCOUNTS, TRANSLATE
 from core.api_client import health
 from core.setup_wizard import _normalize_base
 from gui.header import page_header, Card
-from gui.kit import TableColumnKit
+from gui.kit import KitTable
 from utils.desktop_utils import open_path
 from gui.theme import tokenize
 
@@ -176,9 +176,9 @@ class ApiManagerPage(QWidget):
         line_card.v.addWidget(QLabel("线路部署（一个地址 = 一个账号，双击单元格可编辑；"
                              "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」看"
                              "单条线路，要一次对比几条就用下方「🌐 打开选中」）："))
-        self.acc_table = QTableWidget(0, 4)
-        self.acc_table.setHorizontalHeaderLabels(["账号名", "接口地址", "并发数", "打开"])
-        TableColumnKit(self.acc_table)     # 统一列交互：表头右键靠左/中/右/换行
+        self.acc_table = KitTable(0, 4, ["账号名", "接口地址", "并发数", "打开"],
+                                  zebra=False, row_number=True,
+                                  select="rows", multi=True, edit=True)
         self.acc_table.horizontalHeader().setSectionResizeMode(COL_BASE,
                                                                QHeaderView.ResizeMode.Stretch)
         self.acc_table.setColumnWidth(COL_NAME, 110)
@@ -191,9 +191,6 @@ class ApiManagerPage(QWidget):
         self.acc_table.setStyleSheet(
             tokenize("QTableWidget::item { padding: 3px 8px; border-bottom: 1px solid #EFF0F1; }"
             "QTableWidget::item:selected { background: #EAF1FF; color: #1F2329; }"))
-        # 整行选中 + 连续多选：鼠标按住拖就能圈好几行，配合批量删除
-        self.acc_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.acc_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         line_card.v.addWidget(self.acc_table, 1)
 
         bar = QHBoxLayout()

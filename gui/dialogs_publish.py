@@ -14,13 +14,13 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QLineEdit, QComboBox, QPlainTextEdit, QDialog,
-                               QTableWidget, QTableWidgetItem, QHeaderView,
-                               QAbstractItemView, QMessageBox, QFormLayout,
+                               QTableWidgetItem, QHeaderView,
+                               QMessageBox, QFormLayout,
                                QFileDialog, QGroupBox, QWidget)
 
 from gui.header import page_header
 from gui.tool_panels import BasePanel, ToolWorker, FileListWidget, VIDEO_EXT
-from gui.kit import TableColumnKit
+from gui.kit import KitTable
 
 
 def _split_tags(s):
@@ -220,12 +220,8 @@ class PublishPanel(BasePanel):
             head.addWidget(b)
         outer.addLayout(head)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["选", "平台", "别名", "鉴权", "登录态"])
-        TableColumnKit(self.table)      # 统一列交互：表头右键靠左/中/右/换行
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table = KitTable(0, 5, ["选", "平台", "别名", "鉴权", "登录态"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setFixedHeight(150)
         outer.addWidget(self.table)
 

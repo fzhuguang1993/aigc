@@ -5,7 +5,7 @@ gui/pages_records.py —— 执行记录 + 实时日志
 from PySide6.QtCore import Qt, QTimer, QDate
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                               QTableWidget, QTableWidgetItem, QHeaderView,
+                               QTableWidgetItem, QHeaderView,
                                QPlainTextEdit, QMessageBox, QLineEdit,
                                QCheckBox, QAbstractItemView, QDialog)
 
@@ -16,7 +16,7 @@ from gui.header import page_header, Card
 from gui.widgets import LoadingOverlay
 from gui.tablekit import (FieldManagerDialog, apply_field_layout, enable_drag_with_lock,
                           SecsItem, mount_header_checkbox)
-from gui.kit import TableColumnKit, DateRangePicker
+from gui.kit import KitTable, DateRangePicker
 
 DATA_HEADERS = ["开始时间", "编号", "品名", "账号", "状态", "结束时间",
                 "总用时", "生成", "排队", "输出文件", "错误信息"]
@@ -94,14 +94,10 @@ class RecordsPage(QWidget):
         # ---------- 表格 ----------
         content = Card(margins=(12, 10, 12, 10))
         content.v.setSpacing(8)
-        self.table = QTableWidget(0, len(HEADERS))
-        self.table.setHorizontalHeaderLabels(HEADERS)
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table = KitTable(
+            0, len(HEADERS), HEADERS,
+            zebra=True, row_number=False, select=None, edit=False)
         self.table.setSortingEnabled(True)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setWordWrap(False)
         self.table.setColumnWidth(CHECK_COL, 36)
         self.table.horizontalHeader().setSortIndicatorShown(False)
         enable_drag_with_lock(self.table, lock_count=1)
@@ -115,10 +111,7 @@ class RecordsPage(QWidget):
         # 默认「最新在前」：按开始时间倒序，与任务中心口径一致（点表头可改列/方向）
         self.table.horizontalHeader().setSortIndicator(COL_START, Qt.SortOrder.DescendingOrder)
         content.v.addWidget(self.table, 3)
-        # 统一列交互：表头右键可设本列靠左/居中/靠右 / 垂直居中 / 自动换行。
-        # 复用 gui.kit.TableColumnKit：只接管「表头右键」这一个入口，不改本页
-        # 的选择模式 / 排序 / 字段管理 / 勾选导出等既有行为（实例随表析构）。
-        TableColumnKit(self.table)
+        # （表头右键多级菜单 / 列对齐 / Ctrl+C 已由 KitTable 内部 TableColumnKit 承担）
         # 勾选列表头挂一枚可见的全选框（三态），与任务中心同口径：本页全选/清空当前可见记录
         self._hdr_check = mount_header_checkbox(
             self.table, CHECK_COL, self._on_check_all_toggle, self._check_all_state)

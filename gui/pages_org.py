@@ -15,12 +15,12 @@ refresh() 被主窗口 2 秒定时驱动：全部按数据签名比对，没变�
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QDialog, QComboBox, QLineEdit,
-                               QTabWidget, QTableWidget, QTableWidgetItem,
+                               QTabWidget, QTableWidgetItem,
                                QListWidget, QListWidgetItem, QHeaderView,
-                               QAbstractItemView, QMessageBox, QInputDialog)
+                               QMessageBox, QInputDialog)
 
 from gui.header import page_header
-from gui.kit import TableColumnKit
+from gui.kit import KitTable
 from gui.window_frame import apply_rounded
 from store import org_store
 
@@ -133,16 +133,8 @@ class OrgPage(QWidget):
         bar.addWidget(self.lbl_mem_hint)
         v.addLayout(bar)
 
-        self.tbl_mem = QTableWidget(0, len(_COLS))
-        self.tbl_mem.setHorizontalHeaderLabels(_COLS)
-        TableColumnKit(self.tbl_mem)    # 统一列交互：表头右键靠左/中/右/换行
-        self.tbl_mem.verticalHeader().setVisible(False)
-        self.tbl_mem.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.tbl_mem.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
-        self.tbl_mem.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl_mem = KitTable(0, len(_COLS), _COLS, zebra=False, row_number=False,
+                                select="rows", multi=False, edit=False)
         self.tbl_mem.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         v.addWidget(w_ := self.tbl_mem, 1)
@@ -331,12 +323,8 @@ class OrgPage(QWidget):
         t.setObjectName("InlineTip")
         t.setWordWrap(True)
         v.addWidget(t)
-        self.tbl_line = QTableWidget(0, 2)
-        self.tbl_line.setHorizontalHeaderLabels(("线路", "归属成员"))
-        TableColumnKit(self.tbl_line)   # 统一列交互：表头右键靠左/中/右/换行
-        self.tbl_line.verticalHeader().setVisible(False)
-        self.tbl_line.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_line = KitTable(0, 2, ["线路", "归属成员"], zebra=False,
+                                 row_number=False, select="items", edit=False)
         hh = self.tbl_line.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)

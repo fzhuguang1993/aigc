@@ -12,10 +12,10 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox,
-                               QComboBox, QCheckBox, QListWidget, QTableWidget,
+                               QComboBox, QCheckBox, QListWidget,
                                QTableWidgetItem, QHeaderView, QFileDialog,
                                QPlainTextEdit, QProgressBar, QFormLayout,
-                               QGroupBox, QMessageBox, QAbstractItemView,
+                               QGroupBox, QMessageBox,
                                QApplication, QInputDialog)
 
 from core.config import DOWNLOAD_DIR, MATERIAL_DIR
@@ -398,10 +398,10 @@ class RenamePanel(BasePanel):
         row.addStretch(1)
         outer.addLayout(row)
 
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["原文件名", "新文件名"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # 延迟导入：gui.kit → gui.widgets → gui.tool_panels 存在环，模块顶导入会触环
+        from gui.kit import KitTable
+        self.table = KitTable(0, 2, ["原文件名", "新文件名"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setFixedHeight(150)
         outer.addWidget(self.table)
 

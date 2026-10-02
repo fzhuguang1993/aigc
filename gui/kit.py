@@ -1735,17 +1735,48 @@ class TableColumnKit(QObject):
 
 
 class KitTable(QTableWidget):
-    def __init__(self, rows, cols, headers, parent=None):
+    """全站标准表格（UI 库基准）：把各页在裸 QTableWidget 上反复手写的公共装配收敛成一处，
+    页面按需传参、不再各自拼配置。默认形态＝最常见的「只读 · 整行选 · 斑马纹 · 单行省略 ·
+    隐藏行号」数据表；差异化用构造参数表达。
+
+    构造参数（均关键字，默认值＝全站基准形态）：
+      zebra         交替行底色（斑马纹）；默认 True。
+      row_number    左侧行号列（纵向表头）显隐；默认 False（隐藏）。
+      select        选择行为：'rows' 整行 / 'items' 单元格 / None 不可选；默认 'rows'。
+      multi         True 可连续多选(Extended) / False 单选(Single)；select=None 时无意义。
+      edit          True 双击/按键内联编辑（Excel 式）/ False 只读；默认 False。
+      sort_arrows   True 表头换成 SortableTableHeader（每列画排序箭头、首点降序）；默认 False。
+      no_arrow_cols sort_arrows 下不画箭头的列（如勾选列）；默认 ()。
+
+    列对齐 / 换行 / Ctrl+C 复制行走虚线框 / 表头右键多级菜单 / 偏好持久化统一由内部
+    TableColumnKit（self._colkit）承担。页面专属行为（自定义委托如进度条、单元格业务右键
+    菜单 CustomContextMenu、拖拽锁列、表头全选框、setSortingEnabled）一律作「单独微调」在
+    构造后自行接线——KitTable 不强行覆盖这些，构造里设的 NoContextMenu / NoEditTriggers /
+    默认委托都是可被页面后续 set 掉的初值。"""
+
+    def __init__(self, rows, cols, headers, parent=None, *,
+                 zebra=True, row_number=False, select="rows", multi=True,
+                 edit=False, sort_arrows=False, no_arrow_cols=()):
         super().__init__(rows, cols, parent)
         self.setHorizontalHeaderLabels(headers)
+        # 表头：需要排序箭头时在建表之初就换上 SortableTableHeader，之后逐列配置（列宽 /
+        # resize 模式 / sectionClicked 连线）都落在这张表头上，避免事后换头冲掉既有连线；
+        # 勾选 / 锁定列（no_arrow_cols）不画箭头。
+        if sort_arrows:
+            hdr = SortableTableHeader()
+            hdr.set_no_arrow_cols(list(no_arrow_cols))
+            self.setHorizontalHeader(hdr)
         hh = self.horizontalHeader()
         hh.setSectionsClickable(True)
         hh.setHighlightSections(False)
         hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)   # 列宽可拖
+        # 斑马纹（交替行底色）
+        self.setAlternatingRowColors(bool(zebra))
+        # 行号列（纵向表头）：默认隐藏。行高用 Interactive + 手动控制：默认一行基准高；
+        # 开换行时按内容撑高，关换行时逐行复位到基准高（ResizeToContents 关换行不会自动
+        # 缩回，反而重现“两行”bug）——复位逻辑在 TableColumnKit.toggle_wrap 里。
         vh = self.verticalHeader()
-        vh.setVisible(True)
-        # 行高用 Interactive + 手动控制：默认一行基准高；开换行时按内容撑高，
-        # 关换行时逐行复位到基准高（ResizeToContents 关换行不会自动缩回，反而重现“两行”bug）
+        vh.setVisible(bool(row_number))
         vh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         vh.setDefaultSectionSize(38)
         # 默认一行：直接关掉视图级 wordWrap（这才是“折不折行”的总开关）——列宽超出部分用
@@ -1754,19 +1785,37 @@ class KitTable(QTableWidget):
         # 回到一行高就被裁成“两排字”（即用户反馈的“自动换行前/后不一致”）。toggle_wrap 里切这个开关。
         self.setWordWrap(False)
         self.setTextElideMode(Qt.TextElideMode.ElideRight)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)  # 单元格右键不弹
-        # 单元格：可选中（配合 Ctrl+C 复制）；双击走内联编辑（像 Excel 在格子里改）
-        self.setItemDelegate(_KitItemDelegate(self))   # 去原生焦点框 + 编辑框加宽
-        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
-                             | QAbstractItemView.EditTrigger.EditKeyPressed)
-        # 编辑提交后把 tooltip 同步成最新内容，悬停才能看到改后的全文（等值守卫防信号回环）
-        self.itemChanged.connect(self._sync_tooltip)
-        # 列对齐 / 换行 / 复制行走虚线框 / 选区实线环 全部交给可复用装配器（单一真源）：
-        # 都在 TableColumnKit 里，KitTable 仅复用、不再自带一份。放在 wordWrap 已置
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)  # 单元格右键默认不弹（页面业务菜单可改 CustomContextMenu）
+        # 单元格委托：去原生焦点框 + 内联编辑框加宽；页面专属委托（如进度条）构造后 setItemDelegate 覆盖。
+        self.setItemDelegate(_KitItemDelegate(self))
+        # 选择：整行 / 单元格 / 不可选（NoSelection，勾选框类页面用）；整行与单元格下再分多选/单选
+        if select is None:
+            self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        else:
+            self.setSelectionBehavior(
+                QAbstractItemView.SelectionBehavior.SelectRows if select == "rows"
+                else QAbstractItemView.SelectionBehavior.SelectItems)
+            self.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection if multi
+                else QAbstractItemView.SelectionMode.SingleSelection)
+        # 编辑触发：只读（NoEditTriggers）或双击/按键内联编辑（像 Excel 在格子里改）
+        self.setEditTriggers(
+            (QAbstractItemView.EditTrigger.DoubleClicked
+             | QAbstractItemView.EditTrigger.EditKeyPressed)
+            if edit else QAbstractItemView.EditTrigger.NoEditTriggers)
+        # 编辑提交后把 tooltip 同步成最新内容，悬停才能看到改后的全文（等值守卫防信号回环）。
+        # 仅在开内联编辑时接线：只读表的 itemChanged 多来自勾选框/程序态变更，若也同步会把
+        # 页面手写的说明性 tooltip（如时长列悬停解释）覆盖成单元格文本。
+        if edit:
+            self.itemChanged.connect(self._sync_tooltip)
+        # 列对齐 / 换行 / 复制行走虚线框 / 选区实线环 / 表头右键多级菜单 全部交给可复用装配器
+        # （单一真源）：都在 TableColumnKit 里，KitTable 仅复用、不再自带一份。放在 wordWrap 已置
         # False 之后创建，装配器读到的初始 _wrap 才与实际一致。
         self._colkit = TableColumnKit(self, baseline_h=38, show_selection_ring=True)
+
+    def add_header_menu(self, title, items, key=None):
+        """追加 / 覆盖一组表头右键菜单项（转发给内部 TableColumnKit，页面据此扩展标准菜单）。"""
+        self._colkit.add_header_menu(title, items, key=key)
 
     def _sync_tooltip(self, it):
         # setToolTip 也会触发 dataChanged→itemChanged，不同值才写，避免无限回环

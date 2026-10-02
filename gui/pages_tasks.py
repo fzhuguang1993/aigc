@@ -10,7 +10,7 @@ from PySide6.QtCore import (QThread, Signal, Qt, QDate, QPoint, QSize, QTimer,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import QColor, QCursor, QGuiApplication, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-                               QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
+                               QTableWidgetItem, QHeaderView, QComboBox,
                                QMessageBox, QFileDialog, QAbstractItemView,
                                QLineEdit, QCheckBox, QInputDialog, QFrame,
                                QDialog, QDialogButtonBox, QFormLayout,
@@ -34,7 +34,7 @@ from gui.header import page_header, Card, kpi_row
 from gui.menus import StyledMenu
 from gui.tablekit import (FieldManagerDialog, apply_field_layout,
                           enable_drag_with_lock, SecsItem, mount_header_checkbox)
-from gui.kit import TableColumnKit, DateRangePicker, SortableTableHeader
+from gui.kit import KitTable, DateRangePicker
 from gui.theme import tokenize
 
 STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
@@ -621,30 +621,21 @@ class TasksPage(QWidget):
         content.v.setSpacing(8)
 
         # ---------- 表格 ----------
-        self.table = QTableWidget(0, len(HEADERS))
-        self.table.setHorizontalHeaderLabels(HEADERS)
-        # 每列都带排序箭头的表头（默认降序、窄列不重合）：在建表之初就换上，
-        # 之后所有逐列配置（列宽 / resize 模式 / 可拖动 / sectionClicked 连线）都落在
-        # 这张表头上，避免事后替换表头把既有连线冲掉。勾选列（CHECK_COL）不画箭头。
-        _hdr = SortableTableHeader()
-        _hdr.set_no_arrow_cols([CHECK_COL])
-        self.table.setHorizontalHeader(_hdr)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        # 不再 NoSelection：启用 Qt 自带的鼠标按住拖框选（橡皮筋），框到的行
-        # 同步勾上勾选框（见 _on_rubber_band），与“跨页勾选”共用同一集合
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # 标准表格地基 KitTable（UI 库基准）：整行选 + 可多选、只读、斑马纹、隐藏行号、
+        # 单行超出省略、表头排序箭头（勾选列不画）、列对齐/换行/Ctrl+C/表头右键多级菜单
+        # （内部 TableColumnKit）都由构造参数一次拉齐。本页专属：进度条委托、拖拽锁列、
+        # 表头全选框、单元格业务右键菜单、排序/框选连线，仍在下面按「单独微调」接线。
+        self.table = KitTable(
+            0, len(HEADERS), HEADERS,
+            zebra=True, row_number=False, select="rows", multi=True,
+            edit=False, sort_arrows=True, no_arrow_cols=[CHECK_COL])
         self.table.setSortingEnabled(True)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setWordWrap(False)
         self.table.setMouseTracking(True)
         # 框选靠「按下→拖动→松开」自己识别（见 eventFilter）：不用
         # itemSelectionChanged，否则点一下勾选框取消时被连带选中的行会反手又勾上
         self.table.setItemDelegate(ProgressDelegate(self.table))
         # 勾选列：固定宽度、不参与排序
         self.table.setColumnWidth(CHECK_COL, 36)
-        self.table.horizontalHeader().setSortIndicatorShown(False)
         enable_drag_with_lock(self.table, lock_count=1)
         for c in STRETCH_COLS:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
@@ -667,10 +658,7 @@ class TasksPage(QWidget):
         self.table.installEventFilter(self)      # 空格键弹全文预览用
         self._tag_editor = None                  # 当前内联标签下拉（非 None 时暂停重建表）
         content.v.addWidget(self.table, 1)
-        # 统一列交互：表头右键可设本列靠左/居中/靠右 / 垂直居中 / 自动换行。
-        # 复用 gui.kit.TableColumnKit：只接管「表头右键」这一个入口，不动本页的
-        # 进度条委托 / 框选勾选 / 排序 / 字段管理 / 单元格业务菜单等既有行为。
-        TableColumnKit(self.table)
+        # （表头右键多级菜单 / 列对齐 / Ctrl+C 已由 KitTable 内部 TableColumnKit 承担）
         # 勾选列表头挂一枚可见的全选框（三态：本页全选/部分/全不选）：
         # 以前只能点那一格才全选、格子上没框，用户不知道能全选、也不知去哪勾。
         self._hdr_check = mount_header_checkbox(

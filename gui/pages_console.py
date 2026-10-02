@@ -14,13 +14,13 @@ gui/pages_console.py —— 控制台：接口线路负载监控（现代仪表�
 from PySide6.QtCore import Qt, QPoint, QTimer, QPropertyAnimation, QEasingCurve, QRectF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                               QTableWidget, QTableWidgetItem, QHeaderView,
-                               QAbstractItemView, QScrollArea, QGridLayout,
+                               QTableWidgetItem, QHeaderView,
+                               QScrollArea, QGridLayout,
                                QSizePolicy, QGraphicsDropShadowEffect)
 
 from gui.header import page_header, LightDot, LIGHT_KIND_COLOR, FS_WEAK, Card
 from gui.theme import tokenize
-from gui.kit import TableColumnKit
+from gui.kit import KitTable
 
 SRV_HEADERS = ["线路", "状态", "并发上限", "负载(实时)"]
 LIST_HEADERS = ["线路", "状态", "本机在跑", "并发上限", "空余", "连续失败", "云端负载"]
@@ -343,13 +343,7 @@ class ConsolePage(QWidget):
         # ---------- 详细列表（紧凑表格，每线路一行） ----------
         # 旧版「列表」只是单列宽卡换着法子排，不是列表；这里是真的表格。
         # 列里没有接口地址（商业版红线），状态用四档圆点+文字+语义色。
-        self.list_table = QTableWidget(0, len(LIST_HEADERS))
-        self.list_table.setHorizontalHeaderLabels(LIST_HEADERS)
-        TableColumnKit(self.list_table)   # 统一列交互：表头右键靠左/中/右/换行
-        self.list_table.setAlternatingRowColors(True)
-        self.list_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.list_table.verticalHeader().setVisible(False)
-        self.list_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.list_table = KitTable(0, len(LIST_HEADERS), LIST_HEADERS, select=None)
         self.list_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lsh = self.list_table.horizontalHeader()
         for c, w in {0: 170, 1: 110, 2: 90, 3: 90, 4: 70, 5: 90}.items():
@@ -375,13 +369,7 @@ class ConsolePage(QWidget):
             srv_card = Card(margins=(16, 14, 16, 12))
             srv_card.v.setSpacing(10)
             srv_card.v.addWidget(QLabel("云端线路池（由网关统一调度，仅展示）："))
-            self.srv_table = QTableWidget(0, len(SRV_HEADERS))
-            self.srv_table.setHorizontalHeaderLabels(SRV_HEADERS)
-            TableColumnKit(self.srv_table)   # 统一列交互：表头右键靠左/中/右/换行
-            self.srv_table.setAlternatingRowColors(True)
-            self.srv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            self.srv_table.verticalHeader().setVisible(False)
-            self.srv_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+            self.srv_table = KitTable(0, len(SRV_HEADERS), SRV_HEADERS, select=None)
             sh = self.srv_table.horizontalHeader()
             for c, w in {0: 120, 2: 90, 3: 110}.items():
                 sh.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)

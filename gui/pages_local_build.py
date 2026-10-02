@@ -16,14 +16,14 @@ gui/pages_local_build.py —— 批量基建 · 三级组织独立页（客户 /
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QComboBox, QLineEdit, QDialog,
-                               QFormLayout, QTabWidget, QTableWidget,
-                               QTableWidgetItem, QHeaderView, QAbstractItemView,
+                               QFormLayout, QTabWidget,
+                               QTableWidgetItem, QHeaderView,
                                QMessageBox, QPlainTextEdit, QProgressBar)
 
 from store import app_state
 from gui.header import page_header
 from gui.tablekit import FieldManagerDialog, apply_field_layout
-from gui.kit import TableColumnKit
+from gui.kit import KitTable
 from gui.tool_panels import ToolWorker
 from gui.dialogs_build import LocalAccountDialog, PlanDialog, _split_list  # noqa: F401
 from gui.theme import tokenize
@@ -275,21 +275,12 @@ class LocalBuildPage(QWidget):
         """任务中心同款表格观感：斑马纹 + 表头点选排序 + 拖列调序 + 分列定宽。
         stretch_cols：自动撑满的文本列（默认末列）；widths：{列号: 宽度}；
         num_cols：按数值大小排序的计数列（避免 10 排到 9 前）。"""
-        tb = QTableWidget(0, len(cols))
-        tb.setHorizontalHeaderLabels(cols)
-        TableColumnKit(tb)              # 统一列交互：表头右键靠左/中/右/换行
-        tb.setAlternatingRowColors(True)          # 斑马纹（对齐任务中心）
-        tb.verticalHeader().setVisible(False)
-        tb.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        tb.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        tb.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        tb.setWordWrap(False)
+        tb = KitTable(0, len(cols), cols, zebra=True, row_number=False,
+                      select="rows", multi=False, edit=False)
         tb.setSortingEnabled(True)                # 点表头排序（对齐任务中心）
         tb._num_cols = set(num_cols or ())
         hh = tb.horizontalHeader()
         hh.setSectionsMovable(True)               # 拖表头调列序（对齐任务中心）
-        hh.setHighlightSections(False)
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for c in (stretch_cols if stretch_cols is not None else [len(cols) - 1]):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
         for c, w in (widths or {}).items():
@@ -783,12 +774,8 @@ class LocalBuildPage(QWidget):
         b_all.clicked.connect(self._toggle_all_accts)
         bar.addWidget(b_all)
         v.addLayout(bar)
-        self.tbl_bacct = QTableWidget(0, 5)
-        self.tbl_bacct.setHorizontalHeaderLabels(
+        self.tbl_bacct = KitTable(0, 5,
             ["选", "别名", "归属（客户›执照）", "账户ID", "授权状态"])
-        TableColumnKit(self.tbl_bacct)  # 统一列交互：表头右键靠左/中/右/换行
-        self.tbl_bacct.verticalHeader().setVisible(False)
-        self.tbl_bacct.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_bacct.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         self.tbl_bacct.setFixedHeight(150)
@@ -806,11 +793,7 @@ class LocalBuildPage(QWidget):
             b.clicked.connect(slot)
             bar2.addWidget(b)
         v.addLayout(bar2)
-        self.tbl_plan = QTableWidget(0, 5)
-        self.tbl_plan.setHorizontalHeaderLabels(["选", "方案名", "推广类型", "日预算", "素材"])
-        TableColumnKit(self.tbl_plan)   # 统一列交互：表头右键靠左/中/右/换行
-        self.tbl_plan.verticalHeader().setVisible(False)
-        self.tbl_plan.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_plan = KitTable(0, 5, ["选", "方案名", "推广类型", "日预算", "素材"])
         self.tbl_plan.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         self.tbl_plan.setFixedHeight(130)
