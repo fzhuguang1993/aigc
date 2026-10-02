@@ -174,17 +174,51 @@ def _kit_table(qapp):
 def test_header_menu_three_submenus_with_default_expand(qapp):
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    plan = kit._build_header_menus(0)
-    assert list(plan) == ["align", "order", "format"]
-    assert {m.title() for m, _ in plan.values()} == {"居中调整", "顺序调整", "字段格式"}
-    texts = {k: [a.text() for a in m.actions() if not a.isSeparator()]
-             for k, (m, _) in plan.items()}
-    assert texts["align"][:4] == ["本列靠左", "本列居中", "本列靠右", "本列垂直居中"]
-    assert texts["order"][:2] == ["升序排列", "降序排列"]
-    assert texts["format"][:3] == ["文本", "数字", "日期"]
-    for k, (m, handlers) in plan.items():
-        expands = [a for a in m.actions() if a.text() == "默认展开"]
-        assert len(expands) == 1 and expands[0] in handlers
+    menu, handlers, expand_actions = kit._build_header_menu(0)
+    subs = [a.menu() for a in menu.actions() if a.menu()]
+    assert [m.title() for m in subs] == ["居中调整", "顺序调整", "字段格式"]
+    texts = {m.title(): [a.text() for a in m.actions() if not a.isSeparator()]
+             for m in subs}
+    assert texts["居中调整"] == ["本列靠左", "本列居中", "本列靠右",
+                          "本列垂直居中", "取消自动换行", "默认展开"]
+    assert texts["顺序调整"] == ["升序排列", "降序排列", "默认展开"]
+    assert texts["字段格式"] == ["文本", "数字", "日期", "默认展开"]
+    # 对钩只允许出现在「默认展开」上（字段格式选项不带勾选态）
+    for m in subs:
+        assert [a.text() for a in m.actions() if a.isCheckable()] == ["默认展开"]
+    # 三组都登记了自动展开入口，且每个可见 action 都有 handler
+    assert set(expand_actions) == {"align", "order", "format"}
+    assert all(callable(fn) for fn in handlers.values())
+
+
+def test_header_menu_registration_and_flat_group(qapp):
+    """注册机制：新组可多级；只挂一个平铺项的组直接成一级菜单项（没有多级不绕一层）；
+    同 key 覆盖。"""
+    from gui.kit import TableColumnKit
+    kit = TableColumnKit(_kit_table(qapp))
+    hits = []
+    kit.add_header_menu("业务操作", [("刷新本列", lambda col: hits.append(col))])
+    menu, handlers, expand_actions = kit._build_header_menu(2)
+    flat = [a for a in menu.actions() if not a.menu() and not a.isSeparator()]
+    assert [a.text() for a in flat] == ["刷新本列"]     # 直接挂一级，不建子菜单
+    assert "业务操作" not in expand_actions             # 一级项没有默认展开一说
+    handlers[flat[0]](2)
+    assert hits == [2]
+    # 同 key 覆盖
+    kit.add_header_menu("业务操作改名", [("只读", lambda col: None)], key="业务操作")
+    menu2, _h2, _e2 = kit._build_header_menu(0)
+    flat2 = [a.text() for a in menu2.actions()
+             if not a.menu() and not a.isSeparator()]
+    assert flat2 == ["只读"]
+    # 可嵌三级：带嵌套列表的组仍走子菜单，子项里再开一层
+    kit.add_header_menu("导出", [("按行", [("CSV", lambda c: None),
+                                    ("Excel", lambda c: None)]),
+                          ("按列", lambda c: None)])
+    menu3, _h3, e3 = kit._build_header_menu(0)
+    assert "导出" in e3
+    sub = e3["导出"].menu()
+    assert [a.text() for a in sub.actions() if not a.isSeparator()][:2] == ["按行", "按列"]
+    assert sub.actions()[0].menu() is not None          # 按行 又下钻一层
 
 
 def test_header_menu_default_expand_toggle(qapp, monkeypatch):

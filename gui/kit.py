@@ -19,8 +19,7 @@ from PySide6.QtCore import (Qt, QDate, QTimer, QPoint, QRect, QSize, QEvent,
                             QMimeData)
 from PySide6.QtGui import (QColor, QCursor, QGuiApplication, QPainter, QPen, QBrush,
                            QPainterPath, QFont, QPolygonF, QLinearGradient,
-                           QStandardItemModel, QStandardItem, QKeySequence, QDrag,
-                           QActionGroup)
+                           QStandardItemModel, QStandardItem, QKeySequence, QDrag)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QPlainTextEdit, QComboBox,
                                QSpinBox, QDoubleSpinBox, QDateEdit, QCheckBox,
@@ -1446,8 +1445,10 @@ def _fmt_key(s, fmt):
 
 class TableColumnKit(QObject):
     """可复用表格装配器，attach 到任意 QTableWidget 补上两件事（被 KitTable 复用=单一真源）：
-    ① 表头右键 → 一级菜单：居中调整 / 顺序调整 / 字段格式 三个二级菜单；
-      每个二级菜单尾部带「默认展开」，选中后右键直达该二级菜单（不再出一级菜单）；
+    ① 表头右键 → 通用多级菜单（注册机制 add_header_menu，默认已注册三组：居中调整 /
+      顺序调整 / 字段格式；带子项的组是二级菜单，没有多级就是一级菜单项）；
+      每个二级菜单尾部自动带「默认展开」：选中后右键时一级菜单照常全部可见，
+      默认那组自动就地展开，不用鼠标再选；
       顺序调整＝升序/降序排列（不画排序箭头提示），字段格式（文本/数字/日期）决定比较口径；
       选择与列格式经 store.app_state 按页面键持久化（丢了不影响业务）；
     ② Ctrl+C 复制选中区（制表符分隔）并在选区外画 Excel 式「行走的虚线框」，Esc 取消；
@@ -1478,6 +1479,8 @@ class TableColumnKit(QObject):
                              if v in ("text", "number", "date")}
         except (TypeError, ValueError):
             self._col_fmt = {}
+        # 表头右键菜单注册表：默认三组走与 add_header_menu 完全相同的机制
+        self._header_groups = self._default_header_groups()
         vh = table.verticalHeader()
         self._row_h0 = (baseline_h if baseline_h is not None
                         else vh.defaultSectionSize())
@@ -1594,92 +1597,97 @@ class TableColumnKit(QObject):
         app.clipboard().setText("\n".join(lines))
         self._marquee.start(ranges)
 
-    # ---- 表头右键菜单：一级 = 居中调整 / 顺序调整 / 字段格式 三个二级菜单 ----
-    # 每个二级菜单尾部带「默认展开」：选中后右键直达该二级菜单；直达面板里给
-    # 「打开完整菜单」兑底回退。纯构建（_build_header_menus）不 exec，单测可直接校验结构。
-    _SUB_ORDER = ("align", "order", "format")
-    _SUB_TITLE = {"align": "居中调整", "order": "顺序调整", "format": "字段格式"}
+    # ---- 表头右键菜单：通用多级菜单机制（注册到组件库，各组默认支持多级）----
+    # 带子项的组 → 二级菜单；只挂一个平铺处理项的组 → 直接是一级菜单项（没有多级就不绕一层）。
+    # 组件库默认注册 居中调整/顺序调整/字段格式 三组；页面可 add_header_menu 增组/同键覆盖。
+    # 每个二级菜单自动追加「默认展开」：选中后右键时一级菜单照常全部可见，默认那组自动就地展开。
+    def add_header_menu(self, title, items, key=None):
+        """注册一组表头右键菜单。
+        items: [(label, handler), ...] 为子项；handler 收一个参数：右键所在的逻辑列号；
+              [(label, [(子label, handler), ...]), ...] 可再嵌一级（多级天然支持）。
+        同 key 重复注册为覆盖；默认三组的 key 是 align/order/format。"""
+        k = key or title
+        for i, (kk, _t, _it) in enumerate(self._header_groups):
+            if kk == k:
+                self._header_groups[i] = (k, title, list(items))
+                return
+        self._header_groups.append((k, title, list(items)))
 
-    def _build_header_menus(self, col):
-        """构建三个二级菜单及 action→处理函数映射（不 exec）；返回 {key: (QMenu, handlers)}。"""
+    def _default_header_groups(self):
+        """组件库自带的三组（全部走同一套注册机制，与页面自定义组无差别）。"""
         A = Qt.AlignmentFlag
         So = Qt.SortOrder
-        plan = {}
+        return [
+            ("align", "居中调整", [
+                ("本列靠左", lambda col: self.set_col_align(col, A.AlignLeft)),
+                ("本列居中", lambda col: self.set_col_align(col, A.AlignHCenter)),
+                ("本列靠右", lambda col: self.set_col_align(col, A.AlignRight)),
+                ("本列垂直居中", lambda col: self.set_col_valign(col, A.AlignVCenter)),
+                ("取消自动换行" if self._wrap else "自动换行",
+                 lambda _col: self.toggle_wrap()),
+            ]),
+            ("order", "顺序调整", [
+                ("升序排列", lambda col: self._apply_sort(col, So.AscendingOrder)),
+                ("降序排列", lambda col: self._apply_sort(col, So.DescendingOrder)),
+            ]),
+            ("format", "字段格式", [
+                # 不设对钩/勾选态：点了就按该口径排，菜单保持干净
+                ("文本", lambda col: self._set_col_format(col, "text")),
+                ("数字", lambda col: self._set_col_format(col, "number")),
+                ("日期", lambda col: self._set_col_format(col, "date")),
+            ]),
+        ]
 
-        m = StyledMenu(self._SUB_TITLE["align"])
-        a_l = m.addAction("本列靠左")
-        a_c = m.addAction("本列居中")
-        a_r = m.addAction("本列靠右")
-        m.addSeparator()
-        a_v = m.addAction("本列垂直居中")
-        a_w = m.addAction("取消自动换行" if self._wrap else "自动换行")
-        plan["align"] = (m, {
-            a_l: lambda: self.set_col_align(col, A.AlignLeft),
-            a_c: lambda: self.set_col_align(col, A.AlignHCenter),
-            a_r: lambda: self.set_col_align(col, A.AlignRight),
-            a_v: lambda: self.set_col_valign(col, A.AlignVCenter),
-            a_w: self.toggle_wrap,
-        })
-
-        m = StyledMenu(self._SUB_TITLE["order"])
-        a_asc = m.addAction("升序排列")
-        a_desc = m.addAction("降序排列")
-        plan["order"] = (m, {
-            a_asc: lambda: self._apply_sort(col, So.AscendingOrder),
-            a_desc: lambda: self._apply_sort(col, So.DescendingOrder),
-        })
-
-        m = StyledMenu(self._SUB_TITLE["format"])
-        cur = self._col_fmt.get(col, "text")
-        grp = QActionGroup(m)          # 三选一：同组 checkable 天然互斥
-        handlers = {}
-        for val, label in (("text", "文本"), ("number", "数字"), ("date", "日期")):
-            act = m.addAction(label)
-            act.setCheckable(True)
-            act.setChecked(cur == val)
-            grp.addAction(act)
-            handlers[act] = (lambda v=val: self._set_col_format(col, v))
-        plan["format"] = (m, handlers)
-
-        # 每个二级菜单尾部：默认展开（再点一次可取消，radio 语义自持）
-        for key, (m, handlers) in plan.items():
-            m.addSeparator()
-            act = m.addAction("默认展开")
-            act.setCheckable(True)
-            act.setChecked(self._expand == key)
-            handlers[act] = (lambda k=key: self._toggle_default_expand(k))
-        return plan
-
-    def _exec_full_menu(self, plan, gpos):
-        """一级菜单：按固定顺序挂三个二级菜单，返回被选中的 action（或 None）。"""
+    def _build_header_menu(self, col):
+        """按注册组构建一级菜单（不 exec，单测可直接校验结构）。
+        返回 (menu, handlers, expand_actions)：handlers 为 action→handler(col)；
+        expand_actions 为 key→该组在一级菜单里的入口 action（供自动展开悬停用）。"""
         menu = StyledMenu(self._t)
-        for key in self._SUB_ORDER:
-            menu.addMenu(plan[key][0])
-        return menu.exec(gpos)
+        handlers, expand_actions = {}, {}
+        for key, title, items in self._header_groups:
+            if not items:
+                continue
+            if len(items) == 1 and callable(items[0][1]):
+                # 没有多级：唯一子项直接挂成一级菜单项，不再多绕一层
+                act = menu.addAction(items[0][0])
+                handlers[act] = items[0][1]
+                continue
+            sub = StyledMenu(title)
+            self._fill_menu(sub, items, handlers)
+            sub.addSeparator()
+            ea = sub.addAction("默认展开")
+            ea.setCheckable(True)
+            ea.setChecked(self._expand == key)
+            handlers[ea] = (lambda _col, k=key: self._toggle_default_expand(k))
+            expand_actions[key] = sub.menuAction()
+            menu.addMenu(sub)
+        return menu, handlers, expand_actions
+
+    def _fill_menu(self, menu, items, handlers):
+        """递归装填：payload 是 callable → 平铺项；是列表 → 继续展开成子菜单。"""
+        for label, payload in items:
+            if callable(payload):
+                handlers[menu.addAction(label)] = payload
+            else:
+                sub = StyledMenu(label)
+                self._fill_menu(sub, payload, handlers)
+                menu.addMenu(sub)
 
     def _show_header_menu(self, col, gpos):
-        plan = self._build_header_menus(col)
-        chosen = None
-        if self._expand in plan:
-            # 右键直达默认展开的二级菜单：附一条「打开完整菜单」回退项（点了即解除默认）
-            sub, _h = plan[self._expand]
-            sub.addSeparator()
-            back = sub.addAction("⋯ 打开完整菜单")
-            chosen = sub.exec(gpos)
-            if chosen is back:
-                self._expand = None
-                self._save_prefs()
-                plan = self._build_header_menus(col)
-                chosen = self._exec_full_menu(plan, gpos)
-        else:
-            chosen = self._exec_full_menu(plan, gpos)
+        menu, handlers, expand_actions = self._build_header_menu(col)
+        target = expand_actions.get(self._expand)
+        if target is not None:
+            # 弹出后自动悬停到默认组：一级菜单照常全部可见，默认那组就地展开，不用鼠标再选
+            def _open():
+                if menu.isVisible():
+                    menu.setActiveAction(target)
+            QTimer.singleShot(0, _open)
+        chosen = menu.exec(gpos)
         if chosen is None:
             return
-        for _m, handlers in plan.values():
-            fn = handlers.get(chosen)
-            if fn is not None:
-                fn()
-                return
+        fn = handlers.get(chosen)
+        if fn is not None:
+            fn(col)
 
     def _toggle_default_expand(self, key):
         self._expand = None if self._expand == key else key
