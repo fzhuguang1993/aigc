@@ -1447,8 +1447,8 @@ class TableColumnKit(QObject):
     """可复用表格装配器，attach 到任意 QTableWidget 补上两件事（被 KitTable 复用=单一真源）：
     ① 表头右键 → 通用多级菜单（注册机制 add_header_menu，默认已注册三组：居中调整 /
       顺序调整 / 字段格式；带子项的组是二级菜单，没有多级就是一级菜单项）；
-      每个二级菜单尾部自动带「默认展开」：选中后右键时一级菜单照常全部可见，
-      默认那组自动就地展开，不用鼠标再选；
+      每个二级菜单尾部自动带「默认展开」：选中后当场把该组的内容就地平铺进一级菜单
+      （组标题 + 全部子项直接可见，其余组仍是二级弹层），右键即见全部子项、不用鼠标再选；
       顺序调整＝升序/降序排列（不画排序箭头提示），字段格式（文本/数字/日期）决定比较口径；
       选择与列格式经 store.app_state 按页面键持久化（丢了不影响业务）；
     ② Ctrl+C 复制选中区（制表符分隔）并在选区外画 Excel 式「行走的虚线框」，Esc 取消；
@@ -1600,7 +1600,8 @@ class TableColumnKit(QObject):
     # ---- 表头右键菜单：通用多级菜单机制（注册到组件库，各组默认支持多级）----
     # 带子项的组 → 二级菜单；只挂一个平铺处理项的组 → 直接是一级菜单项（没有多级就不绕一层）。
     # 组件库默认注册 居中调整/顺序调整/字段格式 三组；页面可 add_header_menu 增组/同键覆盖。
-    # 每个二级菜单自动追加「默认展开」：选中后右键时一级菜单照常全部可见，默认那组自动就地展开。
+    # 每个二级菜单自动追加「默认展开」：选中后把该组内容就地平铺进一级菜单（跨平台稳的展开做法：
+    # macOS 下 QMenu 子菜单无法被可靠程序化弹开，强弹会抢焦点让父菜单闪退），其余组仍是二级弹层。
     def add_header_menu(self, title, items, key=None):
         """注册一组表头右键菜单。
         items: [(label, handler), ...] 为子项；handler 收一个参数：右键所在的逻辑列号；
@@ -1639,11 +1640,13 @@ class TableColumnKit(QObject):
         ]
 
     def _build_header_menu(self, col):
-        """按注册组构建一级菜单（不 exec，单测可直接校验结构）。
-        返回 (menu, handlers, expand_actions)：handlers 为 action→handler(col)；
-        expand_actions 为 key→该组在一级菜单里的入口 action（供自动展开悬停用）。"""
+        """按注册组构建一级菜单（不 exec，单测可直接校验结构）。返回 (menu, handlers)：
+        handlers 为 action→handler(col)。
+        默认展开组：不折成二级弹层，而是把「组标题（不可点）+ 其全部子项」就地平铺进一级菜单——
+        右键即见全部子项、无需再悬停；其余带多子项的组仍是二级弹层（尾部带「默认展开」开关），
+        单子项组直接是一级菜单项。"""
         menu = StyledMenu(self._t)
-        handlers, expand_actions = {}, {}
+        handlers = {}
         for key, title, items in self._header_groups:
             if not items:
                 continue
@@ -1652,17 +1655,27 @@ class TableColumnKit(QObject):
                 act = menu.addAction(items[0][0])
                 handlers[act] = items[0][1]
                 continue
+            if key == self._expand:
+                # 默认展开：组标题做不可点分组头，内容直接铺进一级菜单，再带一个「默认展开」开关（取消用）
+                head = menu.addAction(title)
+                head.setEnabled(False)
+                self._fill_menu(menu, items, handlers)
+                ea = menu.addAction("默认展开")
+                ea.setCheckable(True)
+                ea.setChecked(True)
+                ea.setData("default_expand")
+                handlers[ea] = (lambda _col, k=key: self._toggle_default_expand(k))
+                menu.addSeparator()
+                continue
             sub = StyledMenu(title)
             self._fill_menu(sub, items, handlers)
             sub.addSeparator()
             ea = sub.addAction("默认展开")
             ea.setCheckable(True)
-            ea.setChecked(self._expand == key)
-            ea.setData("default_expand")   # 标记：点它不关菜单，而是当场重开并展开
+            ea.setData("default_expand")   # 标记：点它不关菜单，而是当场重开（该组就地平铺展开）
             handlers[ea] = (lambda _col, k=key: self._toggle_default_expand(k))
-            expand_actions[key] = sub.menuAction()
             menu.addMenu(sub)
-        return menu, handlers, expand_actions
+        return menu, handlers
 
     def _fill_menu(self, menu, items, handlers):
         """递归装填：payload 是 callable → 平铺项；是列表 → 继续展开成子菜单。"""
@@ -1675,17 +1688,7 @@ class TableColumnKit(QObject):
                 menu.addMenu(sub)
 
     def _show_header_menu(self, col, gpos):
-        menu, handlers, expand_actions = self._build_header_menu(col)
-        target = expand_actions.get(self._expand)
-        if target is not None:
-            # 弹出后自动悬停到默认组：一级菜单照常全部可见，默认那组就地展开，不用鼠标再选。
-            # singleShot(0) 偶尔早于菜单真正 show（机器/时序差异），未可见时极短重试一次。
-            def _open(tries=0):
-                if menu.isVisible():
-                    menu.setActiveAction(target)
-                elif tries < 3:
-                    QTimer.singleShot(15, lambda: _open(tries + 1))
-            QTimer.singleShot(0, _open)
+        menu, handlers = self._build_header_menu(col)
         chosen = menu.exec(gpos)
         if chosen is None:
             return
@@ -1693,9 +1696,9 @@ class TableColumnKit(QObject):
         if fn is None:
             return
         fn(col)
-        # 点「默认展开」：不关菜单——按新设置立即在同一位置重开，当场把该二级菜单展开给用户看
-        # （再点同一个会解除默认、self._expand 变 None，此时不重开、菜单正常关闭，作为退出）
-        if chosen.data() == "default_expand" and self._expand is not None:
+        # 点「默认展开」开关：按新状态当场在同一位置重开——设为默认立刻看到这组就地平铺展开，
+        # 取消默认则收回二级弹层（走菜单别处 / Esc 正常关闭，不重开）
+        if chosen.data() == "default_expand":
             self._show_header_menu(col, gpos)
 
     def _toggle_default_expand(self, key):

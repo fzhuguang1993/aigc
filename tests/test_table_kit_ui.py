@@ -174,7 +174,7 @@ def _kit_table(qapp):
 def test_header_menu_three_submenus_with_default_expand(qapp):
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    menu, handlers, expand_actions = kit._build_header_menu(0)
+    menu, handlers = kit._build_header_menu(0)
     subs = [a.menu() for a in menu.actions() if a.menu()]
     assert [m.title() for m in subs] == ["居中调整", "顺序调整", "字段格式"]
     texts = {m.title(): [a.text() for a in m.actions() if not a.isSeparator()]
@@ -186,9 +186,26 @@ def test_header_menu_three_submenus_with_default_expand(qapp):
     # 对钩只允许出现在「默认展开」上（字段格式选项不带勾选态）
     for m in subs:
         assert [a.text() for a in m.actions() if a.isCheckable()] == ["默认展开"]
-    # 三组都登记了自动展开入口，且每个可见 action 都有 handler
-    assert set(expand_actions) == {"align", "order", "format"}
     assert all(callable(fn) for fn in handlers.values())
+
+
+def test_default_expand_group_renders_inline(qapp):
+    """设为默认展开的组：内容就地平铺进一级菜单（右键即见全部子项），其余组仍是二级弹层。"""
+    from gui.kit import TableColumnKit
+    kit = TableColumnKit(_kit_table(qapp))
+    kit._expand = "align"
+    menu, handlers = kit._build_header_menu(0)
+    texts = [a.text() for a in menu.actions() if not a.isSeparator()]
+    # 一级菜单里直接出现「居中调整」标题 + 它的子项 + 一个「默认展开」开关
+    assert "本列靠左" in texts and "本列居中" in texts and "默认展开" in texts
+    # 「居中调整」作为分组头：不可点（仅标识，不触发任何动作）
+    head = next(a for a in menu.actions() if a.text() == "居中调整")
+    assert not head.isEnabled()
+    # 顺序调整 / 字段格式 仍折成二级弹层
+    assert [a.menu().title() for a in menu.actions() if a.menu()] == ["顺序调整", "字段格式"]
+    # 就地平铺的子项都挂上了可调用 handler
+    assert all(callable(handlers[a]) for a in menu.actions()
+               if a.text() in ("本列靠左", "升序排列") and a in handlers)
 
 
 def test_header_menu_registration_and_flat_group(qapp):
@@ -198,25 +215,25 @@ def test_header_menu_registration_and_flat_group(qapp):
     kit = TableColumnKit(_kit_table(qapp))
     hits = []
     kit.add_header_menu("业务操作", [("刷新本列", lambda col: hits.append(col))])
-    menu, handlers, expand_actions = kit._build_header_menu(2)
-    flat = [a for a in menu.actions() if not a.menu() and not a.isSeparator()]
+    menu, handlers = kit._build_header_menu(2)
+    flat = [a for a in menu.actions()
+            if not a.menu() and not a.isSeparator() and a.isEnabled()]
     assert [a.text() for a in flat] == ["刷新本列"]     # 直接挂一级，不建子菜单
-    assert "业务操作" not in expand_actions             # 一级项没有默认展开一说
     handlers[flat[0]](2)
     assert hits == [2]
     # 同 key 覆盖
     kit.add_header_menu("业务操作改名", [("只读", lambda col: None)], key="业务操作")
-    menu2, _h2, _e2 = kit._build_header_menu(0)
+    menu2, _h2 = kit._build_header_menu(0)
     flat2 = [a.text() for a in menu2.actions()
-             if not a.menu() and not a.isSeparator()]
+             if not a.menu() and not a.isSeparator() and a.isEnabled()]
     assert flat2 == ["只读"]
     # 可嵌三级：带嵌套列表的组仍走子菜单，子项里再开一层
     kit.add_header_menu("导出", [("按行", [("CSV", lambda c: None),
                                     ("Excel", lambda c: None)]),
                           ("按列", lambda c: None)])
-    menu3, _h3, e3 = kit._build_header_menu(0)
-    assert "导出" in e3
-    sub = e3["导出"].menu()
+    menu3, _h3 = kit._build_header_menu(0)
+    sub = next(a.menu() for a in menu3.actions()
+               if a.menu() and a.menu().title() == "导出")
     assert [a.text() for a in sub.actions() if not a.isSeparator()][:2] == ["按行", "按列"]
     assert sub.actions()[0].menu() is not None          # 按行 又下钻一层
 
@@ -243,30 +260,32 @@ def test_header_menu_default_expand_toggle(qapp, monkeypatch):
 
 
 def test_default_expand_reopens_in_place(qapp, monkeypatch):
-    """点「默认展开」不是等下次：应当场在同一位置重开菜单，并把该二级菜单展开。
-    驱exec 返回序列模拟：第一次弹→用户点 align 组的「默认展开」；第二次弹（重开）→Esc 关。"""
+    """点「默认展开」不是等下次：应当场在同一位置重开菜单，重开后该组内容已就地平铺。
+    驱 exec 返回序列模拟：第一次弹→用户点 align 组的「默认展开」；第二次弹（重开）→Esc 关。"""
     from PySide6.QtCore import QPoint
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
     assert kit._expand is None
-    calls = {"n": 0}
+    calls = {"n": 0, "inline_after": False}
     orig_build = kit._build_header_menu
 
     def fake_build(col):
-        menu, handlers, expand_actions = orig_build(col)
+        menu, handlers = orig_build(col)
         calls["n"] += 1
         if calls["n"] == 1:
             ea = next(a for a in handlers if a.data() == "default_expand")
-            monkeypatch.setattr(menu, "exec", lambda pos: ea)   # 用户点了默认展开
+            monkeypatch.setattr(menu, "exec", lambda pos: ea)   # 用户点了 align 组的默认展开
         else:
-            assert "align" in expand_actions                    # 重开时默认组已登记自动展开
+            texts = [a.text() for a in menu.actions() if not a.isSeparator()]
+            calls["inline_after"] = "本列靠左" in texts          # 重开后 align 已就地平铺
             monkeypatch.setattr(menu, "exec", lambda pos: None)  # 用户 Esc
-        return menu, handlers, expand_actions
+        return menu, handlers
 
     monkeypatch.setattr(kit, "_build_header_menu", fake_build)
     kit._show_header_menu(0, QPoint(10, 10))
     assert calls["n"] == 2            # 菜单被当场重开了一次
     assert kit._expand == "align"     # 设置已生效
+    assert calls["inline_after"] is True   # 重开后默认组内容已就地平铺可见
 
 
 def test_apply_sort_number_moves_whole_rows(qapp):
