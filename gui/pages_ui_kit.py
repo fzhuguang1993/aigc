@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from gui import ui_kit
 from gui.header import page_header, Card, KpiCard
 from gui.widgets import FlowLayout
-from gui.menus import StyledMenu
+from gui.menus import StyledMenu, MenuCascade
 
 C = ui_kit.COLORS
 
@@ -438,12 +438,17 @@ class UiKitPage(QWidget):
     # ================= Tab：弹层 =================
     def _tab_overlay(self):
         sa, v = self._tab_shell(
-            "浮层：右键菜单 StyledMenu / 悬停 Tooltip / 对话框 QMessageBox。这几颗点了就是真的弹，"
-            "所见即所得；tooltip 全站接管成单例圆角白卡（淡灰软阴影），同一时刻只会弹一个。")
-        m = KitButton("🖱 点开右键菜单", kind="ghost", obj_name="GhostBtn",
+            "浮层：单层级右键菜单 StyledMenu / 多层级右键菜单 MenuCascade / 悬停 Tooltip / 对话框 QMessageBox。"
+            "这几颗点了就是真的弹，所见即所得；tooltip 全站接管成单例圆角白卡（淡灰软阴影），同一时刻只会弹一个。")
+        m = KitButton("🖱 单层级右键菜单", kind="ghost", obj_name="GhostBtn",
                       desc="演示：弹出全站统一的 StyledMenu 右键菜单（真圆角 + 自绘软阴影）。",
                       explain=False)
         m.clicked.connect(self._show_menu_demo)
+        cm = KitButton("🗂 多层级右键菜单", kind="ghost", obj_name="GhostBtn",
+                       desc="演示：注册式多级弹层 MenuCascade——带子项的组是二级/三级弹层，"
+                            "默认展开的组就地平铺、标题即收起开关。表头右键就用它。",
+                       explain=False)
+        cm.clicked.connect(self._show_cascade_menu_demo)
         tipb = KitButton("☝ 悬停看 Tooltip", kind="ghost", obj_name="GhostBtn",
                          desc="演示：悬停弹出圆角 tooltip 气泡。", explain=False)
         # 只留一份文案：hover_tip 350ms 即弹，内容就用 widget 自己的 toolTip；
@@ -454,9 +459,38 @@ class UiKitPage(QWidget):
         dlg = KitButton("🗨 弹出对话框", kind="primary",
                         desc="演示：弹出一颗真圆角 QMessageBox（顶层去框 + 逐像素透明）。", explain=False)
         dlg.clicked.connect(self._demo_dialog)
-        v.addLayout(_row(m, tipb, dlg))
+        v.addLayout(_row(m, cm, tipb, dlg))
+        self._cascade_status = QLabel("（点上面的菜单试试：「多层级」那颗带二级/三级弹层与默认就地展开）")
+        self._cascade_status.setObjectName("PageTip")
+        self._cascade_status.setWordWrap(True)
+        v.addWidget(self._cascade_status)
         v.addStretch(1)
         return sa
+
+    def _show_cascade_menu_demo(self):
+        """注册式多级右键弹层示例（与表头右键同一套 MenuCascade，方便复用/对齐口径）：
+        - 「导出」组里再嵌一层「更多格式」→ 三级弹层；
+        - 「排序」组设默认展开 → 一级菜单里就地平铺，标题即收起开关。"""
+        mc = MenuCascade(parent=self)
+        say = lambda msg: self._cascade_status.setText("点了：" + msg)   # noqa: E731
+        mc.add("视图", [
+            ("放大", lambda _ctx: say("视图 → 放大")),
+            ("缩小", lambda _ctx: say("视图 → 缩小")),
+        ], key="view")
+        mc.add("导出", [
+            ("为 Excel", lambda _ctx: say("导出 → Excel")),
+            ("为 CSV", lambda _ctx: say("导出 → CSV")),
+            ("更多格式", [                       # 子项里再挂列表 → 三级弹层
+                ("JSON", lambda _ctx: say("导出 → 更多格式 → JSON（三级弹层）")),
+                ("YAML", lambda _ctx: say("导出 → 更多格式 → YAML（三级弹层）")),
+            ]),
+        ], key="export")
+        mc.add("排序", [
+            ("升序", lambda _ctx: say("排序 → 升序（该组默认就地展开）")),
+            ("降序", lambda _ctx: say("排序 → 降序（该组默认就地展开）")),
+        ], key="sort")
+        mc.set_expanded(["sort"])               # 演示：一组默认就地展开
+        mc.show(QCursor.pos(), None)
 
     def _show_menu_demo(self):
         # 对标飞书：菜单项走“纯文字 + 行高拉开 + 悬停淡蓝”，不再用一堆彩色 emoji
