@@ -183,29 +183,45 @@ def test_header_menu_three_submenus_with_default_expand(qapp):
                           "本列垂直居中", "取消自动换行", "默认展开"]
     assert texts["顺序调整"] == ["升序排列", "降序排列", "默认展开"]
     assert texts["字段格式"] == ["文本", "数字", "日期", "默认展开"]
-    # 对钩只允许出现在「默认展开」上（字段格式选项不带勾选态）
+    # 不带任何对钩/勾选态（含「默认展开」与各选项），展开态只靠文字表达
     for m in subs:
-        assert [a.text() for a in m.actions() if a.isCheckable()] == ["默认展开"]
+        assert [a.text() for a in m.actions() if a.isCheckable()] == []
     assert all(callable(fn) for fn in handlers.values())
 
 
 def test_default_expand_group_renders_inline(qapp):
-    """设为默认展开的组：内容就地平铺进一级菜单（右键即见全部子项），其余组仍是二级弹层。"""
+    """展开的组：内容就地平铺进一级菜单（右键即见全部子项），其余组仍是二级弹层；
+    开关是普通菜单项、文字随状态变（无对钩）。"""
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    kit._expand = "align"
+    kit._expand = {"align"}
     menu, handlers = kit._build_header_menu(0)
     texts = [a.text() for a in menu.actions() if not a.isSeparator()]
-    # 一级菜单里直接出现「居中调整」标题 + 它的子项 + 一个「默认展开」开关
-    assert "本列靠左" in texts and "本列居中" in texts and "默认展开" in texts
+    # 一级菜单里直接出现「居中调整」标题 + 它的子项 + 一个「取消展开」开关（已展开态）
+    assert "本列靠左" in texts and "本列居中" in texts and "取消展开" in texts
+    # 任何菜单项都不带对钩/勾选态
+    assert not any(a.isCheckable() for a in menu.actions())
     # 「居中调整」作为分组头：不可点（仅标识，不触发任何动作）
     head = next(a for a in menu.actions() if a.text() == "居中调整")
     assert not head.isEnabled()
-    # 顺序调整 / 字段格式 仍折成二级弹层
+    # 顺序调整 / 字段格式 仍折成二级弹层，尾部是「默认展开」
     assert [a.menu().title() for a in menu.actions() if a.menu()] == ["顺序调整", "字段格式"]
     # 就地平铺的子项都挂上了可调用 handler
     assert all(callable(handlers[a]) for a in menu.actions()
                if a.text() in ("本列靠左", "升序排列") and a in handlers)
+
+
+def test_multiple_expand_groups_inline(qapp):
+    """多组同时展开：align + order 都就地平铺，format 仍是弹层；各自独立、互不顶掉。"""
+    from gui.kit import TableColumnKit
+    kit = TableColumnKit(_kit_table(qapp))
+    kit._expand = {"align", "order"}
+    menu, _handlers = kit._build_header_menu(0)
+    texts = [a.text() for a in menu.actions() if not a.isSeparator()]
+    assert "本列靠左" in texts and "升序排列" in texts        # 两组都平铺
+    assert [a.menu().title() for a in menu.actions() if a.menu()] == ["字段格式"]
+    # 两个展开组各自带一个「取消展开」
+    assert texts.count("取消展开") == 2
 
 
 def test_header_menu_registration_and_flat_group(qapp):
@@ -245,18 +261,19 @@ def test_header_menu_default_expand_toggle(qapp, monkeypatch):
     saved = {}
     from store import app_state
     monkeypatch.setattr(app_state, "get", lambda k, d=None: {})
-    monkeypatch.setattr(app_state, "set_value", lambda k, v: saved.setdefault(k, v))
+    monkeypatch.setattr(app_state, "set_value", lambda k, v: saved.__setitem__(k, v))
     kit = TableColumnKit(t)
     kit._toggle_default_expand("align")
-    assert kit._expand == "align"
-    assert saved["colkit::UTMenuTable"]["expand"] == "align"
-    # 再点同一个：解除默认
+    assert kit._expand == {"align"}
+    assert saved["colkit::UTMenuTable"]["expand"] == ["align"]
+    # 再点同一个：收起该组
     kit._toggle_default_expand("align")
-    assert kit._expand is None
-    # 换到另一个：互斥
+    assert kit._expand == set()
+    # 多组同时展开：互不顶掉
     kit._toggle_default_expand("order")
     kit._toggle_default_expand("format")
-    assert kit._expand == "format"
+    assert kit._expand == {"order", "format"}
+    assert saved["colkit::UTMenuTable"]["expand"] == ["format", "order"]
 
 
 def test_default_expand_reopens_in_place(qapp, monkeypatch):
@@ -265,7 +282,7 @@ def test_default_expand_reopens_in_place(qapp, monkeypatch):
     from PySide6.QtCore import QPoint
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    assert kit._expand is None
+    assert kit._expand == set()
     calls = {"n": 0, "inline_after": False}
     orig_build = kit._build_header_menu
 
@@ -284,7 +301,7 @@ def test_default_expand_reopens_in_place(qapp, monkeypatch):
     monkeypatch.setattr(kit, "_build_header_menu", fake_build)
     kit._show_header_menu(0, QPoint(10, 10))
     assert calls["n"] == 2            # 菜单被当场重开了一次
-    assert kit._expand == "align"     # 设置已生效
+    assert kit._expand == {"align"}   # 设置已生效
     assert calls["inline_after"] is True   # 重开后默认组内容已就地平铺可见
 
 

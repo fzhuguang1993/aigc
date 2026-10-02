@@ -1447,8 +1447,9 @@ class TableColumnKit(QObject):
     """可复用表格装配器，attach 到任意 QTableWidget 补上两件事（被 KitTable 复用=单一真源）：
     ① 表头右键 → 通用多级菜单（注册机制 add_header_menu，默认已注册三组：居中调整 /
       顺序调整 / 字段格式；带子项的组是二级菜单，没有多级就是一级菜单项）；
-      每个二级菜单尾部自动带「默认展开」：选中后当场把该组的内容就地平铺进一级菜单
-      （组标题 + 全部子项直接可见，其余组仍是二级弹层），右键即见全部子项、不用鼠标再选；
+      每个二级菜单尾部自动带「默认展开 / 取消展开」文字开关（无对钩）：点开就把该组的内容
+      就地平铺进一级菜单（组标题 + 全部子项直接可见），右键即见全部子项、不用鼠标再选；
+      可展开的组不唯一——多组各自独立开关、互不顶掉，一级菜单里可同时平铺多组；
       顺序调整＝升序/降序排列（不画排序箭头提示），字段格式（文本/数字/日期）决定比较口径；
       选择与列格式经 store.app_state 按页面键持久化（丢了不影响业务）；
     ② Ctrl+C 复制选中区（制表符分隔）并在选区外画 Excel 式「行走的虚线框」，Esc 取消；
@@ -1469,18 +1470,23 @@ class TableColumnKit(QObject):
         self._wrap = table.wordWrap()   # 跟随表格现状，菜单首项文案才准确
         self._col_h = {}                # col → 水平对齐基准（仅水平位）
         self._col_v = {}                # col → 垂直对齐基准（仅垂直位）
-        # 表头右键菜单偏好：列格式（col→text/number/date）与「默认展开」的二级菜单
+        # 表头右键菜单偏好：列格式（col→text/number/date）与「默认展开」的组（可多组，键集合）
         self._col_fmt = {}
-        self._expand = None
+        self._expand = set()
+        # 表头右键菜单注册表：默认三组走与 add_header_menu 完全相同的机制（先建好供下面校验键）
+        self._header_groups = self._default_header_groups()
         prefs = self._load_prefs()
-        self._expand = prefs.get("expand") if prefs.get("expand") in ("align", "order", "format") else None
+        valid_keys = {k for k, _t, _i in self._header_groups}
+        exp = prefs.get("expand")
+        if isinstance(exp, str):                 # 兼容旧版单值存储
+            exp = [exp]
+        if isinstance(exp, (list, tuple)):
+            self._expand = {k for k in exp if k in valid_keys}
         try:
             self._col_fmt = {int(k): v for k, v in (prefs.get("fmt") or {}).items()
                              if v in ("text", "number", "date")}
         except (TypeError, ValueError):
             self._col_fmt = {}
-        # 表头右键菜单注册表：默认三组走与 add_header_menu 完全相同的机制
-        self._header_groups = self._default_header_groups()
         vh = table.verticalHeader()
         self._row_h0 = (baseline_h if baseline_h is not None
                         else vh.defaultSectionSize())
@@ -1600,8 +1606,9 @@ class TableColumnKit(QObject):
     # ---- 表头右键菜单：通用多级菜单机制（注册到组件库，各组默认支持多级）----
     # 带子项的组 → 二级菜单；只挂一个平铺处理项的组 → 直接是一级菜单项（没有多级就不绕一层）。
     # 组件库默认注册 居中调整/顺序调整/字段格式 三组；页面可 add_header_menu 增组/同键覆盖。
-    # 每个二级菜单自动追加「默认展开」：选中后把该组内容就地平铺进一级菜单（跨平台稳的展开做法：
-    # macOS 下 QMenu 子菜单无法被可靠程序化弹开，强弹会抢焦点让父菜单闪退），其余组仍是二级弹层。
+    # 每个二级菜单尾部追加文字开关「默认展开 / 取消展开」（不带对钩）：点开把该组内容就地平铺进
+    # 一级菜单（跨平台稳：macOS 下 QMenu 子菜单无法可靠程序化弹开，强弹会抢焦点让父菜单闪退），
+    # 其余组仍是二级弹层；可展开的组不唯一，多组各自独立、互不顶掉。
     def add_header_menu(self, title, items, key=None):
         """注册一组表头右键菜单。
         items: [(label, handler), ...] 为子项；handler 收一个参数：右键所在的逻辑列号；
@@ -1642,9 +1649,9 @@ class TableColumnKit(QObject):
     def _build_header_menu(self, col):
         """按注册组构建一级菜单（不 exec，单测可直接校验结构）。返回 (menu, handlers)：
         handlers 为 action→handler(col)。
-        默认展开组：不折成二级弹层，而是把「组标题（不可点）+ 其全部子项」就地平铺进一级菜单——
-        右键即见全部子项、无需再悬停；其余带多子项的组仍是二级弹层（尾部带「默认展开」开关），
-        单子项组直接是一级菜单项。"""
+        已展开的组（key ∈ self._expand，可多组）：不折成二级弹层，而是把「组标题（不可点）+
+        其全部子项」就地平铺进一级菜单，尾部挂一个「取消展开」文字开关；其余带多子项的组仍是
+        二级弹层，尾部挂「默认展开」文字开关；单子项组直接是一级菜单项。开关都不带对钩。"""
         menu = StyledMenu(self._t)
         handlers = {}
         for key, title, items in self._header_groups:
@@ -1655,14 +1662,12 @@ class TableColumnKit(QObject):
                 act = menu.addAction(items[0][0])
                 handlers[act] = items[0][1]
                 continue
-            if key == self._expand:
-                # 默认展开：组标题做不可点分组头，内容直接铺进一级菜单，再带一个「默认展开」开关（取消用）
+            if key in self._expand:
+                # 已展开：组标题做不可点分组头，内容铺进一级菜单，尾部「取消展开」收回（无对钩）
                 head = menu.addAction(title)
                 head.setEnabled(False)
                 self._fill_menu(menu, items, handlers)
-                ea = menu.addAction("默认展开")
-                ea.setCheckable(True)
-                ea.setChecked(True)
+                ea = menu.addAction("取消展开")
                 ea.setData("default_expand")
                 handlers[ea] = (lambda _col, k=key: self._toggle_default_expand(k))
                 menu.addSeparator()
@@ -1671,7 +1676,6 @@ class TableColumnKit(QObject):
             self._fill_menu(sub, items, handlers)
             sub.addSeparator()
             ea = sub.addAction("默认展开")
-            ea.setCheckable(True)
             ea.setData("default_expand")   # 标记：点它不关菜单，而是当场重开（该组就地平铺展开）
             handlers[ea] = (lambda _col, k=key: self._toggle_default_expand(k))
             menu.addMenu(sub)
@@ -1702,7 +1706,11 @@ class TableColumnKit(QObject):
             self._show_header_menu(col, gpos)
 
     def _toggle_default_expand(self, key):
-        self._expand = None if self._expand == key else key
+        # 各组独立开关：已在集合里就移除（收起），否则加入（展开）——多组可同时展开，互不顶掉
+        if key in self._expand:
+            self._expand.discard(key)
+        else:
+            self._expand.add(key)
         self._save_prefs()
 
     def _set_col_format(self, col, fmt):
@@ -1769,7 +1777,7 @@ class TableColumnKit(QObject):
             return
         try:
             from store import app_state
-            app_state.set_value(key, {"expand": self._expand,
+            app_state.set_value(key, {"expand": sorted(self._expand),
                                       "fmt": {str(c): f for c, f in self._col_fmt.items()}})
         except Exception:
             pass
