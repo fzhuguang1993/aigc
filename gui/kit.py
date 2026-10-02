@@ -1940,9 +1940,10 @@ class _FMOrderChip(_FMDrag, QFrame):
         self.fid, self.mgr, self.index = fid, mgr, index
         self.setObjectName("FMChip")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(28)   # 真胶囊：高度固定 28，配合 QSS 的 14px 圆角＝两端全半圆
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         h = QHBoxLayout(self)
-        h.setContentsMargins(8, 3, 6, 3)
+        h.setContentsMargins(10, 0, 8, 0)
         h.setSpacing(5)
         g = QLabel("☰")
         g.setObjectName("FMGrip")
@@ -2012,9 +2013,9 @@ class FieldManager(QWidget):
         lv.setSpacing(10)
         for gname, ids in self._groups:
             gb = QGroupBox(gname)
-            gv = QVBoxLayout(gb)
-            gv.setContentsMargins(2, 2, 2, 2)
-            gv.setSpacing(4)
+            # 勾选框流式排布：从左往右一行摆多个，放不下自动换行（不要一排只放一个）
+            gv = FlowLayout(gb, hgap=10, vgap=4)
+            gv.setContentsMargins(2, 6, 2, 2)
             for fid in ids:
                 if fid not in self._labels:
                     continue
@@ -2043,11 +2044,7 @@ class FieldManager(QWidget):
 
         # ---------- 右：显示顺序（流式胶囊 + 拖拽落点光标；圆角外框 + 竖向滚动看全）----------
         right = QVBoxLayout()
-        right.setSpacing(6)
-        rl = QLabel("显示顺序 · 拖动 ☰ 调序（松手前会闪烁落点光标），× 移除")
-        rl.setObjectName("FMHint")
-        rl.setWordWrap(True)
-        right.addWidget(rl)
+        right.setSpacing(0)
         self._bar = _FMOrderBar(self)
         self._right = QScrollArea()
         self._right.setWidgetResizable(True)
@@ -2201,7 +2198,6 @@ class FieldManager(QWidget):
             f"#FieldManager QCheckBox{{color:{C['text']};font-size:13px;"
             f"background:transparent;spacing:6px;}}"
             f"#FMGrip{{color:{C['sub']};font-size:12px;background:transparent;}}"
-            f"#FMHint{{color:{C['weak']};font-size:12px;background:transparent;}}"
             f"#FMOrderBar{{background:transparent;border:none;}}"
             f"#FMChip{{background:{soft};border:1px solid {line};"
             f"border-radius:{ui_kit.RADIUS['pill']}px;}}"
