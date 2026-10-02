@@ -11,7 +11,8 @@ FS_* 常量、数据中台的 _STATUS_COLOR/KpiCard、menus.py 的 RADIUS、各�
 - rgba()/tint() 给「软色底/描边」这类按主色派生的场景用（KPI 徽章、字段胶囊都吃这个）。
 - 想快速看全所有令牌与组件效果，开「UI 组件库」画廊页（gui/pages_ui_kit.py）。
 """
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QColor, QPainter, QPen
 
 
 # --------------------------------------------------------------------
@@ -151,6 +152,32 @@ tint = rgba
 def color(name, default=None):
     """按语义名取色；给画廊/各页统一入口，避免拼错 key 直接 KeyError 崩 UI。"""
     return COLORS.get(name, default if default is not None else COLORS["text"])
+
+
+def draw_rounded_card(pr, rect, radius, margin, fill=None, border=None):
+    """在透明顶层上自绘一张圆角白卡 + 向外逐层变淡的软阴影（弹层家族共用：
+    菜单 / 圆角浮层 / tooltip 气泡 / 无边框对话框 / 全文预览浮层都吃这一个）。
+    margin 为四周留白（也是阴影活动带），内容布局需用同宽边距避开圆角。
+    为什么放这儿：这套画法是「弹层圆角」的单一真源，历史上长在 kit.py，
+    但 widgets.py 反向被 kit.py 依赖、没法 import 回来；提到令牌层，两侧都能复用。
+    pr 需已开启 Antialiasing；radius 缺省取 RADIUS['lg']（与菜单容器刻度对齐）。"""
+    if radius is None:
+        radius = RADIUS["lg"]
+    card = QRectF(rect).adjusted(margin, margin, -margin, -margin)
+    sc = QColor(COLORS["text"])
+    pr.setPen(Qt.PenStyle.NoPen)
+    steps = 6
+    # 软阴影：整体调淡一档（太重白底上一眼看出“发灰”），保留最内层一点点层次即可——
+    # 描边已能勾出轮廓，阴影只负责把卡片从背景里轻轻托起来。
+    for i in range(steps, 0, -1):
+        off = i * (margin / steps)
+        alpha = 3 + int(13 * (1 - i / steps))
+        pr.setBrush(QColor(sc.red(), sc.green(), sc.blue(), alpha))
+        pr.drawRoundedRect(card.adjusted(-off, -off, off, off),
+                           radius + off, radius + off)
+    pr.setBrush(QColor(fill or COLORS["card"]))
+    pr.setPen(QPen(QColor(border or COLORS["border_popup"]), 1))
+    pr.drawRoundedRect(card, radius, radius)
 
 
 def swatches():

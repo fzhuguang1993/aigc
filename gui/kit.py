@@ -96,24 +96,9 @@ def _lighten(hex_color, f):
     return _mix(QColor(hex_color), QColor(255, 255, 255), f).name()
 
 
-def _draw_rounded_card(pr, rect, radius, margin, fill=None, border=None):
-    """在透明顶层上自绘一张圆角白卡 + 向外逐层变淡的软阴影（菜单/弹窗/通知共用）。
-    margin 为四周留白（也是阴影活动带），内容布局需用同宽边距避开圆角。"""
-    card = QRectF(rect).adjusted(margin, margin, -margin, -margin)
-    sc = QColor(C["text"])
-    pr.setPen(Qt.PenStyle.NoPen)
-    steps = 6
-    # 软阴影：整体调淡一档（原 8+28 太重，白底上一眼看出“发灰”），保留最内层一点点
-    # 层次即可——描边已能勾出轮廓，阴影只负责把卡片从背景里轻轻托起来。
-    for i in range(steps, 0, -1):
-        off = i * (margin / steps)
-        alpha = 3 + int(13 * (1 - i / steps))
-        pr.setBrush(QColor(sc.red(), sc.green(), sc.blue(), alpha))
-        pr.drawRoundedRect(card.adjusted(-off, -off, off, off),
-                           radius + off, radius + off)
-    pr.setBrush(QColor(fill or C["card"]))
-    pr.setPen(QPen(QColor(border or C["border_popup"]), 1))
-    pr.drawRoundedRect(card, radius, radius)
+# 「弹层圆角卡 + 软阴影」画法已下沉到设计令牌层 gui/ui_kit.py（单一真源，
+# widgets.py 的全文预览浮层也复用它）——这里保留原名做别名，两处调用点不改。
+_draw_rounded_card = ui_kit.draw_rounded_card
 
 
 class _RoundPopup(QWidget):

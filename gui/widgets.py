@@ -22,6 +22,7 @@ from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
 from store import app_state
 from utils.desktop_utils import open_path, reveal_in_folder
 from gui.theme import tokenize
+from gui.ui_kit import COLORS, RADIUS as TOK_RADIUS, draw_rounded_card
 
 
 class FlowLayout(QLayout):
@@ -1044,18 +1045,23 @@ class ImagePreviewDialog(QDialog):
 # 中文（含中文标点）连续片段：悬停预览时整段高亮，与英文镜头描述区分开
 _CJK_RUN = re.compile(r"([\u4e00-\u9fff\u3000-\u303f\uff01-\uff5e、。！？“”‘’…—·\u2014]+)")
 
+# 高亮取设计令牌：文字用 warning 橙（与全站强调色一致）；软黄底是暖色，
+# 令牌里的 *_soft 全是冷调（蓝/红）压不住橙字，故单独留一档暖黄
+_HL_COLOR = COLORS["warning"]
+_HL_BG = "#FFF4C4"
+
 
 def _highlight_cjk_html(text):
     """转义 HTML 后，把每段中文包成橙底色 span；保留原有换行"""
     lines = []
+    span = f'<span style="color:{_HL_COLOR}; background-color:{_HL_BG};">\\1</span>'
     for line in text.split("\n"):
         esc = html.escape(line)
-        lines.append(_CJK_RUN.sub(
-            r'<span style="color:#B54708; background-color:#FFF4C4;">\1</span>', esc))
+        lines.append(_CJK_RUN.sub(span, esc))
     return "<br>".join(lines)
 
 
-class HoverPreview(QScrollArea):
+class HoverPreview(QWidget):
     """全文预览浮层：限宽自动换行、超长可滚动、保留原文换行排版。
 
     两种模式：
@@ -1067,8 +1073,10 @@ class HoverPreview(QScrollArea):
     编辑弹窗里再翻一遍。第一次要口令，之后同一份内容在原文/对照间来回切。
     """
 
-    WIDTH = 460
-    MAX_H = 340
+    WIDTH = 460           # 白卡可见宽（不含四周阴影带）
+    MAX_H = 340           # 白卡可见最大高
+    SHADOW = 14           # 四周软阴影活动带（与 _RoundPopup 同款：透明边带里逐层画阴影）
+    PAD = 12              # 卡片内文字留白（也保证文字不压到圆角）
     HIDE_DELAY = 300        # ms：离开单元格后给移入浮层留的反应时间
     # 单独按下修饰键（比如先按住 Alt）不算“按了个键”：否则 Alt+W 的第一个键
     # 就把浮层关掉了，组合键永远按不出来
@@ -1077,25 +1085,46 @@ class HoverPreview(QScrollArea):
 
     def __init__(self, parent=None, host=None):
         super().__init__(parent)
-        # ToolTip 窗口标志：不抢焦点、永远浮在最上层
-        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        # ToolTip 窗口标志：不抢焦点、永远浮在最上层；NoDropShadow + 逐像素透明，
+        # 四角交给 paintEvent 自绘圆角卡——与 StyledMenu / TipBubble 同一套弹层家族，
+        # 告别过去「QSS border-radius 在方窗里画圆角（直角套圆角）」和脱离调色板的硬编码色。
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+                            | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setWindowOpacity(0.98)
-        self.setStyleSheet(tokenize("""
-            QScrollArea { background:#FFFFFF; border:1px solid #C6CFDD; border-radius:8px; }
-            QLabel { background:transparent; color:#2B3441; font-size:12px; padding:10px; }
-            QScrollBar:vertical { width:8px; background:transparent; }
-            QScrollBar::handle:vertical { background:#C6CFDD; border-radius:4px; }
-        """))
-        self.setWidgetResizable(True)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # 外层留出阴影带，里面放一个透明的 QScrollArea 承载正文（超长可滚动）
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(self.SHADOW, self.SHADOW, self.SHADOW, self.SHADOW)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._scroll.viewport().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.label = QLabel()
         self.label.setWordWrap(True)                       # 按宽度自动换行
         self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.setWidget(self.label)
-        self.setFixedWidth(self.WIDTH)
-        self.setMaximumHeight(self.MAX_H)
+        self.label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._scroll.setWidget(self.label)
+        outer.addWidget(self._scroll)
+        # 内容层保持透明，让自绘白卡透出；文字 / 滚动条一律取设计令牌（tokenize 映射回 COLORS）
+        self.setStyleSheet(tokenize(f"""
+            QScrollArea {{ background:transparent; border:none; }}
+            QScrollArea > QWidget > QWidget {{ background:transparent; }}
+            QLabel {{ background:transparent; color:#1F2329; font-size:12px;
+                      padding:{self.PAD}px; }}
+            QScrollBar:vertical {{ width:8px; background:transparent; margin:0; }}
+            QScrollBar::handle:vertical {{ background:#C9CDD4; border-radius:4px;
+                                           min-height:24px; }}
+            QScrollBar::handle:vertical:hover {{ background:#A9AFB8; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background:transparent; }}
+        """))
+        self.setFixedWidth(self.WIDTH + 2 * self.SHADOW)
+        self.setMaximumHeight(self.MAX_H + 2 * self.SHADOW)
         self._keep_rect = None                             # 全局坐标：视为“未离开”的区域
         self._pinned = False                # 钉住模式（单击/空格唤起）中
         self._hide_timer = QTimer(self)                    # 延时隐藏检查
@@ -1131,10 +1160,19 @@ class HoverPreview(QScrollArea):
             return _highlight_cjk_html(text)
         return "<br>".join(html.escape(line) for line in str(text or "").split("\n"))
 
+    def paintEvent(self, e):
+        # 透明顶层上自绘一张圆角白卡 + 一圈软阴影（与全站弹层家族同款）；
+        # 内容层保持透明，卡片底色从四角透出——修「方窗套圆角」。
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        draw_rounded_card(p, self.rect(), TOK_RADIUS["lg"], self.SHADOW)
+        p.end()
+        super().paintEvent(e)
+
     def _fit(self):
         self.label.adjustSize()
-        h = min(self.label.sizeHint().height() + 24, self.MAX_H)
-        self.setFixedHeight(h)
+        card_h = min(self.label.sizeHint().height() + 2 * self.PAD, self.MAX_H)
+        self.setFixedHeight(card_h + 2 * self.SHADOW)
 
     def _render(self, text, rich_text):
         """悬停模式：只铺内容，不带翻译尾注（没解锁的人不该看见 Alt+W）"""
@@ -1170,7 +1208,8 @@ class HoverPreview(QScrollArea):
             tip = "中文对照（提交给云端的仍是原文）· 再按 Alt+W 回原文"
         else:
             tip = "按 Alt+W 看中文对照 · 其它键关闭"
-        return '<br><span style="color:#8F959E;">{}</span>'.format(html.escape(tip))
+        return '<br><span style="color:{};">{}</span>'.format(
+            COLORS["weak"], html.escape(tip))
 
     def show_pinned(self, text, pos, rich_text=True):
         """单击/空格唤起：钉住显示，任意键关闭（Popup 模式自带键盘抓取）"""
@@ -1183,7 +1222,9 @@ class HoverPreview(QScrollArea):
         self._showing_zh = False      # 换了内容就先看原文，别拿上一段的对照糊弄
         self._tip = ""
         self._err = ""
-        self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
+                            | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._repaint()
         self.move(self.clamp_to_screen(pos))
         self.show()
@@ -1197,7 +1238,9 @@ class HoverPreview(QScrollArea):
             return                              # 已钉住：悬停不覆盖正在阅读的内容
         if self.windowFlags() & Qt.WindowType.Popup:
             # 上一次钉住关闭后恢复 ToolTip 标志（不抢焦点、不自动关闭）
-            self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+            self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+                                | Qt.WindowType.NoDropShadowWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._render(text, rich_text)
         self.move(self.clamp_to_screen(pos))
         self.show()
@@ -1224,7 +1267,9 @@ class HoverPreview(QScrollArea):
         super().hide()
         if was_pinned:
             # 恢复 ToolTip 标志，不影响下次悬停模式
-            self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+            self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+                                | Qt.WindowType.NoDropShadowWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
     def keyPressEvent(self, e):
         if not self._pinned:
