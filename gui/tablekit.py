@@ -61,7 +61,7 @@ class FieldManagerDialog(QDialog):
                  tip="勾选要显示的字段 · 右侧拖动调整列顺序 · 点「确定」应用"):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(620, 460)
+        self.resize(600, 500)
 
         fields, cats = self._to_fields(columns, categories)
         self.fm = FieldManager(fields, order, hidden, categories=cats)

@@ -1814,8 +1814,7 @@ class _FMDrag:
             mime.setData(_FM_MIME, json.dumps(
                 {"src": src, "id": fid, "index": index}).encode("utf-8"))
             drag.setMimeData(mime)
-            target = self.parentWidget() if isinstance(self, _FMHandle) else self
-            pm = target.grab()
+            pm = self.grab()      # 右侧整枚胶囊跟随光标（左侧已改纯勾选、无把手）
             drag.setPixmap(pm)
             drag.setHotSpot(QPoint(pm.width() // 2, pm.height() // 2))
             self._fm_press = None
@@ -1824,46 +1823,113 @@ class _FMDrag:
         return False
 
 
-class _FMHandle(_FMDrag, QLabel):
-    """池行左侧的 ☰ 拖拽把手：按住拖到右侧即把该字段插入落点。"""
+class _FMOrderBar(QWidget):
+    """右侧流式容器：装顺序胶囊；内部拖动调序，并在落点画一条闪烁竖线提示插入位。"""
 
-    def __init__(self, mgr, fid, src="pool", parent=None):
-        super().__init__("☰", parent)
-        self.mgr, self.fid, self.src = mgr, fid, src
-        self.setObjectName("FMGrip")
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
-        self.setFixedWidth(14)
-
-    def mousePressEvent(self, e):
-        self._fm_press_ev(e)
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):
-        if self._fm_try_drag(e, self.src, self.fid):
-            e.accept()
-        else:
-            super().mouseMoveEvent(e)
-
-    def mouseReleaseEvent(self, e):
-        self._fm_press = None
-        super().mouseReleaseEvent(e)
-
-
-class _FMPoolRow(QWidget):
-    """左侧一条字段：[☰ 把手][勾选框]。勾选＝追加到右侧；按住把手＝拖到右侧落点插入。"""
-
-    def __init__(self, fid, mgr, parent=None):
+    def __init__(self, mgr, parent=None):
         super().__init__(parent)
-        self.fid, self.mgr = fid, mgr
-        h = QHBoxLayout(self)
-        h.setContentsMargins(2, 0, 4, 0)
-        h.setSpacing(6)
-        h.addWidget(_FMHandle(mgr, fid))
-        self.cb = QCheckBox(mgr.label_of(fid))
-        self.cb.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.cb.toggled.connect(lambda on, f=fid: mgr.toggle(f, on))
-        h.addWidget(self.cb, 1)
-        mgr._boxes[fid] = self.cb
+        self.mgr = mgr
+        self.setObjectName("FMOrderBar")
+        self.setAcceptDrops(True)
+        self._flow = FlowLayout(self, hgap=6, vgap=8)
+        self._flow.setContentsMargins(8, 8, 8, 8)
+        # 拖拽落点指示：drag 期间按插入位画一条闪烁竖线（普通拖拽该有的反馈）
+        self._drop_index = None
+        self._blink_on = False
+        self._blink = QTimer(self)
+        self._blink.setInterval(420)
+        self._blink.timeout.connect(self._tick_blink)
+
+    def _tick_blink(self):
+        self._blink_on = not self._blink_on
+        self.update()
+
+    def _chips(self):
+        out = []
+        for i in range(self._flow.count()):
+            it = self._flow.itemAt(i)
+            w = it.widget() if it is not None else None
+            if isinstance(w, _FMOrderChip):
+                out.append((i, w))
+        return out
+
+    def insert_index_at(self, pt):
+        """把落点换算成扁平序列插入位：按行（top）分组，同行按 x。"""
+        chips = self._chips()
+        if not chips:
+            return 0
+        rows = {}
+        for idx, c in chips:
+            rows.setdefault(c.geometry().top(), []).append((idx, c))
+        tops = sorted(rows)
+        target = tops[0]
+        for t in tops:
+            if pt.y() >= t:
+                target = t
+            else:
+                break
+        row = rows[target]
+        for idx, c in row:
+            if pt.x() < c.geometry().center().x():
+                return idx
+        return row[-1][0] + 1
+
+    def _caret_rect(self, index):
+        """插入位 index → 落点竖线的几何（x=胶囊缝隙，y=该行胶囊上下沿）。"""
+        cw = [c for _, c in self._chips()]
+        m = self._flow.contentsMargins()
+        if not cw:
+            return QRectF(m.left(), m.top() + 2, 0, 18)
+        if index < len(cw):
+            g = cw[index].geometry()
+            x = g.left() - self._flow.hgap / 2.0
+        else:
+            g = cw[-1].geometry()
+            x = g.right() + self._flow.hgap / 2.0 + 1
+        return QRectF(x, g.top(), 0, g.height())
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(_FM_MIME):
+            self._blink.start()
+            self._blink_on = True
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasFormat(_FM_MIME):
+            idx = self.insert_index_at(e.position().toPoint())
+            if idx != self._drop_index:
+                self._drop_index = idx
+                self._blink_on = True
+                self.update()
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self._end_marker()
+
+    def dropEvent(self, e):
+        pt = e.position().toPoint()
+        self._end_marker()
+        self.mgr.handle_drop(pt, e)
+        e.acceptProposedAction()
+
+    def _end_marker(self):
+        self._blink.stop()
+        self._drop_index = None
+        self._blink_on = False
+        self.update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self._drop_index is None or not self._blink_on:
+            return
+        r = self._caret_rect(self._drop_index)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(C["primary"]))
+        pen.setWidthF(2.0)
+        p.setPen(pen)
+        p.drawLine(int(r.x()), int(r.top()), int(r.x()), int(r.bottom()))
+        p.end()
 
 
 class _FMOrderChip(_FMDrag, QFrame):
@@ -1907,69 +1973,13 @@ class _FMOrderChip(_FMDrag, QFrame):
         super().mouseReleaseEvent(e)
 
 
-class _FMOrderBar(QWidget):
-    """右侧流式容器：装顺序胶囊，接受「池拖入 / 内部重排」。"""
-
-    def __init__(self, mgr, parent=None):
-        super().__init__(parent)
-        self.mgr = mgr
-        self.setObjectName("FMOrderBar")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setAcceptDrops(True)
-        self.setMinimumHeight(140)
-        self._flow = FlowLayout(self, hgap=6, vgap=6)
-        self._flow.setContentsMargins(8, 8, 8, 8)
-
-    def _chips(self):
-        out = []
-        for i in range(self._flow.count()):
-            it = self._flow.itemAt(i)
-            w = it.widget() if it is not None else None
-            if isinstance(w, _FMOrderChip):
-                out.append((i, w))
-        return out
-
-    def insert_index_at(self, pt):
-        """把落点换算成扁平序列插入位：按行（top）分组，同行按 x。"""
-        chips = self._chips()
-        if not chips:
-            return 0
-        rows = {}
-        for idx, c in chips:
-            rows.setdefault(c.geometry().top(), []).append((idx, c))
-        tops = sorted(rows)
-        target = tops[0]
-        for t in tops:
-            if pt.y() >= t:
-                target = t
-            else:
-                break
-        row = rows[target]
-        for idx, c in row:
-            if pt.x() < c.geometry().center().x():
-                return idx
-        return row[-1][0] + 1
-
-    def dragEnterEvent(self, e):
-        if e.mimeData().hasFormat(_FM_MIME):
-            e.acceptProposedAction()
-
-    def dragMoveEvent(self, e):
-        if e.mimeData().hasFormat(_FM_MIME):
-            e.acceptProposedAction()
-
-    def dropEvent(self, e):
-        if e.mimeData().hasFormat(_FM_MIME):
-            self.mgr.handle_drop(e.position().toPoint(), e)
-            e.acceptProposedAction()
-
-
 class FieldManager(QWidget):
     """字段管理：左分类勾选 / 右流式拖拽排序。字段用 (id,label,category)。"""
 
     changed = Signal()
 
-    def __init__(self, fields, order, hidden, categories=None, parent=None):
+    def __init__(self, fields, order, hidden, categories=None, size=(560, 360),
+                 parent=None):
         super().__init__(parent)
         self.setObjectName("FieldManager")
         self._fields = list(fields)
@@ -1995,40 +2005,71 @@ class FieldManager(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(12)
 
+        # ---------- 左：字段池（纯 QCheckBox 逐行勾选，无把手；圆角外框与右侧统一）----------
         left_host = QWidget()
         lv = QVBoxLayout(left_host)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(8)
+        lv.setContentsMargins(12, 12, 12, 12)
+        lv.setSpacing(10)
         for gname, ids in self._groups:
-            box = QGroupBox(gname)
-            gv = QVBoxLayout(box)
-            gv.setContentsMargins(10, 6, 10, 8)
-            gv.setSpacing(3)
+            gb = QGroupBox(gname)
+            gv = QVBoxLayout(gb)
+            gv.setContentsMargins(2, 2, 2, 2)
+            gv.setSpacing(4)
             for fid in ids:
-                if fid in self._labels:
-                    gv.addWidget(_FMPoolRow(fid, self))
-            lv.addWidget(box)
+                if fid not in self._labels:
+                    continue
+                cb = QCheckBox(self.label_of(fid))
+                cb.setCursor(Qt.CursorShape.PointingHandCursor)
+                cb.toggled.connect(lambda on, f=fid: self.toggle(f, on))
+                gv.addWidget(cb)
+                self._boxes[fid] = cb
+            lv.addWidget(gb)
         lv.addStretch(1)
         lscroll = QScrollArea()
         lscroll.setWidgetResizable(True)
         lscroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        lscroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        lscroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lscroll.setStyleSheet(
+            "QScrollArea,QScrollArea>QWidget>QWidget{background:transparent;border:none;}")
         lscroll.setWidget(left_host)
-        lscroll.setFixedWidth(220)
-        outer.addWidget(lscroll)
+        frame_l = QFrame()
+        frame_l.setObjectName("FMPool")
+        frame_l.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        frame_l.setFixedWidth(220)
+        fl = QVBoxLayout(frame_l)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.addWidget(lscroll)
+        outer.addWidget(frame_l)
 
+        # ---------- 右：显示顺序（流式胶囊 + 拖拽落点光标；圆角外框 + 竖向滚动看全）----------
         right = QVBoxLayout()
-        right.setSpacing(4)
-        rl = QLabel("显示顺序 · 拖动 ☰ 调序，× 移除")
+        right.setSpacing(6)
+        rl = QLabel("显示顺序 · 拖动 ☰ 调序（松手前会闪烁落点光标），× 移除")
         rl.setObjectName("FMHint")
+        rl.setWordWrap(True)
         right.addWidget(rl)
         self._bar = _FMOrderBar(self)
-        right.addWidget(self._bar, 1)
+        self._right = QScrollArea()
+        self._right.setWidgetResizable(True)
+        self._right.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._right.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._right.setStyleSheet(
+            "QScrollArea,QScrollArea>QWidget>QWidget{background:transparent;border:none;}")
+        self._right.setWidget(self._bar)
+        frame_r = QFrame()
+        frame_r.setObjectName("FMOrderWrap")
+        frame_r.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        fr = QVBoxLayout(frame_r)
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.addWidget(self._right)
+        right.addWidget(frame_r, 1)
         outer.addLayout(right, 1)
 
         self._apply_style()
         self._sync_boxes()
         self._rebuild_bar()
+        if size:
+            self.setFixedSize(*size)   # 固定尺寸，不做自适应
 
     # ---------- 对外 ----------
     def label_of(self, fid):
@@ -2129,28 +2170,44 @@ class FieldManager(QWidget):
         for i, fid in enumerate(self._order):
             self._bar._flow.addWidget(_FMOrderChip(fid, self, i))
         self._bar.updateGeometry()
+        self._sync_order_height()
+
+    def _sync_order_height(self):
+        """右侧放在滚动容器里，FlowLayout 的高度靠 heightForWidth 手动喂给 min height，
+        这样字段多时才会出现竖向滚动条（组件固定尺寸→宽度恒定，算一次即准）。"""
+        w = self._right.viewport().width()
+        if w <= 0:
+            return
+        self._bar.setMinimumHeight(max(self._bar._flow.heightForWidth(w), 40))
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._sync_order_height()
+        QTimer.singleShot(0, self._sync_order_height)
 
     def _apply_style(self):
         soft = ui_kit.rgba(C["primary"], 0.10)
         hover = ui_kit.rgba(C["primary"], 0.18)
         line = ui_kit.rgba(C["primary"], 0.35)
+        card_r = ui_kit.RADIUS["card"]
         self.setStyleSheet(
-            f"#FieldManager QGroupBox{{border:1px solid {C['border']};"
-            f"border-radius:{ui_kit.RADIUS['md']}px;margin-top:8px;padding-top:4px;"
-            f"font-weight:600;color:{C['sub']};background:transparent;}}"
-            f"#FieldManager QGroupBox::title{{subcontrol-origin:margin;left:10px;"
-            f"padding:0 4px;}}"
-            f"#FieldManager QCheckBox{{color:{C['text']};font-size:13px;background:transparent;}}"
-            f"#FMGrip{{color:{C['weak']};font-size:12px;background:transparent;}}"
+            # 左字段池与右顺序区共用一套圆角外框（浅底 + 1px 边 + card 圆角），两边对称
+            f"#FMPool,#FMOrderWrap{{background:{C['bg_field']};"
+            f"border:1px solid {C['border']};border-radius:{card_r}px;}}"
+            # 分类标题：外框已给边框，组内不再描边（避免双层框），只留标题文字
+            f"#FieldManager QGroupBox{{border:none;background:transparent;"
+            f"font-weight:600;color:{C['sub']};margin-top:2px;padding:0;}}"
+            f"#FieldManager QGroupBox::title{{subcontrol-origin:margin;left:2px;padding:0;}}"
+            f"#FieldManager QCheckBox{{color:{C['text']};font-size:13px;"
+            f"background:transparent;spacing:6px;}}"
+            f"#FMGrip{{color:{C['sub']};font-size:12px;background:transparent;}}"
             f"#FMHint{{color:{C['weak']};font-size:12px;background:transparent;}}"
-            f"#FMOrderBar{{background:{C['bg_field']};border:1px solid {C['border']};"
-            f"border-radius:{ui_kit.RADIUS['card']}px;}}"
+            f"#FMOrderBar{{background:transparent;border:none;}}"
             f"#FMChip{{background:{soft};border:1px solid {line};"
             f"border-radius:{ui_kit.RADIUS['pill']}px;}}"
             f"#FMChip:hover{{background:{hover};border:1px solid {C['primary']};}}"
             f"#FMChip #FMChipText{{color:{C['text']};font-size:13px;"
             f"background:transparent;border:none;}}"
-            f"#FMChip #FMGrip{{color:{C['sub']};}}"
             f"#FMChipX{{background:transparent;border:none;color:{C['weak']};"
             f"font-weight:700;padding:0;}}"
             f"#FMChipX:hover{{color:{C['danger']};}}")
