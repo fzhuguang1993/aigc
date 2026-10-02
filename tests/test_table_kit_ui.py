@@ -242,6 +242,33 @@ def test_header_menu_default_expand_toggle(qapp, monkeypatch):
     assert kit._expand == "format"
 
 
+def test_default_expand_reopens_in_place(qapp, monkeypatch):
+    """点「默认展开」不是等下次：应当场在同一位置重开菜单，并把该二级菜单展开。
+    驱exec 返回序列模拟：第一次弹→用户点 align 组的「默认展开」；第二次弹（重开）→Esc 关。"""
+    from PySide6.QtCore import QPoint
+    from gui.kit import TableColumnKit
+    kit = TableColumnKit(_kit_table(qapp))
+    assert kit._expand is None
+    calls = {"n": 0}
+    orig_build = kit._build_header_menu
+
+    def fake_build(col):
+        menu, handlers, expand_actions = orig_build(col)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            ea = next(a for a in handlers if a.data() == "default_expand")
+            monkeypatch.setattr(menu, "exec", lambda pos: ea)   # 用户点了默认展开
+        else:
+            assert "align" in expand_actions                    # 重开时默认组已登记自动展开
+            monkeypatch.setattr(menu, "exec", lambda pos: None)  # 用户 Esc
+        return menu, handlers, expand_actions
+
+    monkeypatch.setattr(kit, "_build_header_menu", fake_build)
+    kit._show_header_menu(0, QPoint(10, 10))
+    assert calls["n"] == 2            # 菜单被当场重开了一次
+    assert kit._expand == "align"     # 设置已生效
+
+
 def test_apply_sort_number_moves_whole_rows(qapp):
     from PySide6.QtCore import Qt
     from gui.kit import TableColumnKit

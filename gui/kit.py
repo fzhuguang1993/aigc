@@ -1658,6 +1658,7 @@ class TableColumnKit(QObject):
             ea = sub.addAction("默认展开")
             ea.setCheckable(True)
             ea.setChecked(self._expand == key)
+            ea.setData("default_expand")   # 标记：点它不关菜单，而是当场重开并展开
             handlers[ea] = (lambda _col, k=key: self._toggle_default_expand(k))
             expand_actions[key] = sub.menuAction()
             menu.addMenu(sub)
@@ -1677,17 +1678,25 @@ class TableColumnKit(QObject):
         menu, handlers, expand_actions = self._build_header_menu(col)
         target = expand_actions.get(self._expand)
         if target is not None:
-            # 弹出后自动悬停到默认组：一级菜单照常全部可见，默认那组就地展开，不用鼠标再选
-            def _open():
+            # 弹出后自动悬停到默认组：一级菜单照常全部可见，默认那组就地展开，不用鼠标再选。
+            # singleShot(0) 偶尔早于菜单真正 show（机器/时序差异），未可见时极短重试一次。
+            def _open(tries=0):
                 if menu.isVisible():
                     menu.setActiveAction(target)
+                elif tries < 3:
+                    QTimer.singleShot(15, lambda: _open(tries + 1))
             QTimer.singleShot(0, _open)
         chosen = menu.exec(gpos)
         if chosen is None:
             return
         fn = handlers.get(chosen)
-        if fn is not None:
-            fn(col)
+        if fn is None:
+            return
+        fn(col)
+        # 点「默认展开」：不关菜单——按新设置立即在同一位置重开，当场把该二级菜单展开给用户看
+        # （再点同一个会解除默认、self._expand 变 None，此时不重开、菜单正常关闭，作为退出）
+        if chosen.data() == "default_expand" and self._expand is not None:
+            self._show_header_menu(col, gpos)
 
     def _toggle_default_expand(self, key):
         self._expand = None if self._expand == key else key
