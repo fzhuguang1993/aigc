@@ -25,11 +25,11 @@ RADIUS = 10                     # 卡片圆角半径（与 ui_kit.RADIUS["lg"] �
 MARGIN = 12                     # 四周留白：既是 items 的 padding，也是自绘软阴影的活动带
 _SHADOW_STEPS = 6               # 阴影分层数（越多越细腻）
 
-# MenuCascade 用色：展开钮绿、收起钮红、分组标题主蓝文字 + 淡蓝底色带（都取 ui_kit 令牌）
+# MenuCascade 用色：展开钮绿、收起钮红、分组标题主蓝文字 + 浅灰底色带（都取 ui_kit 令牌）
 _EXPAND = {"bg": COLORS["success"], "hover": COLORS["line_ok"]}
 _COLLAPSE = {"bg": COLORS["danger"], "hover": COLORS["danger_text"]}
 _HEADER_COLOR = COLORS["primary"]
-_HEADER_BG = COLORS["primary_soft"]   # 二级菜单分组标题的淡蓝底色带
+_HEADER_BG = COLORS["bg"]   # 二级菜单分组标题的浅灰底色带
 
 
 class StyledMenu(QMenu):
@@ -185,8 +185,8 @@ class MenuCascade:
             f" QPushButton:pressed {{ background:{hover}; }}")
         btn.clicked.connect(lambda: self._request_toggle(key))
         wa = QWidgetAction(self._top)
-        # 左右 0 内距：色块顶到卡片内缘（整个菜单同宽），圆角由按钮自身 border-radius 处理
-        wa.setDefaultWidget(_row(btn, margins=(0, 4, 0, 4), fill=True))
+        # 左右留 10px 缝：接近菜单同宽但不顶到卡片边（顶边圆角胶囊不好看），与标题同一内缩缘线
+        wa.setDefaultWidget(_row(btn, margins=(10, 4, 10, 4), fill=True))
         wa.setData("default_expand")   # 标记：单测据此识别展开/收起开关
         return wa
 
@@ -229,7 +229,7 @@ def _row(inner, margins=(14, 3, 14, 3), fill=False):
 
 
 def _group_header(menu, title):
-    """就地展开时的分组标题：与展开/收起钮同款——固定底色主蓝文字整条横铺（顶到卡片内缘、与整个菜单同宽），
+    """就地展开时的分组标题：与展开/收起钮同款——浅灰固定底色 + 主蓝文字圆角胶囊，整条横铺（与按钮同一内缩缘线），
     不可点。经 QWidgetAction 挂进菜单。"""
     lbl = QLabel(title)
     lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -237,6 +237,6 @@ def _group_header(menu, title):
         f"color:{_HEADER_COLOR}; background:{_HEADER_BG}; font-weight:700; font-size:12px;"
         f" border-radius:{TOK_RADIUS['md']}px; padding:5px 14px;")
     wa = QWidgetAction(menu)
-    # 左右 0 内距：标题底色带与菜单同宽（与按钮对齐同一缘线）
-    wa.setDefaultWidget(_row(lbl, margins=(0, 4, 0, 4), fill=True))
+    # 左右 10px 缝：与按钮同宽同缘线，不顶到卡片边
+    wa.setDefaultWidget(_row(lbl, margins=(10, 4, 10, 4), fill=True))
     return wa
