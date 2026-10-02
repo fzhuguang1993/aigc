@@ -192,20 +192,6 @@ def _button_texts(menu):
     return out
 
 
-def _header_texts(menu):
-    """menu 里做分组标题的 QLabel 文字（不含按钮行）。"""
-    from PySide6.QtWidgets import QWidgetAction, QPushButton, QLabel
-    out = []
-    for a in menu.actions():
-        if isinstance(a, QWidgetAction):
-            w = a.defaultWidget()
-            if w is not None and w.findChild(QPushButton) is None:
-                lbl = w.findChild(QLabel)
-                if lbl is not None:
-                    out.append(lbl.text())
-    return out
-
-
 def test_header_menu_three_submenus_with_default_expand(qapp):
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
@@ -224,29 +210,36 @@ def test_header_menu_three_submenus_with_default_expand(qapp):
 
 
 def test_default_expand_group_renders_inline(qapp):
-    """展开的组：强调色分组标题(QLabel) + 子项就地平铺进一级菜单 + 尾部红钮「取消展开」；
-    其余组仍是二级弹层。"""
+    """展开态＝该二级菜单被默认展开：标题栏本身就是同款胶囊按钮（可点即收起），
+    下接子项就地平铺进一级菜单；不再另设「取消展开」钮；其余组仍是二级弹层。"""
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
     kit._menu.set_expanded(["align"])
     menu, handlers = kit._menu.build(0)
-    assert "居中调整" in _header_texts(menu)          # 强调色分组标题
+    # 一级菜单里唯一一枚胶囊就是分组标题栏（标题即收起开关）
+    assert _button_texts(menu) == ["居中调整"]
     assert "本列靠左" in _leaf_texts(menu)             # 子项就地平铺进一级菜单
-    assert _button_texts(menu) == ["取消展开"]         # 展开组尾部红钮
+    assert "取消展开" not in _button_texts(menu)       # 已无独立收起钮（标题与开关绑定）
     assert not any(a.isCheckable() for a in menu.actions())   # 无对钩
     # 顺序调整 / 字段格式 仍折成二级弹层
     assert [a.menu().title() for a in menu.actions() if a.menu()] == ["顺序调整", "字段格式"]
+    # 标题栏可点→收起该组（与展开钮同一机制）
+    from PySide6.QtWidgets import QWidgetAction, QPushButton
+    title_btn = next(a.defaultWidget().findChild(QPushButton) for a in menu.actions()
+                     if isinstance(a, QWidgetAction)
+                     and a.defaultWidget().findChild(QPushButton) is not None)
+    title_btn.click()
+    assert kit._menu.expanded() == set()
 
 
 def test_multiple_expand_groups_inline(qapp):
-    """多组同时展开：align + order 都就地平铺，format 仍是弹层；各自独立、互不顶掉。"""
+    """多组同时展开：align + order 标题栏都平铺可点收起，format 仍是弹层；各自独立、互不顶掉。"""
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
     kit._menu.set_expanded(["align", "order"])
     menu, _ = kit._menu.build(0)
-    assert set(_header_texts(menu)) >= {"居中调整", "顺序调整"}
+    assert _button_texts(menu) == ["居中调整", "顺序调整"]   # 两个展开组各一枚标题胶囊
     assert "本列靠左" in _leaf_texts(menu) and "升序排列" in _leaf_texts(menu)
-    assert _button_texts(menu) == ["取消展开", "取消展开"]      # 两个展开组各一个红钮
     assert [a.menu().title() for a in menu.actions() if a.menu()] == ["字段格式"]
 
 

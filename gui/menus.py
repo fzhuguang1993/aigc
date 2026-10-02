@@ -15,7 +15,7 @@ gui/menus.py —— 全站统一的右键 / 下拉菜单模板（StyledMenu）
 """
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import (QMenu, QWidget, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QMenu, QWidget, QHBoxLayout,
                               QPushButton, QWidgetAction, QSizePolicy)
 
 from gui.ui_kit import COLORS
@@ -25,11 +25,9 @@ RADIUS = 10                     # 卡片圆角半径（与 ui_kit.RADIUS["lg"] �
 MARGIN = 12                     # 四周留白：既是 items 的 padding，也是自绘软阴影的活动带
 _SHADOW_STEPS = 6               # 阴影分层数（越多越细腻）
 
-# MenuCascade 用色：展开钮绿、收起钮红；分组标题与展开钮完全同款（success 实底 + 白字）
-_EXPAND = {"bg": COLORS["success"], "hover": COLORS["line_ok"]}
-_COLLAPSE = {"bg": COLORS["danger"], "hover": COLORS["danger_text"]}
-_HEADER_BG = COLORS["success"]            # 分组标题底色：取 success 令牌（与默认展开钮同色）
-_HEADER_COLOR = COLORS["on_primary"]      # 分组标题文字：主色底上白字
+# MenuCascade 胶囊按钮用色：success 绿实底 + 白字（hover 深一档 line_ok）。
+# 「默认展开」按钮与展开态的分组标题栏都用同一枚同款胶囊——标题栏即按钮，点击可收起。
+_PILL = {"bg": COLORS["success"], "hover": COLORS["line_ok"], "fg": COLORS["on_primary"]}
 
 
 class StyledMenu(QMenu):
@@ -80,20 +78,20 @@ class StyledMenu(QMenu):
 # MenuCascade —— 注册式「多级右键弹层」装配器（可复用弹层组件，与业务解耦）
 #
 # 为什么放这儿：多级右键菜单这套逻辑（注册分组 / 无多级降一级 / 分组就地展开 /
-# 彩色分组标题 / 展开收起彩色按钮 / 切换后就地重开）历史上长在 TableColumnKit 里，
+# 标题栏即展开收起胶囊 / 切换后就地重开）历史上长在 TableColumnKit 里，
 # 任何想加右键菜单的地方都得照抄。抽到弹层组件菜单里，表头 / 行右键 / 工具按钮下拉
 # 都能复用：谁用谁 new 一个、注册自己的分组、给定 context（列号 / 行号 / 任意对象）。
 #
 # 分组规则：
 # - 多个子项的组 → 二级弹层；只有一个平铺处理项的组 → 直接是一级菜单项（没多级不绕一层）；
 #   子项里再挂列表 → 继续下钻（多级天然支持）。
-# - 每个多子项组尾部带一个彩色文字按钮：收起态绿钮「默认展开」、展开态红钮「取消展开」。
-#   点开后该组不再折成弹层，而是把「强调色分组标题 + 全部子项」就地平铺进一级菜单（跨平台稳：
+# - 展开 / 收起靠同一枚 success 绿胶囊按钮（标题栏即开关、与二级菜单内容同款同宽、铺满不留缝）：
+#   收起时组折成二级弹层，弹层尾部一枚「默认展开」胶囊，点了就地展开；展开时该组不再折层，
+#   而是把「分组标题胶囊（点击即收起）+ 全部子项」就地平铺进一级菜单（跨平台稳：
 #   macOS 下 QMenu 子菜单无法可靠程序化弹开）。可展开的组不唯一，多组各自独立、互不顶掉。
 # =====================================================================
 class MenuCascade:
-    EXPAND_LABEL = "默认展开"      # 收起态：绿钮，点了就地展开该组
-    COLLAPSE_LABEL = "取消展开"    # 已展开：红钮，点了收回该组
+    EXPAND_LABEL = "默认展开"      # 收起态：弹层尾部绿胶囊，点了就地展开该组（展开态则标题栏本身即收起开关）
 
     def __init__(self, parent=None, on_changed=None):
         self._parent = parent
@@ -145,17 +143,17 @@ class MenuCascade:
                 handlers[act] = items[0][1]
                 continue
             if key in self._expanded:
-                # 已展开：强调色分组标题（不可点）+ 子项就地平铺进一级菜单 + 尾部红钮「取消展开」
+                # 展开态＝该二级菜单被默认展开：标题栏就是同款胶囊按钮（点击可收起），
+                # 下接平铺子项（与二级菜单内容同款同宽）。标题与开关已绑定，不再另设「取消展开」钮。
                 # QMenu 加自定义控件只能经 QWidgetAction+addAction（无 addWidget）
-                menu.addAction(_group_header(menu, title))
+                menu.addAction(self._pill(title, key))
                 self._fill(menu, items, handlers)
-                menu.addAction(self._expand_btn(self.COLLAPSE_LABEL, False, key))
                 menu.addSeparator()
                 continue
             sub = StyledMenu(title)
             self._fill(sub, items, handlers)
             sub.addSeparator()
-            sub.addAction(self._expand_btn(self.EXPAND_LABEL, True, key))
+            sub.addAction(self._pill(self.EXPAND_LABEL, key))
             menu.addMenu(sub)
         return menu, handlers
 
@@ -168,24 +166,23 @@ class MenuCascade:
                 self._fill(sub, payload, handlers)
                 menu.addMenu(sub)
 
-    def _expand_btn(self, label, expandable, key):
-        """生成一个带背景色的文字按钮 action：expandable=True 绿（可展开），False 红（可收起）；
-        按钮横向铺满菜单内容宽度（与普通菜单项同宽）。"""
-        palette = _EXPAND if expandable else _COLLAPSE
-        bg, hover = palette["bg"], palette["hover"]
+    def _pill(self, label, key):
+        """生成一枚 success 绿实底胶囊按钮 action：整条铺满菜单宽、可点击触发 _request_toggle(key)。
+        既做「默认展开」按钮（弹层尾部），也做展开态的分组标题栏（标题即收起开关）——同款同宽。"""
+        bg, hover, fg = _PILL["bg"], _PILL["hover"], _PILL["fg"]
         btn = QPushButton(label)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setMinimumHeight(26)
-        # Expanding：随行铺满，使按钮宽度与普通 item 同宽（不再只占文字宽）
+        # Expanding：随行铺满，与分组子项 / 二级菜单同宽
         btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         btn.setStyleSheet(
-            f"QPushButton {{ background:{bg}; color:#FFFFFF; border:none;"
+            f"QPushButton {{ background:{bg}; color:{fg}; border:none;"
             f" border-radius:{TOK_RADIUS['md']}px; padding:5px 14px; font-weight:600; }}"
             f" QPushButton:hover {{ background:{hover}; }}"
             f" QPushButton:pressed {{ background:{hover}; }}")
         btn.clicked.connect(lambda: self._request_toggle(key))
         wa = QWidgetAction(self._top)
-        # 左右 0 内距：与分组标题同缘、铺满整个菜单宽（不留缝）
+        # 左右 0 内距：铺满整个菜单宽（不留缝）
         wa.setDefaultWidget(_row(btn, margins=(0, 4, 0, 4), fill=True))
         wa.setData("default_expand")   # 标记：单测据此识别展开/收起开关
         return wa
@@ -216,8 +213,8 @@ class MenuCascade:
 
 def _row(inner, margins=(14, 3, 14, 3), fill=False):
     """把控件包进一行，作为 QWidgetAction 的默认控件；菜单行高与左右内距跟普通 item 对齐。
-    fill=False：左对齐 + 右弹性（标题 / 内容宽控件）；fill=True：不给弹性，交由 inner 自身
-    Expanding 策略铺满行宽（按钮需与菜单同宽时用）。"""
+    fill=False：左对齐 + 右弹性（内容宽控件）；fill=True：不给弹性，交由 inner 自身
+    Expanding 策略铺满行宽（胶囊按钮需与菜单同宽时用）。"""
     w = QWidget()
     lay = QHBoxLayout(w)
     lay.setContentsMargins(*margins)
@@ -226,17 +223,3 @@ def _row(inner, margins=(14, 3, 14, 3), fill=False):
     if not fill:
         lay.addStretch(1)
     return w
-
-
-def _group_header(menu, title):
-    """就地展开时的分组标题：与展开钮完全同款——success 实底 + 白字圆角胶囊，整条横铺（与按钮同缘同宽、不留缝），
-    不可点。经 QWidgetAction 挂进菜单。"""
-    lbl = QLabel(title)
-    lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    lbl.setStyleSheet(
-        f"color:{_HEADER_COLOR}; background:{_HEADER_BG}; font-weight:600; font-size:13px;"
-        f" border:none; border-radius:{TOK_RADIUS['md']}px; padding:5px 14px;")
-    wa = QWidgetAction(menu)
-    # 左右 0 内距：与按钮同宽同缘线、铺满整个菜单（不留缝）
-    wa.setDefaultWidget(_row(lbl, margins=(0, 4, 0, 4), fill=True))
-    return wa
