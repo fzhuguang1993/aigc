@@ -160,7 +160,7 @@ def test_field_manager_insert_index_at_empty(qapp):
     assert fm._bar.insert_index_at(QPoint(10, 10)) == 0
 
 
-# ------------------------------------------------ 表头右键：三个二级菜单 + 默认展开
+# ------------------------------------------------ 表头右键：MenuCascade 多级菜单 + 就地展开
 def _kit_table(qapp):
     from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
     t = QTableWidget(3, 2)
@@ -171,86 +171,109 @@ def _kit_table(qapp):
     return t
 
 
+def _leaf_texts(menu):
+    """普通叶子菜单项文字（排除分隔符 / 子菜单入口 / QWidgetAction 里的钮与标题）。"""
+    from PySide6.QtWidgets import QWidgetAction
+    return [a.text() for a in menu.actions()
+            if not a.isSeparator() and a.menu() is None
+            and not isinstance(a, QWidgetAction) and a.text()]
+
+
+def _button_texts(menu):
+    """menu 各 QWidgetAction 里的 QPushButton 文字（展开/收起彩色钮）。"""
+    from PySide6.QtWidgets import QWidgetAction, QPushButton
+    out = []
+    for a in menu.actions():
+        if isinstance(a, QWidgetAction):
+            w = a.defaultWidget()
+            b = w.findChild(QPushButton) if w is not None else None
+            if b is not None:
+                out.append(b.text())
+    return out
+
+
+def _header_texts(menu):
+    """menu 里做分组标题的 QLabel 文字（不含按钮行）。"""
+    from PySide6.QtWidgets import QWidgetAction, QPushButton, QLabel
+    out = []
+    for a in menu.actions():
+        if isinstance(a, QWidgetAction):
+            w = a.defaultWidget()
+            if w is not None and w.findChild(QPushButton) is None:
+                lbl = w.findChild(QLabel)
+                if lbl is not None:
+                    out.append(lbl.text())
+    return out
+
+
 def test_header_menu_three_submenus_with_default_expand(qapp):
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    menu, handlers = kit._build_header_menu(0)
+    menu, handlers = kit._menu.build(0)
     subs = [a.menu() for a in menu.actions() if a.menu()]
     assert [m.title() for m in subs] == ["居中调整", "顺序调整", "字段格式"]
-    texts = {m.title(): [a.text() for a in m.actions() if not a.isSeparator()]
-             for m in subs}
-    assert texts["居中调整"] == ["本列靠左", "本列居中", "本列靠右",
-                          "本列垂直居中", "取消自动换行", "默认展开"]
-    assert texts["顺序调整"] == ["升序排列", "降序排列", "默认展开"]
-    assert texts["字段格式"] == ["文本", "数字", "日期", "默认展开"]
-    # 不带任何对钩/勾选态（含「默认展开」与各选项），展开态只靠文字表达
+    assert {m.title(): _leaf_texts(m) for m in subs}["居中调整"] == [
+        "本列靠左", "本列居中", "本列靠右", "本列垂直居中", "取消自动换行"]
+    assert _leaf_texts(next(m for m in subs if m.title() == "顺序调整")) == ["升序排列", "降序排列"]
+    assert _leaf_texts(next(m for m in subs if m.title() == "字段格式")) == ["文本", "数字", "日期"]
+    # 每个弹层尾部一个绿钮「默认展开」；全菜单无任何对钩/勾选态
     for m in subs:
-        assert [a.text() for a in m.actions() if a.isCheckable()] == []
+        assert _button_texts(m) == ["默认展开"]
+        assert not any(a.isCheckable() for a in m.actions())
     assert all(callable(fn) for fn in handlers.values())
 
 
 def test_default_expand_group_renders_inline(qapp):
-    """展开的组：内容就地平铺进一级菜单（右键即见全部子项），其余组仍是二级弹层；
-    开关是普通菜单项、文字随状态变（无对钩）。"""
+    """展开的组：强调色分组标题(QLabel) + 子项就地平铺进一级菜单 + 尾部红钮「取消展开」；
+    其余组仍是二级弹层。"""
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    kit._expand = {"align"}
-    menu, handlers = kit._build_header_menu(0)
-    texts = [a.text() for a in menu.actions() if not a.isSeparator()]
-    # 一级菜单里直接出现「居中调整」标题 + 它的子项 + 一个「取消展开」开关（已展开态）
-    assert "本列靠左" in texts and "本列居中" in texts and "取消展开" in texts
-    # 任何菜单项都不带对钩/勾选态
-    assert not any(a.isCheckable() for a in menu.actions())
-    # 「居中调整」作为分组头：不可点（仅标识，不触发任何动作）
-    head = next(a for a in menu.actions() if a.text() == "居中调整")
-    assert not head.isEnabled()
-    # 顺序调整 / 字段格式 仍折成二级弹层，尾部是「默认展开」
+    kit._menu.set_expanded(["align"])
+    menu, handlers = kit._menu.build(0)
+    assert "居中调整" in _header_texts(menu)          # 强调色分组标题
+    assert "本列靠左" in _leaf_texts(menu)             # 子项就地平铺进一级菜单
+    assert _button_texts(menu) == ["取消展开"]         # 展开组尾部红钮
+    assert not any(a.isCheckable() for a in menu.actions())   # 无对钩
+    # 顺序调整 / 字段格式 仍折成二级弹层
     assert [a.menu().title() for a in menu.actions() if a.menu()] == ["顺序调整", "字段格式"]
-    # 就地平铺的子项都挂上了可调用 handler
-    assert all(callable(handlers[a]) for a in menu.actions()
-               if a.text() in ("本列靠左", "升序排列") and a in handlers)
 
 
 def test_multiple_expand_groups_inline(qapp):
     """多组同时展开：align + order 都就地平铺，format 仍是弹层；各自独立、互不顶掉。"""
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    kit._expand = {"align", "order"}
-    menu, _handlers = kit._build_header_menu(0)
-    texts = [a.text() for a in menu.actions() if not a.isSeparator()]
-    assert "本列靠左" in texts and "升序排列" in texts        # 两组都平铺
+    kit._menu.set_expanded(["align", "order"])
+    menu, _ = kit._menu.build(0)
+    assert set(_header_texts(menu)) >= {"居中调整", "顺序调整"}
+    assert "本列靠左" in _leaf_texts(menu) and "升序排列" in _leaf_texts(menu)
+    assert _button_texts(menu) == ["取消展开", "取消展开"]      # 两个展开组各一个红钮
     assert [a.menu().title() for a in menu.actions() if a.menu()] == ["字段格式"]
-    # 两个展开组各自带一个「取消展开」
-    assert texts.count("取消展开") == 2
 
 
 def test_header_menu_registration_and_flat_group(qapp):
-    """注册机制：新组可多级；只挂一个平铺项的组直接成一级菜单项（没有多级不绕一层）；
-    同 key 覆盖。"""
+    """注册机制：新组可多级；只挂一个平铺项的组直接成一级菜单项（没有多级不绕一层）；同 key 覆盖。"""
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
     hits = []
     kit.add_header_menu("业务操作", [("刷新本列", lambda col: hits.append(col))])
-    menu, handlers = kit._build_header_menu(2)
-    flat = [a for a in menu.actions()
-            if not a.menu() and not a.isSeparator() and a.isEnabled()]
-    assert [a.text() for a in flat] == ["刷新本列"]     # 直接挂一级，不建子菜单
-    handlers[flat[0]](2)
+    menu, handlers = kit._menu.build(2)
+    assert _leaf_texts(menu) == ["刷新本列"]     # 直接挂一级，不建子菜单
+    act = next(a for a in menu.actions() if a.text() == "刷新本列")
+    handlers[act](2)
     assert hits == [2]
     # 同 key 覆盖
     kit.add_header_menu("业务操作改名", [("只读", lambda col: None)], key="业务操作")
-    menu2, _h2 = kit._build_header_menu(0)
-    flat2 = [a.text() for a in menu2.actions()
-             if not a.menu() and not a.isSeparator() and a.isEnabled()]
-    assert flat2 == ["只读"]
+    menu2, _h2 = kit._menu.build(0)
+    assert _leaf_texts(menu2) == ["只读"]
     # 可嵌三级：带嵌套列表的组仍走子菜单，子项里再开一层
     kit.add_header_menu("导出", [("按行", [("CSV", lambda c: None),
                                     ("Excel", lambda c: None)]),
                           ("按列", lambda c: None)])
-    menu3, _h3 = kit._build_header_menu(0)
+    menu3, _h3 = kit._menu.build(0)
     sub = next(a.menu() for a in menu3.actions()
                if a.menu() and a.menu().title() == "导出")
-    assert [a.text() for a in sub.actions() if not a.isSeparator()][:2] == ["按行", "按列"]
+    # 按行是二级弹层（带 .menu()），按列是叶子；[a.text()] 保留全部入口
+    assert [a.text() for a in sub.actions()][:2] == ["按行", "按列"]
     assert sub.actions()[0].menu() is not None          # 按行 又下钻一层
 
 
@@ -263,46 +286,35 @@ def test_header_menu_default_expand_toggle(qapp, monkeypatch):
     monkeypatch.setattr(app_state, "get", lambda k, d=None: {})
     monkeypatch.setattr(app_state, "set_value", lambda k, v: saved.__setitem__(k, v))
     kit = TableColumnKit(t)
-    kit._toggle_default_expand("align")
-    assert kit._expand == {"align"}
+    kit._menu.toggle("align")
+    assert kit._menu.expanded() == {"align"}
     assert saved["colkit::UTMenuTable"]["expand"] == ["align"]
     # 再点同一个：收起该组
-    kit._toggle_default_expand("align")
-    assert kit._expand == set()
+    kit._menu.toggle("align")
+    assert kit._menu.expanded() == set()
     # 多组同时展开：互不顶掉
-    kit._toggle_default_expand("order")
-    kit._toggle_default_expand("format")
-    assert kit._expand == {"order", "format"}
+    kit._menu.toggle("order")
+    kit._menu.toggle("format")
+    assert kit._menu.expanded() == {"order", "format"}
     assert saved["colkit::UTMenuTable"]["expand"] == ["format", "order"]
 
 
-def test_default_expand_reopens_in_place(qapp, monkeypatch):
-    """点「默认展开」不是等下次：应当场在同一位置重开菜单，重开后该组内容已就地平铺。
-    驱 exec 返回序列模拟：第一次弹→用户点 align 组的「默认展开」；第二次弹（重开）→Esc 关。"""
-    from PySide6.QtCore import QPoint
+def test_expand_button_click_toggles_and_reopens(qapp):
+    """绿钮 clicked → 该组进展开集合 + 置重开标记（show 循环据此同地重开）；非等下次。"""
+    from PySide6.QtWidgets import QWidgetAction, QPushButton
     from gui.kit import TableColumnKit
     kit = TableColumnKit(_kit_table(qapp))
-    assert kit._expand == set()
-    calls = {"n": 0, "inline_after": False}
-    orig_build = kit._build_header_menu
-
-    def fake_build(col):
-        menu, handlers = orig_build(col)
-        calls["n"] += 1
-        if calls["n"] == 1:
-            ea = next(a for a in handlers if a.data() == "default_expand")
-            monkeypatch.setattr(menu, "exec", lambda pos: ea)   # 用户点了 align 组的默认展开
-        else:
-            texts = [a.text() for a in menu.actions() if not a.isSeparator()]
-            calls["inline_after"] = "本列靠左" in texts          # 重开后 align 已就地平铺
-            monkeypatch.setattr(menu, "exec", lambda pos: None)  # 用户 Esc
-        return menu, handlers
-
-    monkeypatch.setattr(kit, "_build_header_menu", fake_build)
-    kit._show_header_menu(0, QPoint(10, 10))
-    assert calls["n"] == 2            # 菜单被当场重开了一次
-    assert kit._expand == {"align"}   # 设置已生效
-    assert calls["inline_after"] is True   # 重开后默认组内容已就地平铺可见
+    cascade = kit._menu
+    menu, _handlers = cascade.build(0)
+    sub = next(a.menu() for a in menu.actions()
+               if a.menu() and a.menu().title() == "顺序调整")
+    btn = next(a.defaultWidget().findChild(QPushButton) for a in sub.actions()
+               if isinstance(a, QWidgetAction)
+               and a.defaultWidget().findChild(QPushButton) is not None)
+    assert btn.text() == "默认展开"
+    btn.click()                                   # 触发 clicked → _request_toggle("order")
+    assert cascade.expanded() == {"order"}
+    assert cascade._reopen is True                # 待 show 循环在同一位置重开
 
 
 def test_apply_sort_number_moves_whole_rows(qapp):
