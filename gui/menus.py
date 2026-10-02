@@ -185,7 +185,8 @@ class MenuCascade:
             f" QPushButton:pressed {{ background:{hover}; }}")
         btn.clicked.connect(lambda: self._request_toggle(key))
         wa = QWidgetAction(self._top)
-        wa.setDefaultWidget(_row(btn, fill=True))
+        # 左右 0 内距：色块顶到卡片内缘（整个菜单同宽），圆角由按钮自身 border-radius 处理
+        wa.setDefaultWidget(_row(btn, margins=(0, 4, 0, 4), fill=True))
         wa.setData("default_expand")   # 标记：单测据此识别展开/收起开关
         return wa
 
@@ -228,12 +229,14 @@ def _row(inner, margins=(14, 3, 14, 3), fill=False):
 
 
 def _group_header(menu, title):
-    """就地展开时的分组标题：主蓝加粗文字 + 淡蓝底色带（整条横铺），不可点。经 QWidgetAction 挂进菜单。"""
+    """就地展开时的分组标题：与展开/收起钮同款——固定底色主蓝文字整条横铺（顶到卡片内缘、与整个菜单同宽），
+    不可点。经 QWidgetAction 挂进菜单。"""
     lbl = QLabel(title)
     lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     lbl.setStyleSheet(
         f"color:{_HEADER_COLOR}; background:{_HEADER_BG}; font-weight:700; font-size:12px;"
-        f" border-radius:{TOK_RADIUS['sm']}px; padding:5px 10px;")
+        f" border-radius:{TOK_RADIUS['md']}px; padding:5px 14px;")
     wa = QWidgetAction(menu)
-    wa.setDefaultWidget(_row(lbl, margins=(10, 5, 10, 3), fill=True))
+    # 左右 0 内距：标题底色带与菜单同宽（与按钮对齐同一缘线）
+    wa.setDefaultWidget(_row(lbl, margins=(0, 4, 0, 4), fill=True))
     return wa
