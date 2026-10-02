@@ -16,7 +16,7 @@ gui/menus.py —— 全站统一的右键 / 下拉菜单模板（StyledMenu）
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QMenu, QWidget, QHBoxLayout, QLabel,
-                              QPushButton, QWidgetAction)
+                              QPushButton, QWidgetAction, QSizePolicy)
 
 from gui.ui_kit import COLORS
 from gui.ui_kit import RADIUS as TOK_RADIUS   # ui_kit 圆角令牌（本模块顶部 RADIUS=10 是菜单圆角，两者不同名）
@@ -25,10 +25,11 @@ RADIUS = 10                     # 卡片圆角半径（与 ui_kit.RADIUS["lg"] �
 MARGIN = 12                     # 四周留白：既是 items 的 padding，也是自绘软阴影的活动带
 _SHADOW_STEPS = 6               # 阴影分层数（越多越细腻）
 
-# MenuCascade 用色：展开钮绿、收起钮红、分组标题主蓝强调（都取 ui_kit 令牌）
+# MenuCascade 用色：展开钮绿、收起钮红、分组标题主蓝文字 + 淡蓝底色带（都取 ui_kit 令牌）
 _EXPAND = {"bg": COLORS["success"], "hover": COLORS["line_ok"]}
 _COLLAPSE = {"bg": COLORS["danger"], "hover": COLORS["danger_text"]}
 _HEADER_COLOR = COLORS["primary"]
+_HEADER_BG = COLORS["primary_soft"]   # 二级菜单分组标题的淡蓝底色带
 
 
 class StyledMenu(QMenu):
@@ -168,12 +169,15 @@ class MenuCascade:
                 menu.addMenu(sub)
 
     def _expand_btn(self, label, expandable, key):
-        """生成一个带背景色的文字按钮 action：expandable=True 绿（可展开），False 红（可收起）。"""
+        """生成一个带背景色的文字按钮 action：expandable=True 绿（可展开），False 红（可收起）；
+        按钮横向铺满菜单内容宽度（与普通菜单项同宽）。"""
         palette = _EXPAND if expandable else _COLLAPSE
         bg, hover = palette["bg"], palette["hover"]
         btn = QPushButton(label)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setMinimumHeight(26)
+        # Expanding：随行铺满，使按钮宽度与普通 item 同宽（不再只占文字宽）
+        btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         btn.setStyleSheet(
             f"QPushButton {{ background:{bg}; color:#FFFFFF; border:none;"
             f" border-radius:{TOK_RADIUS['md']}px; padding:5px 14px; font-weight:600; }}"
@@ -181,7 +185,7 @@ class MenuCascade:
             f" QPushButton:pressed {{ background:{hover}; }}")
         btn.clicked.connect(lambda: self._request_toggle(key))
         wa = QWidgetAction(self._top)
-        wa.setDefaultWidget(_row(btn))
+        wa.setDefaultWidget(_row(btn, fill=True))
         wa.setData("default_expand")   # 标记：单测据此识别展开/收起开关
         return wa
 
@@ -209,22 +213,27 @@ class MenuCascade:
             fn(context)
 
 
-def _row(inner, margins=(14, 3, 14, 3)):
-    """把控件包进一行（左对齐 + 右弹性），作为 QWidgetAction 的默认控件；
-    菜单行高与左右内距跟普通 item 对齐，按钮/标题不会顶到圆角边。"""
+def _row(inner, margins=(14, 3, 14, 3), fill=False):
+    """把控件包进一行，作为 QWidgetAction 的默认控件；菜单行高与左右内距跟普通 item 对齐。
+    fill=False：左对齐 + 右弹性（标题 / 内容宽控件）；fill=True：不给弹性，交由 inner 自身
+    Expanding 策略铺满行宽（按钮需与菜单同宽时用）。"""
     w = QWidget()
     lay = QHBoxLayout(w)
     lay.setContentsMargins(*margins)
     lay.setSpacing(0)
     lay.addWidget(inner)
-    lay.addStretch(1)
+    if not fill:
+        lay.addStretch(1)
     return w
 
 
 def _group_header(menu, title):
-    """就地展开时的分组标题：强调色（主蓝）加粗、不可点。经 QWidgetAction 挂进菜单。"""
+    """就地展开时的分组标题：主蓝加粗文字 + 淡蓝底色带（整条横铺），不可点。经 QWidgetAction 挂进菜单。"""
     lbl = QLabel(title)
-    lbl.setStyleSheet(f"color:{_HEADER_COLOR}; font-weight:700; font-size:12px; background:transparent;")
+    lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    lbl.setStyleSheet(
+        f"color:{_HEADER_COLOR}; background:{_HEADER_BG}; font-weight:700; font-size:12px;"
+        f" border-radius:{TOK_RADIUS['sm']}px; padding:5px 10px;")
     wa = QWidgetAction(menu)
-    wa.setDefaultWidget(_row(lbl, margins=(14, 5, 14, 2)))
+    wa.setDefaultWidget(_row(lbl, margins=(10, 5, 10, 3), fill=True))
     return wa
