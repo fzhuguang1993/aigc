@@ -22,6 +22,7 @@ from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, ToolWorker
 from store import app_state
 from utils.desktop_utils import open_path, reveal_in_folder
 from gui.theme import tokenize
+from gui.menus import StyledMenu
 from gui.ui_kit import COLORS, RADIUS as TOK_RADIUS, draw_rounded_card
 
 
@@ -210,8 +211,9 @@ class VideoPlayerDialog(QDialog):
     """无边框播放器：播放/暂停、进度（可拖可点）、步长快进退、倍速、全屏、
     横竖屏自适应、审片标记
 
-    无边框就得自己把窗口的事管完：顶部一条可拖动的标题栏（定位/全屏/最小化/关闭），
-    右下角 QSizeGrip 拉大，Esc 关、双击画面全屏、单击画面播放/暂停。
+    无边框就得自己把窗口的事管完：顶部一条可拖动的标题栏（全屏/最小化/关闭），
+    右下角 QSizeGrip 拉大，Esc 关、双击画面全屏、单击画面播放/暂停；
+    识别字幕 / 定位源文件收到画面右键菜单里（不占顶栏）。
 
     allow_mark：只有【成品视频】才给标记按钮。素材库里预览的是同事传上来的
     原材，误点一下就把素材改名了，所以默认不给。
@@ -266,16 +268,10 @@ class VideoPlayerDialog(QDialog):
         self.lbl_name.setSizePolicy(QSizePolicy.Policy.Ignored,
                                     QSizePolicy.Policy.Preferred)
         bar.addWidget(self.lbl_name, 1)
-        self.btn_reveal = QPushButton("📂 定位")
-        self.btn_reveal.setToolTip("打开成品所在文件夹并选中这个文件（G）")
-        self.btn_reveal.clicked.connect(self._reveal)
         self.btn_full = QPushButton("⛶ 全屏")
         self.btn_full.setCheckable(True)
         self.btn_full.setToolTip("全屏 / 退出全屏（F 或双击画面）")
         self.btn_full.toggled.connect(self._set_fullscreen)
-        self.btn_asr = QPushButton("🎤 识别字幕")
-        self.btn_asr.setToolTip("边播边识别口播：弹一个浮窗，识别一句就往下追加一句（看识别效果用）")
-        self.btn_asr.clicked.connect(self._do_asr)
         b_min = QPushButton("―")
         b_min.setToolTip("最小化")
         b_min.clicked.connect(self.showMinimized)
@@ -283,7 +279,9 @@ class VideoPlayerDialog(QDialog):
         b_close.setObjectName("CloseBtn")
         b_close.setToolTip("关闭（Esc）")
         b_close.clicked.connect(self.close)
-        for b in (self.btn_asr, self.btn_reveal, self.btn_full, b_min, b_close):
+        # 识别字幕 / 定位源文件不再占顶栏一颗按钮（显得拥挤），改收进画面右键菜单（见
+        # contextMenuEvent）：需要时右键画面即取，标题栏只留全屏/最小化/关闭。
+        for b in (self.btn_full, b_min, b_close):
             bar.addWidget(b)
         lay.addLayout(bar)
 
@@ -694,11 +692,22 @@ class VideoPlayerDialog(QDialog):
         self.resize(new_w, self.height())
 
     def _video_clicked(self, e):
-        """单击画面＝播放/暂停，双击＝全屏（双击时两下点击会把播放状态又拨回来）"""
+        """左键单击画面＝播放/暂停，双击＝全屏（右键不在这管，交给 contextMenuEvent）"""
+        if e.button() != Qt.MouseButton.LeftButton:
+            e.ignore()                      # 右键不拨播放态，否则弹菜单会顺带把暂停/播放切一下
+            return
         if e.detail() == 2:
             self._toggle_fullscreen()
         else:
             self._toggle_play()
+        e.accept()
+
+    def contextMenuEvent(self, e):
+        """播放界面右键菜单：把从标题栏收起的「识别字幕 / 定位源文件」收在这里。"""
+        m = StyledMenu(self)
+        m.addAction("🎤 识别字幕", self._do_asr)
+        m.addAction("📂 定位源文件", self._reveal)
+        m.exec(e.globalPos())
         e.accept()
 
     def mousePressEvent(self, e):

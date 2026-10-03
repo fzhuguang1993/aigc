@@ -1,15 +1,17 @@
 """
 tests/test_table_kit_ui.py —— 本轮「字段管理组件 + 表格交互升级」的回归用例
 
-固化五块已在离屏冒烟验证过的行为（计划 G 节）：
+固化几块已在离屏冒烟验证过的行为（计划 G 节）：
 - FieldManager：勾选 ↔ 顺序双向同步、set_all / reset、hidden 计算、拖拽落点插入；
 - FieldManagerDialog 薄封装：(logical,标题)+[(分类,[标题])] → FieldManager 契约映射，
   accept() 仍产出 .order / .hidden；
 - TableColumnKit 复制：选中区拼制表符文本写剪贴板 + 叠层行走虚线启停，Ctrl+C 命中 / Esc 停 /
   其它键放行（不破坏各表原键盘行为）；
-- SortableTableHeader：首点新列＝降序、再点同列翻转、no_arrow 列不强制、绘制不崩；
-- enable_sort_arrows：换表头后列宽 / resize 模式迁移（Stretch 列不硬设宽）；
-- mount_header_checkbox：以表头为父的三态全选框、程序设态不回环、点框回调全选/清空。
+- KitTable 标准勾选列（checkbox 默认开）：首列勾选格 + 表头三态全选框，make_check_item /
+  checked_rows / set_all_checked / is_row_checked、点表头框发 check_all_toggled(bool)、
+  三态随各行勾选态自动刷新；checkbox=False 时不建勾选列；
+- mount_header_checkbox（已迁入 gui/kit，gui/tablekit 再导出）：以表头为父的三态全选框、
+  程序设态不回环、点框回调全选/清空。
 
 全部离屏（QT_QPA_PLATFORM=offscreen）跑，clipboard 用桩避免平台差异。
 """
@@ -428,96 +430,58 @@ def test_colkit_copy_no_selection_falls_back_current_item(qapp, fake_clip):
     assert fake_clip.text == "d"
 
 
-# --------------------------------------------------------- SortableTableHeader
-def test_sortable_header_first_click_descending_then_toggle(qapp):
-    """首点新列＝降序，再点同列翻转升/升；换到另一列又回到降序。直接调
-    handle_section_click（不依赖基类在点击时自动拨指示列——那张表头把
-    setSortIndicatorShown 关了，靠的就是这份自持逻辑）。"""
+# ------------------------------------------------------------ KitTable 勾选列
+def test_kit_table_checkbox_column_basic(qapp):
+    """默认 checkbox=True：首列标准勾选格 + 表头三态全选框，基础 API 均成立。"""
     from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QTableWidget
-    from gui.kit import SortableTableHeader
-    t = QTableWidget(3, 3)
-    t.setHorizontalHeaderLabels(["甲", "乙", "丙"])
-    hdr = SortableTableHeader()
-    hdr.set_no_arrow_cols([0])
-    t.setHorizontalHeader(hdr)
-    qapp.processEvents()
-    assert hdr.handle_section_click(1) == Qt.SortOrder.DescendingOrder   # 首点降序
-    assert hdr.sortIndicatorSection() == 1
-    assert hdr.handle_section_click(1) == Qt.SortOrder.AscendingOrder    # 同列再点→升
-    assert hdr.handle_section_click(1) == Qt.SortOrder.DescendingOrder   # 再点→降
-    assert hdr.handle_section_click(2) == Qt.SortOrder.DescendingOrder   # 换新列又降
-    assert hdr.sortIndicatorSection() == 2
+    from gui.kit import KitTable
+    tb = KitTable(2, 3, ["", "品名", "状态"])
+    assert tb.check_col == 0
+    assert tb._hdr_check is not None                 # 表头挂了全选框
+    tb.setItem(0, 0, tb.make_check_item(True))
+    tb.setItem(1, 0, tb.make_check_item(False))
+    assert tb.is_row_checked(0) and not tb.is_row_checked(1)
+    assert tb.checked_rows() == [0]
+    tb.set_all_checked(True)
+    assert tb.checked_rows() == [0, 1]
+    assert tb._check_all_state() == Qt.CheckState.Checked
+    tb.set_row_checked(1, False)
+    assert tb._check_all_state() == Qt.CheckState.PartiallyChecked
+    tb.set_all_checked(False)
+    assert tb._check_all_state() == Qt.CheckState.Unchecked
 
 
-def test_sortable_header_no_arrow_col_is_skipped(qapp):
+def test_kit_table_check_all_toggled_signal(qapp):
+    """点表头全选框：点成 Checked → 发 check_all_toggled(True)，其余 → False。"""
     from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QTableWidget
-    from gui.kit import SortableTableHeader
-    t = QTableWidget(3, 3)
-    t.setHorizontalHeaderLabels(["选", "乙", "丙"])
-    hdr = SortableTableHeader()
-    hdr.set_no_arrow_cols([0])
-    t.setHorizontalHeader(hdr)
-    qapp.processEvents()
-    # 勾选列：handle_section_click 直接返回 None，不记录为上次点过的排序列
-    assert hdr.handle_section_click(0) is None
-    assert hdr._last_col is None
-    # 越界 / 负数同样安全
-    assert hdr.handle_section_click(99) is None
-    assert hdr.handle_section_click(-1) is None
+    from gui.kit import KitTable
+    tb = KitTable(1, 2, ["", "品名"])
+    tb.setItem(0, 0, tb.make_check_item())
+    got = []
+    tb.check_all_toggled.connect(lambda b: got.append(b))
+    tb._on_hdr_check_toggle(Qt.CheckState.Checked)
+    tb._on_hdr_check_toggle(Qt.CheckState.PartiallyChecked)
+    tb._on_hdr_check_toggle(Qt.CheckState.Unchecked)
+    assert got == [True, False, False]
 
 
-def test_sortable_header_grab_paints_without_crash(qapp):
-    from PySide6.QtWidgets import QTableWidget
-    from gui.kit import SortableTableHeader
-    t = QTableWidget(2, 3)
-    t.setHorizontalHeaderLabels(["很宽的标题列内容", "乙", "丙"])
-    hdr = SortableTableHeader()
-    hdr.set_no_arrow_cols([0])
-    t.setHorizontalHeader(hdr)
-    t.resize(300, 140)
-    t.show()
-    qapp.processEvents()
-    pm = hdr.grab()                # 触发 paintSection（含窄列预留 ARROW_W 计算）
-    assert not pm.isNull()
+def test_kit_table_checkbox_disabled(qapp):
+    """checkbox=False：不建勾选列、不挂表头全选框（供无需批量勾选的表）。"""
+    from gui.kit import KitTable
+    tb = KitTable(1, 2, ["a", "b"], checkbox=False)
+    assert tb.check_col is None
+    assert tb._hdr_check is None
 
 
-def test_sortable_header_text_handles_str_headerdata(qapp):
-    # PySide6 headerData 直接返回 str，_text 须能取到（曾经的 isValid() 崩点）
-    from PySide6.QtWidgets import QTableWidget
-    from gui.kit import SortableTableHeader
-    t = QTableWidget(1, 2)
-    t.setHorizontalHeaderLabels(["名称", "值"])
-    hdr = SortableTableHeader()
-    t.setHorizontalHeader(hdr)
-    qapp.processEvents()
-    assert hdr._text(0) == "名称"
-    assert hdr._text(5) in ("", "5")   # 越界不崩
-
-
-# ------------------------------------------------------------ enable_sort_arrows
-def test_enable_sort_arrows_swaps_header_and_migrates(qapp):
-    from PySide6.QtWidgets import QTableWidget
-    from PySide6.QtWidgets import QHeaderView
-    from gui.kit import SortableTableHeader, TableColumnKit
-    t = QTableWidget(2, 3)
-    t.setHorizontalHeaderLabels(["甲", "乙", "丙"])
-    hh = t.horizontalHeader()
-    hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-    hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-    t.setColumnWidth(0, 120)
-    t.setColumnWidth(1, 80)
-    kit = TableColumnKit(t)
-    new = kit.enable_sort_arrows(no_arrow_cols=(0,))
-    assert isinstance(new, SortableTableHeader)
-    assert t.horizontalHeader() is new
-    assert 0 in new._no_arrow
-    # 非 Stretch 列宽迁移
-    assert t.columnWidth(0) == 120
-    assert t.columnWidth(1) == 80
-    # Stretch 列保持 Stretch 模式（未被硬设宽）
-    assert new.sectionResizeMode(2) == QHeaderView.ResizeMode.Stretch
+def test_kit_table_check_item_is_checkable_centered(qapp):
+    """make_check_item：可勾选 + 居中；checked 参数决定初始态。"""
+    from PySide6.QtCore import Qt
+    from gui.kit import KitTable
+    tb = KitTable(1, 2, ["", "品名"], checkbox=False)
+    it = tb.make_check_item(True)
+    assert it.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert it.checkState() == Qt.CheckState.Checked
+    assert it.textAlignment() & int(Qt.AlignmentFlag.AlignHCenter)
 
 
 # ---------------------------------------------------------- mount_header_checkbox

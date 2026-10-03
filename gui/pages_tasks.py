@@ -30,11 +30,11 @@ from gui.dialogs import (TaskDialog, FindReplaceDialog, ForceRerunDialog,
 from gui.delegates import ProgressDelegate, ProgressRole
 from gui.formatting import secs
 from gui.widgets import VideoPlayerDialog, HoverPreview, Toast, FlowLayout
-from gui.header import page_header, Card, kpi_row
+from gui.header import page_header, Card
 from gui.menus import StyledMenu
 from gui.tablekit import (FieldManagerDialog, apply_field_layout,
-                          enable_drag_with_lock, SecsItem, mount_header_checkbox)
-from gui.kit import KitTable, DateRangePicker
+                          enable_drag_with_lock, SecsItem)
+from gui.kit import KitTable, DateRangePicker, KpiBand
 from gui.theme import tokenize
 
 STATUS_COLORS = {"completed": "#00A870", "failed": "#F54A45", "error": "#F54A45",
@@ -76,6 +76,25 @@ STATUS_FILTERS = [("全部", None),
 NO_TAG = "（无备注）"        # 备注下拉的虚拟选项：一筛就只看没标的
 NO_TAGGED = "（未打标）"     # 标签下拉的虚拟选项：一筛就只看没打标签的
 BLANK = "（未填）"
+
+
+# ---------- 顶部 KPI 指标带：可选字段注册表（与数据中台同一 KpiBand 机制）----------
+# key 供 _update_kpis 按 key 取值；tooltip 写死该指标的计算口径（悬停即见）；
+# default 决定是否默认展示（“⚙ 指标”走「字段管理」同款弹窗可改）。
+_TASK_KPI_DEFS = [
+    {"key": "total", "name": "总任务", "icon": "📦", "color": "#3370FF", "default": True,
+     "tooltip": "列表里的全部任务条数（取全量、不受当前筛选影响：一筛就“只剩几条”会让人误以为任务变少）。"},
+    {"key": "pending", "name": "待执行", "icon": "🗒", "color": "#8F959E", "default": True,
+     "tooltip": "状态为空、还没提交执行过的任务数。"},
+    {"key": "run", "name": "进行中", "icon": "⏳", "color": "#FF8D19", "default": True,
+     "tooltip": "此刻已提交、仍在排队或云端生成的执行条数（实时在途，与状态列改写同口径）。"},
+    {"key": "ok", "name": "成功", "icon": "✓", "color": "#00B96B", "default": True,
+     "tooltip": "状态为 completed / succeeded（成功出片）的任务数。"},
+    {"key": "fail", "name": "失败", "icon": "✕", "color": "#F54A45", "default": True,
+     "tooltip": "状态为 failed / error / timeout 的任务数。"},
+    {"key": "rate", "name": "成功率", "icon": "％", "color": "#7F3FBF", "default": False,
+     "tooltip": "成功率 = 成功任务数 ÷ 总任务数 × 100%。"},
+]
 
 
 def _dur_tip(row, kind):
@@ -451,17 +470,24 @@ class TasksPage(QWidget):
 
         # 对标数据中台的视觉层次：页头 → 一排 KPI 概览 → 白卡分组的「控制区
         # + 表格内容区」，而不是把工具条/筛选/表格裸摆在灰底上。
-        hdr = page_header("任务中心", icon="📋")
+        hdr = page_header("任务中心", icon="🎯")
         lay.addWidget(hdr)
 
-        # ---------- 顶部 KPI 概览（总任务/待执行/进行中/成功/失败，随 refresh 更新）----------
-        self._kpi_lay, self._kpi_cards = kpi_row([
-            ("总任务", "📦", "#3370FF"), ("待执行", "🗒", "#8F959E"),
-            ("进行中", "⏳", "#FF8D19"), ("成功", "✓", "#00B96B"),
-            ("失败", "✕", "#F54A45"),
-        ], spacing=12, min_width=118)
-        self.k_total, self.k_pending, self.k_run, self.k_ok, self.k_fail = self._kpi_cards
-        lay.addLayout(self._kpi_lay)
+        # ---------- 顶部 KPI 指标带（宽度自适应 + 展开/收起 + 指标可选，复用 KpiBand/字段管理）----------
+        # 与数据中台同一套（标准件见 gui.kit.KpiBand）：窄窗口不硬挤、按可用宽度算“一行放几张”，多出来的收进“展开”；
+        # “⚙ 指标”复用「字段管理」弹窗选展示哪些指标；每张卡悬停即见自己的计算口径。
+        self.kpi = KpiBand()
+        self.kpi.set_defs(_TASK_KPI_DEFS)
+        self.kpi.picker = self._pick_kpi
+        saved_kpi = app_state.get("tasks_kpi_sel")
+        if isinstance(saved_kpi, list) and saved_kpi:
+            self.kpi.set_selected(saved_kpi, notify=False)
+        self.kpi.set_expanded(bool(app_state.get("tasks_kpi_exp")), notify=False)
+        self.kpi.selectionChanged.connect(
+            lambda keys: app_state.set_value("tasks_kpi_sel", keys))
+        self.kpi.expandedChanged.connect(
+            lambda on: app_state.set_value("tasks_kpi_exp", on))
+        lay.addWidget(self.kpi)
 
         # ---------- 控制区卡片：工具栏 / 搜索 / 快捷筛选 / 内嵌筛选面板收进一张白卡 ----------
         ctrl = Card(margins=(14, 12, 14, 12))
@@ -621,21 +647,19 @@ class TasksPage(QWidget):
         content.v.setSpacing(8)
 
         # ---------- 表格 ----------
-        # 标准表格地基 KitTable（UI 库基准）：整行选 + 可多选、只读、斑马纹、隐藏行号、
-        # 单行超出省略、表头排序箭头（勾选列不画）、列对齐/换行/Ctrl+C/表头右键多级菜单
-        # （内部 TableColumnKit）都由构造参数一次拉齐。本页专属：进度条委托、拖拽锁列、
-        # 表头全选框、单元格业务右键菜单、排序/框选连线，仍在下面按「单独微调」接线。
+        # 标准表格地基 KitTable（UI 库基准）：首列勾选框 + 表头三态全选框（内置 checkbox）、
+        # 单元格选（select="items"，与画廊标准件同口径：点一格选中/复制那一格）+ 可多选、
+        # 只读、斑马纹、隐藏行号、单行超出省略、列对齐/换行/Ctrl+C/表头右键
+        # 多级菜单（含「顺序调整」升降序，内部 TableColumnKit）都由构造一次拉齐。本页专属：
+        # 进度条委托、拖拽锁列、单元格业务右键菜单、框选连线，仍在下面按「单独微调」接线。
+        # 排序：表头升降序箭头与「点列头排序」已按「严格按 UI 库样式」移除，升降序统一走右键菜单。
         self.table = KitTable(
             0, len(HEADERS), HEADERS,
-            zebra=True, row_number=False, select="rows", multi=True,
-            edit=False, sort_arrows=True, no_arrow_cols=[CHECK_COL])
-        self.table.setSortingEnabled(True)
+            zebra=True, row_number=False, select="items", multi=True, edit=False)
         self.table.setMouseTracking(True)
         # 框选靠「按下→拖动→松开」自己识别（见 eventFilter）：不用
         # itemSelectionChanged，否则点一下勾选框取消时被连带选中的行会反手又勾上
         self.table.setItemDelegate(ProgressDelegate(self.table))
-        # 勾选列：固定宽度、不参与排序
-        self.table.setColumnWidth(CHECK_COL, 36)
         enable_drag_with_lock(self.table, lock_count=1)
         for c in STRETCH_COLS:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
@@ -653,16 +677,18 @@ class TasksPage(QWidget):
         self.table.cellDoubleClicked.connect(self._on_cell_double)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
-        self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
+        # 表头全选框（KitTable 内置）被点：True=全选本页 / False=清空 → 落到跨页选中集
+        self.table.check_all_toggled.connect(self._apply_all_page)
+        # 「顺序调整」菜单由页面接管：记下排序意图后刷新，让排序跨轮询重建仍保持
+        # （KitTable 默认菜单只排当前页行、重建即丢；这里改走页面自持的 _user_sort_col）
+        self.table.add_header_menu("顺序调整", [
+            ("升序排列", lambda col: self._manual_sort(col, Qt.SortOrder.AscendingOrder)),
+            ("降序排列", lambda col: self._manual_sort(col, Qt.SortOrder.DescendingOrder)),
+        ], key="order")
         self.table.viewport().installEventFilter(self)
         self.table.installEventFilter(self)      # 空格键弹全文预览用
         self._tag_editor = None                  # 当前内联标签下拉（非 None 时暂停重建表）
         content.v.addWidget(self.table, 1)
-        # （表头右键多级菜单 / 列对齐 / Ctrl+C 已由 KitTable 内部 TableColumnKit 承担）
-        # 勾选列表头挂一枚可见的全选框（三态：本页全选/部分/全不选）：
-        # 以前只能点那一格才全选、格子上没框，用户不知道能全选、也不知去哪勾。
-        self._hdr_check = mount_header_checkbox(
-            self.table, CHECK_COL, self._on_check_all_toggle, self._check_all_state)
         self._build_empty_state()        # 空表时盖在表格上的引导层（导入/新建 或 清除筛选）
 
         # ---------- 分页栏 ----------
@@ -708,7 +734,8 @@ class TasksPage(QWidget):
         self._selected_ids = set() # 跨页保留的选中集合
         self._drag_anchor = None   # 鼠标框选的按下起点（区分单击与拖选）
         self._gather_ids = set()   # 上一批需要置顶聚集的任务（替换命中/新导入）
-        self._user_sort_col = None # 用户点过的排序列；None=未排序，保留聚集顺序
+        self._user_sort_col = None # 用户经右键菜单「顺序调整」排过的列；None=未排序，保留聚集顺序
+        self._user_sort_order = None  # 对应升降序（Qt.SortOrder）；None 时 refresh 默认升序
         self._page = 1
         self._syncing = False      # 恢复选中时屏蔽 selectionChanged
         self._player = None        # 视频窗口引用，防 GC
@@ -1151,16 +1178,10 @@ class TasksPage(QWidget):
         active_map = {}
         for t in actives:                 # 同一任务可能并发多个 job（强制重跑/抽卡）
             active_map.setdefault(t["row_idx"], []).append(t)
-        header = self.table.horizontalHeader()
-        # 表头排序只在用户真点过列头时生效：否则 setSortingEnabled(True) 会按默认
-        # 指示列（任务ID升序）重排，刚置顶聚集的那批（ID最大）会被换回页底
+        # 排序：不再有表头箭头 / 点击排序；仅当用户在表头右键菜单点过「顺序调整」
+        # （_manual_sort 记下 _user_sort_col/_order）才在本页行内按该列重排。
         sort_col = self._user_sort_col
-        sort_order = header.sortIndicatorOrder()
-        if sort_col is None:
-            header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
-        elif sort_col == CHECK_COL:
-            sort_col = COL_PID
-        self.table.setSortingEnabled(False)
+        sort_order = self._user_sort_order or Qt.SortOrder.AscendingOrder
         self._syncing = True
         has_bar = False
         self.table.setUpdatesEnabled(False)   # 重建期挂起重绘：几百个格子一次画完
@@ -1180,9 +1201,8 @@ class TasksPage(QWidget):
                     has_bar = True
         finally:
             self.table.setUpdatesEnabled(True)
-        self.table.setSortingEnabled(True)
-        if sort_col is not None and sort_col >= 0:
-            self.table.sortItems(sort_col, sort_order)
+        if sort_col is not None and sort_col >= 0 and sort_col != CHECK_COL:
+            self.table.sortItems(sort_col, sort_order)   # sortItems 不依赖 setSortingEnabled
         self._syncing = False
         # 滚动位置显式还原：同步重建不会天然归零（实测同行数重建后 value 不变），
         # 数据刷新时原样还回；列表变短时 Qt 会把 value 往回压（clamp），这里再钉一次。
@@ -1199,21 +1219,20 @@ class TasksPage(QWidget):
         self.b_next.setEnabled(self._page < self._page_count())
         self._update_sel_label()
         self._update_run_summary(actives)
-        box = getattr(self, "_hdr_check", None)
-        if box is not None:
-            box.sync_state()
+        self.table.refresh_check_all_state()
 
     def _make_item(self, tid, row, r, c, ats, status, out_path):
+        if c == CHECK_COL:
+            # 标准勾选单元格由 UI 库生成（可勾选 + 居中），再挂上「行→任务ID」与业务提示
+            item = self.table.make_check_item(tid in self._selected_ids)
+            item.setData(Qt.ItemDataRole.UserRole, tid)
+            item.setToolTip("勾选后可跨页保留，支持批量执行/删除；"
+                            "按住鼠标在表上拖出框，框到的行会取反：没勾的勾上、已勾的取消")
+            return item
         item = SecsItem(0) if c in SECS_COLS else QTableWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, tid)     # 行→任务ID，排序后仍可靠
         pct = None
-        if c == CHECK_COL:
-            item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            item.setCheckState(Qt.CheckState.Checked if tid in self._selected_ids
-                               else Qt.CheckState.Unchecked)
-            item.setToolTip("勾选后可跨页保留，支持批量执行/删除；"
-                            "按住鼠标在表上拖出框，框到的行会取反：没勾的勾上、已勾的取消")
-        elif c == COL_PID:
+        if c == COL_PID:
             item.setData(Qt.ItemDataRole.DisplayRole, tid)
         elif c == COL_NUM:
             item.setText(str(row["编号"]))
@@ -1360,9 +1379,7 @@ class TasksPage(QWidget):
         else:
             self._selected_ids.discard(tid)
         self._update_sel_label()
-        box = getattr(self, "_hdr_check", None)
-        if box is not None:
-            box.sync_state()
+        self.table.refresh_check_all_state()
 
     def _on_rubber_band(self):
         """把框到的行【取反】：没勾的勾上，已经勾上的取消勾选。
@@ -1392,39 +1409,23 @@ class TasksPage(QWidget):
         self.table.clearSelection()
         self._syncing = False
         self._update_sel_label()
-        box = getattr(self, "_hdr_check", None)
-        if box is not None:
-            box.sync_state()
+        self.table.refresh_check_all_state()
 
-    def _on_header_clicked(self, logical):
-        """点列头：记下用户排序意图（聚集排序让位于手动排序）；
-        点勾选列表头 = 全选/取消本页（表头那枚全选框走 _on_check_all_toggle）"""
-        if logical != CHECK_COL:
-            self._user_sort_col = logical
-            self._gather_ids = set()
+    def _manual_sort(self, col, order):
+        """表头右键菜单「顺序调整」：记下排序意图（列 + 升降序），让位聚集排序后刷新。
+        refresh 会在重建的本页行内按此列 sortItems，因此排序跨轮询重建仍保持。
+        勾选列不参与排序（它恒在最左、无排序语义）。"""
+        if col is None or col < 0 or col == CHECK_COL:
             return
-        items = self._check_items()
-        if not items:
-            return
-        all_on = all(i.checkState() == Qt.CheckState.Checked for i in items)
-        self._apply_all_page(not all_on)
+        self._user_sort_col = col
+        self._user_sort_order = order
+        self._gather_ids = set()
+        self.refresh(force=True)
 
     def _check_items(self):
         return [self.table.item(r, CHECK_COL)
                 for r in range(self.table.rowCount())
                 if self.table.item(r, CHECK_COL) is not None]
-
-    def _check_all_state(self):
-        """表头全选框三态：本页全选=Checked、部分=Partially、全不选=Unchecked。"""
-        items = self._check_items()
-        if not items:
-            return Qt.CheckState.Unchecked
-        n = sum(1 for i in items if i.checkState() == Qt.CheckState.Checked)
-        if n == 0:
-            return Qt.CheckState.Unchecked
-        if n == len(items):
-            return Qt.CheckState.Checked
-        return Qt.CheckState.PartiallyChecked
 
     def _apply_all_page(self, select):
         """把本页所有行勾选框设成 select（True 全选 / False 清空），并同步跨页选中集。"""
@@ -1440,13 +1441,7 @@ class TasksPage(QWidget):
         else:
             self._selected_ids -= ids
         self._update_sel_label()
-        box = getattr(self, "_hdr_check", None)
-        if box is not None:
-            box.sync_state()
-
-    def _on_check_all_toggle(self, state):
-        """表头全选框被点：用户点成 Checked→全选本页；其余（含从部分点过来）→清空本页。"""
-        self._apply_all_page(state == Qt.CheckState.Checked)
+        self.table.refresh_check_all_state()
 
     def _clear_selection(self):
         self._selected_ids.clear()
@@ -1455,9 +1450,7 @@ class TasksPage(QWidget):
             self.table.item(r, CHECK_COL).setCheckState(Qt.CheckState.Unchecked)
         self._syncing = False
         self._update_sel_label()
-        box = getattr(self, "_hdr_check", None)
-        if box is not None:
-            box.sync_state()
+        self.table.refresh_check_all_state()
 
     def _update_sel_label(self):
         self.lbl_sel.setText(f"已选 {len(self._selected_ids)} 个")
@@ -1486,11 +1479,61 @@ class TasksPage(QWidget):
                 n_fail += 1
             elif not s:
                 n_pending += 1
-        self.k_total.set_value(len(df))
-        self.k_pending.set_value(n_pending)
-        self.k_run.set_value(len(actives))
-        self.k_ok.set_value(n_ok)
-        self.k_fail.set_value(n_fail)
+        n_total = len(df)
+        rate = (n_ok / n_total * 100) if n_total else 0.0
+        for key, val in (("total", n_total), ("pending", n_pending),
+                         ("run", len(actives)), ("ok", n_ok), ("fail", n_fail),
+                         ("rate", f"{rate:.1f}%")):
+            card = self.kpi.card(key)
+            if card is not None:
+                card.set_value(val)
+        self._apply_kpi_sparklines()
+
+    def _apply_kpi_sparklines(self):
+        """任务中心 KPI 卡右侧的迷你走势：直接复用 task_store.range_stats 的按天序列
+        （runs 表每次执行有独立时间戳，天然铺得开日粒度）。
+        早期这版按 tasks.updated_at 分桶，但「更新时间」每次状态变更都被覆盖、
+        全库活股聚成同一天→非零天不足 2 天→永远画不出线，故改吃 runs 日序列。
+        total/ok/fail 给按天执行数、rate 给按天成功率；pending（存量）/run（瞬时）
+        无历史序列不画。折线挂上会使卡片变宽，末尾调 kpi.relayout() 重算列数。
+        （先出图，具体统计口径后续可再精修）"""
+        try:
+            # days=None → 只列有执行记录的日子（最多近 60 天），不受“今天”往后翻把旧数据
+            # 移出窗口而影响，只要历史上真有 ≥ 2 个执行日就能成线。
+            daily = task_store.range_stats(days=None)["daily"]
+        except Exception:
+            daily = []
+        series = {
+            "total": [r["total"] for r in daily],
+            "ok":    [r["ok"] for r in daily],
+            "fail":  [r["fail"] for r in daily],
+            "rate":  [(r["ok"] / r["total"] * 100) if r["total"] else 0.0 for r in daily],
+        }
+        for key in self.kpi.keys():          # 先全收回，避免残留上一条线
+            c = self.kpi.card(key)
+            if c is not None:
+                c.hide_sparkline()
+        for key in self.kpi.selected():
+            vals = series.get(key)
+            c = self.kpi.card(key)
+            if c is not None and vals and len(vals) >= 2:
+                c.set_sparkline(vals)
+        self.kpi.relayout()
+
+    def _pick_kpi(self, band):
+        """「⚙ 指标」：复用「字段管理」同款弹窗选顶部 KPI 展示哪几个指标 + 排序。"""
+        keys = band.keys()
+        cols = [(k, (band.meta(k) or {}).get("name", k)) for k in keys]
+        sel = band.selected()
+        hidden = {k for k in keys if k not in sel}
+        dlg = FieldManagerDialog(
+            self, cols, order=sel, hidden=hidden, title="KPI 指标 · 任务中心",
+            default_order=keys,
+            default_hidden=[d["key"] for d in _TASK_KPI_DEFS if not d.get("default", True)],
+            tip="勾选要在顶部用 KPI 卡展示的指标 · 右侧拖动调整顺序 · 悬停卡片看计算口径")
+        if not dlg.exec():
+            return None
+        return [k for k in dlg.order if k in keys] or None
 
     def _update_run_summary(self, actives):
         # A2：把「执行全部」的口径写成实时数量（当前筛选下填了提示词的）
@@ -1744,11 +1787,10 @@ class TasksPage(QWidget):
                 if anchor is not None and \
                         (e.position().toPoint() - anchor).manhattanLength() > 16:
                     self._on_rubber_band()
-                else:
-                    # 单击不框选：顺手清掉 Qt 的行高亮。启用框选后单击也会高亮
-                    # 整行，而这里的“真选中”是勾选框（跨页保留、驱动批量操作），
-                    # 留着高亮会让人误以为这行被选上了。
-                    self.table.clearSelection()
+                # 单击不再清掉 Qt 选中高亮：按「严格对齐组件库」（select="items"），点中单元格
+                # 应与画廊表一样——只选中那一格（淡蓝底 ::item:selected + 活动格蓝框），
+                # Ctrl+C 也只复制那一格。真正的批量“选中”仍由勾选框（跨页保留、驱动执行/删除）
+                # 决定，Qt 单元格高亮只是“当前点在哪”的即时反馈。
         if obj is self.table and e.type() == QEvent.Type.KeyPress \
                 and e.key() == Qt.Key.Key_Space and self._hover_cell:
             # 空格与单击同路由：文本列弹全文预览，输出列播视频（鼠标停哪敲哪，

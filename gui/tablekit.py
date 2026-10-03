@@ -4,11 +4,15 @@ gui/tablekit.py —— 表格通用能力：勾选框列 + 字段管理（显示
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QHBoxLayout,
-                               QVBoxLayout, QTableWidgetItem, QPushButton, QCheckBox)
+                               QVBoxLayout, QTableWidgetItem, QPushButton)
 
 from gui.formatting import secs
-from gui.kit import FieldManager
+from gui.kit import FieldManager, mount_header_checkbox
 from gui.window_frame import apply_rounded
+
+# mount_header_checkbox 已迁入 UI 库（gui/kit.py），KitTable 的 checkbox 列内部要用它；
+# tablekit 这里保留同名再导出，历史上 `from gui.tablekit import mount_header_checkbox`
+# 的调用方（任务中心 / 执行记录）无需改动。
 
 
 class SecsItem(QTableWidgetItem):
@@ -178,54 +182,3 @@ def enable_drag_with_lock(table, lock_count=1):
             table._ft_moving = False
 
     h.sectionMoved.connect(on_moved)
-
-
-def mount_header_checkbox(table, col, on_toggle, state_provider=None):
-    """在表头某一列挂一枚**可见**的全选勾选框（对标主流后台：勾选列表头就该有个框）。
-
-    为什么需要：以前只有「点表头那一格」才全选，格子上没框，用户根本不知道能全选、
-    也不知去哪全选。这里摆一枚三态框：本页全选=Checked、部分=PartiallyChecked、全不选=Unchecked。
-
-    on_toggle(state): 用户点框后回调（state 为点击后的新勾选态；宿主页据此全选/清空本页）。
-    state_provider(): 返回当前应有的三态；调用方在数据变化后调 cb.sync_state() 同步框态。
-    返回的 QCheckBox 以表头为父，随列宽 / 移动 / 横向滚动自动重定位；并带两个便捷方法：
-    reposition() 重新摆位、sync_state() 按 provider 刷新三态。
-    """
-    header = table.horizontalHeader()
-    cb = QCheckBox(header)
-    cb.setCursor(Qt.CursorShape.PointingHandCursor)
-    cb.setText("")                       # 只要那个方框，别占文字位
-    guard = {"on": False}
-
-    def reposition():
-        if header.isSectionHidden(col):
-            cb.hide()
-            return
-        w, h = header.sectionSize(col), header.height()
-        x = header.sectionViewportPosition(col)
-        box = 18                          # 紧凑方框，在该列里水平/垂直居中
-        cb.setGeometry(x + max(0, (w - box) // 2), max(0, (h - box) // 2), box, box)
-        cb.show()
-        cb.raise_()
-
-    def sync_state():
-        if state_provider is None:
-            return
-        guard["on"] = True               # 程序设态不触发 on_toggle（否则会误全选/清空）
-        cb.setCheckState(state_provider())
-        guard["on"] = False
-
-    def _changed(_state):
-        if guard["on"]:
-            return
-        on_toggle(cb.checkState())
-        sync_state()                       # 宿主改完行勾选后回写真实三态
-
-    cb.stateChanged.connect(_changed)
-    cb.reposition = reposition
-    cb.sync_state = sync_state
-    for sig in (header.sectionResized, header.sectionMoved, header.geometriesChanged):
-        sig.connect(lambda *a: reposition())
-    table.horizontalScrollBar().valueChanged.connect(lambda *a: reposition())
-    reposition()
-    return cb

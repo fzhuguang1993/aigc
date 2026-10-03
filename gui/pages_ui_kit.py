@@ -37,15 +37,11 @@ C = ui_kit.COLORS
 from gui.kit import (_section_title, _sub_title, _hint, _contrast_text, _row,
                     _lighten, hover_tip, KitButton, TreeSelect, ModernDateEdit,
                     DateRangePicker, KitSlider, ResizableTextEdit, KitTable,
-                    FieldManager, _FlowKpiCard, _round_dialog)
+                    FieldManager, KpiBand, _round_dialog)
 
 
 class UiKitPage(QWidget):
     """UI 组件库交互画廊：分类 Tab，示例按钮带动效 + 点击弹窗说明。"""
-
-    _KPI_W = 330   # KPI 卡片固定宽度（不随窗口拉伸）：使默认内容区实宽（约 1470~1630）恰好一行 4 张，最大化再容纳 6 张
-    _KPI_H = 80    # KPI 卡片最小高度（内容装不下时卡片自动长高）
-    _KPI_GAP = 18  # KPI 卡片行/列间距
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -302,23 +298,27 @@ class UiKitPage(QWidget):
 
     # ================= Tab：表格·卡片 =================
     def _tab_data(self):
-        sa, v = self._tab_shell("数据展示：表格 QTableWidget / KPI 卡片 KpiCard / 字段胶囊。")
-        v.addWidget(_sub_title("表格（列标题右键→多级菜单：居中调整 / 顺序调整 / 字段格式，二级菜单底部带一枚 success 绿胶囊「默认展开」：点了就把该组内容就地平铺展开（右键即见全部子项、不用再悬停）；展开后分组标题本身就是一枚同款绿胶囊（标题与开关绑定、点击即收起，不再单列「取消展开」钮），展开态与二级菜单内容同款同宽、铺满整个菜单不留缝，可多组同时展开、互不顶掉；这套多级右键菜单已抽成可复用的 MenuCascade 弹出层组件（注册分组、无多级自动降一级）；拖表头边改列宽；双击在单元格内直接编辑；选中 Ctrl+C 复制后出现 Excel 式行走虚线框、按 Esc 取消；默认每格一行，超出用 … 省略、悬停看完整内容，开自动换行则整格展开）"))
-        # 标准表格基准件 KitTable：这里显式开单元格选择 / 内联编辑 / 行号列，
-        # 供上方长文案演示（其余配置项默认即全站基准形态：只读·整行选·斑马纹·隐藏行号）。
-        tb = KitTable(3, 3, ["品名", "状态", "数值"],
+        sa, v = self._tab_shell("数据展示：表格 QTableWidget / KPI 指标带 KpiBand / 字段胶囊。")
+        v.addWidget(_sub_title("表格 KitTable（UI 库标准件，样式已固化）：首列即标准勾选列——列名就是那枚三态全选框，点它全选 / 全不选本页（部分勾选时表头显半选态）；升降序不再有表头箭头 / 点击排序，改走列标题右键菜单的「顺序调整」。其余能力：列标题右键多级菜单（居中调整 / 顺序调整 / 字段格式，二级菜单底部带 success 绿胶囊「默认展开」；多级右键菜单已抽成可复用 MenuCascade 弹层组件）；拖表头边改列宽；双击在单元格内直接编辑；点击单元格→整行淡蓝底高亮，点中的那一格再单独描一圈主蓝「活动单元格」实线框（Excel 式，随点击 / 方向键移动）；选中区 Ctrl+C 复制后出现 Excel 式行走虚线框、按 Esc 取消；默认每格一行、超出用 … 省略、悬停看完整内容，开自动换行则整格展开。"))
+        # 标准件：首列内置勾选列（表头三态全选框）；这里叠开内联编辑 / 行号列，演示 checkbox 与其它配置可共存。
+        # 页头传 headers 时第 0 项给空串（表头由勾选框占据），数据列从第 1 列起。
+        tb = KitTable(3, 4, ["", "品名", "状态", "数值"],
                       select="items", edit=True, row_number=True)
+        # 表头全选框（内置信号 check_all_toggled(bool)）：直接把本页所有勾选格设成同一态
+        tb.check_all_toggled.connect(tb.set_all_checked)
         data = [("骨胶原维D钙·关节好物分享长文本换行示例", "成功", "128"),
                 ("关节贴", "运行中", "32"), ("钙片", "失败", "—")]
         A = Qt.AlignmentFlag
         for r, row in enumerate(data):
-            for c, val in enumerate(row):
+            tb.setItem(r, 0, tb.make_check_item())        # 首列：标准勾选格
+            for c0, val in enumerate(row):
+                c = c0 + 1
                 it = QTableWidgetItem(val)
                 it.setToolTip(val)          # 默认一行时悬停看完整内容
-                if c == 1:
+                if c0 == 1:
                     it.setForeground(QColor(ui_kit.STATUS_COLORS.get(val, C["text"])))
                     it.setTextAlignment(A.AlignCenter)
-                elif c == 2:
+                elif c0 == 2:
                     it.setTextAlignment(A.AlignRight | A.AlignVCenter)
                 tb.setItem(r, c, it)
         tb.setMinimumHeight(180)
@@ -329,10 +329,9 @@ class UiKitPage(QWidget):
                                ".order/.hidden 实时可取）"))
         v.addWidget(self._field_manager_demo())
 
-        v.addWidget(_sub_title("KPI 卡片 KpiCard（吃 KPI_PALETTE；右侧空白放小折线 sparkline）"))
-        # 定宽 KPI 带：每卡固定 _KPI_W 宽、不拉伸；普通窗口一行 4 张，最大化行宽能容纳
-        # 6 张则一行 6 张，卡片数超过一行自动折到下一行（FlowLayout 按实际可用宽换行）。
-        # 后期要做“上板/下板”直接再调一次 _kpi_band(...) 即可。
+        v.addWidget(_sub_title("KPI 指标带 KpiBand（UI 库标准件，样式已固化）：卡片自适应换行——按可用宽度算“一行放几张”，多出来的收进右侧“展开”；“⚙ 指标”复用字段管理弹窗选展示哪几张 + 拖拽排序；每卡右侧挂迷你折线，悬停看口径。数据中台 / 任务中心顶部指标条用的就是同一个件。"))
+        # KpiBand 自适应带：按可用宽度算“一行放几张”，多出来的收进“展开”；
+        # 挂上折线后卡片变宽会自动重算列数。后期要做“上板/下板”直接再调一次 _kpi_band(...) 即可。
         kpi_specs = (
             ("总执行", "1,280", True, [3, 5, 4, 6, 8, 7, 9, 12]),
             ("成功", "1,150", True, [2, 4, 3, 5, 6, 6, 8, 9]),
@@ -363,23 +362,40 @@ class UiKitPage(QWidget):
         return sa
 
     def _kpi_band(self, specs):
-        """一排定宽 KPI 卡片（供上板/下板等多条复用）。
-        卡片固定宽 _KPI_W、不随窗口拉伸；用 FlowLayout 按实际可用宽排：一行能塞几张就塞几张，
-        放不下自动折到下一行——普通窗口一行 4 张、最大化后行宽能容纳 6 张则一行 6 张。
-        specs = [(名称, 数值, 是否上涨 up, spark 序列), ...]。"""
-        host = QWidget()
-        flow = FlowLayout(host, hgap=self._KPI_GAP, vgap=self._KPI_GAP)
-        flow.setContentsMargins(0, 0, 0, 0)
+        """UI 库标准件 KpiBand 的活实例：自适应换行 + 展开/收起 + ⚙指标 + 右侧迷你折线。
+        取代旧版另写的定宽 FlowLayout 假象（_FlowKpiCard 已删，单一真源）：这里挂的就
+        是数据中台 / 任务中心顶部用的同一个 KpiBand。specs = [(名称, 数值, 是否上涨 up, spark), ...]。"""
+        band = KpiBand()
+        pal = ui_kit.KPI_PALETTE
+        defs = [{"key": f"k{i}", "name": name, "icon": "📈", "color": pal[i % len(pal)],
+                 "tooltip": f"{name}：组件库演示卡（悬停即见此口径位）", "default": True}
+                for i, (name, _val, _up, _spark) in enumerate(specs)]
+        band.set_defs(defs)
         for i, (name, val, up, spark) in enumerate(specs):
-            k = _FlowKpiCard(self._KPI_W, self._KPI_H, name, "📈",
-                             ui_kit.KPI_PALETTE[i % len(ui_kit.KPI_PALETTE)])
-            k.set_value(val, "较昨日 +3.2%", up=up)
-            k.set_sparkline(spark)
-            # 不再把 spark 的最小宽压成 0：那是卡片很窄（~240）时才需要的撑宽手段。
-            # 卡片定宽到 330 已装得下 图标+文字+96px 折线；若再压 0，文字列会把空间全占走、
-            # 把折线挤成 0 宽（就是“默认折线没了”的根因）。
-            flow.addWidget(k)
-        return host
+            c = band.card(f"k{i}")
+            if c is None:
+                continue
+            c.set_value(val, "较昨日 +3.2%" if up else "较昨日 -1.1%", up=up)
+            if spark and len(spark) >= 2:
+                c.set_sparkline(spark, pal[i % len(pal)])
+        band.picker = self._kpi_pick          # “⚙ 指标”同样复用字段管理弹窗
+        band.relayout()                        # 挂完折线卡变宽，按新宽重算列数
+        return band
+
+    def _kpi_pick(self, band):
+        """“⚙ 指标”：复用「字段管理」同款弹窗选顶部 KPI 展示哪几个 + 排序（与业务页一致）。"""
+        from gui.tablekit import FieldManagerDialog
+        keys = band.keys()
+        cols = [(k, (band.meta(k) or {}).get("name", k)) for k in keys]
+        sel = band.selected()
+        hidden = {k for k in keys if k not in sel}
+        dlg = FieldManagerDialog(self, cols, order=sel, hidden=hidden,
+                                 title="KPI 指标 · 组件库演示",
+                                 default_order=keys, default_hidden=[],
+                                 tip="勾选要用 KPI 卡展示的指标 · 右侧拖动调整顺序")
+        if not dlg.exec():
+            return None
+        return [k for k in dlg.order if k in keys] or None
 
     def _token_chip(self, key, label, style="flat"):
         acc = ui_kit.FIELD_COLORS.get(key, C["primary"])

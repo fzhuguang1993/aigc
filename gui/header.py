@@ -6,7 +6,7 @@ gui/header.py —— 统一页头与 KPI 卡片（飞书风格配色）
 import math
 
 from PySide6.QtCore import Qt, QTimer, QPointF
-from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath, QLinearGradient
+from PySide6.QtGui import (QColor, QPainter, QPen, QPainterPath, QLinearGradient)
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                                QSizePolicy, QSpacerItem)
 
@@ -142,7 +142,10 @@ class _AccentBar(QWidget):
 
 
 def page_header(title, subtitle="", icon=""):
-    """紧凑单行页头：渐变竖条 + 标题 + 同行灰色副标题，总高 40px"""
+    """紧凑单行页头：渐变竖条 + 标题，总高 40px。
+
+    subtitle 形参保留但**不再绘制**：各主栏目左上角那行灰色提示小字看着臃肿，已统一去掉；
+    所有 `page_header(标题, 描述, ...)` 的旧调用无需改动（描述被忽略）。"""
     w = QWidget()
     w.setFixedHeight(40)
     lay = QHBoxLayout(w)
@@ -152,11 +155,6 @@ def page_header(title, subtitle="", icon=""):
     lbl = QLabel(f"{icon}  {title}" if icon else title)
     lbl.setStyleSheet(f"font-size:17px; font-weight:700; color:{FS_TEXT}; background:transparent;")
     lay.addWidget(lbl)
-    if subtitle:
-        s = QLabel(subtitle)
-        s.setStyleSheet(f"font-size:12px; color:{FS_WEAK}; background:transparent;")
-        lay.addSpacing(4)
-        lay.addWidget(s, 0, Qt.AlignmentFlag.AlignVCenter)
     lay.addStretch(1)
     return w
 

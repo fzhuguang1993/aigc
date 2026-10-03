@@ -343,7 +343,7 @@ class ConsolePage(QWidget):
         # ---------- 详细列表（紧凑表格，每线路一行） ----------
         # 旧版「列表」只是单列宽卡换着法子排，不是列表；这里是真的表格。
         # 列里没有接口地址（商业版红线），状态用四档圆点+文字+语义色。
-        self.list_table = KitTable(0, len(LIST_HEADERS), LIST_HEADERS, select=None)
+        self.list_table = KitTable(0, len(LIST_HEADERS), LIST_HEADERS, checkbox=False, select=None)
         self.list_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lsh = self.list_table.horizontalHeader()
         for c, w in {0: 170, 1: 110, 2: 90, 3: 90, 4: 70, 5: 90}.items():
@@ -369,7 +369,7 @@ class ConsolePage(QWidget):
             srv_card = Card(margins=(16, 14, 16, 12))
             srv_card.v.setSpacing(10)
             srv_card.v.addWidget(QLabel("云端线路池（由网关统一调度，仅展示）："))
-            self.srv_table = KitTable(0, len(SRV_HEADERS), SRV_HEADERS, select=None)
+            self.srv_table = KitTable(0, len(SRV_HEADERS), SRV_HEADERS, checkbox=False, select=None)
             sh = self.srv_table.horizontalHeader()
             for c, w in {0: 120, 2: 90, 3: 110}.items():
                 sh.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)

@@ -133,7 +133,7 @@ class OrgPage(QWidget):
         bar.addWidget(self.lbl_mem_hint)
         v.addLayout(bar)
 
-        self.tbl_mem = KitTable(0, len(_COLS), _COLS, zebra=False, row_number=False,
+        self.tbl_mem = KitTable(0, len(_COLS), _COLS, checkbox=False, zebra=False, row_number=False,
                                 select="rows", multi=False, edit=False)
         self.tbl_mem.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
@@ -323,7 +323,7 @@ class OrgPage(QWidget):
         t.setObjectName("InlineTip")
         t.setWordWrap(True)
         v.addWidget(t)
-        self.tbl_line = KitTable(0, 2, ["线路", "归属成员"], zebra=False,
+        self.tbl_line = KitTable(0, 2, ["线路", "归属成员"], checkbox=False, zebra=False,
                                  row_number=False, select="items", edit=False)
         hh = self.tbl_line.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)

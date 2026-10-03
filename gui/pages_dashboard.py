@@ -36,9 +36,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from core.config import USER_NAME
 from store import app_state, task_store
 from gui.formatting import secs
-from gui.header import page_header, Card, KpiCard
+from gui.header import page_header, Card
 from gui.widgets import LoadingOverlay
-from gui.kit import TableColumnKit
+from gui.kit import TableColumnKit, KpiBand
 from gui.window_frame import apply_rounded
 from gui.menus import StyledMenu
 from gui import ui_kit
@@ -160,6 +160,42 @@ _DIM_DRILL = {"day": "day", "product": "product", "account": "account",
               "status": "status", "dur": "dur"}
 
 
+# ---------- 总览顶部 KPI 指标带：可选字段注册表 ----------
+# 每一项即一张 KpiCard：key 供取值/接趋势线寻址，tooltip 写死该指标的**计算口径**
+# （悬停卡片即见，满足“KPI 卡配套计算逻辑”），default 决定是否默认展示（“⚙ 指标”可改）。
+# 值/环比/趋势线在 DashboardPage._refresh_kpis / _apply_kpi_sparklines 里按 key 现算。
+_KPI_DEFS = [
+    {"key": "total", "name": "执行总条数", "icon": "▶", "color": COLORS["primary"],
+     "default": True,
+     "tooltip": "当前时间范围内已落库的执行记录总条数（按开始时间计入当日，"
+                "含成功/失败/取消，不含仍在跑的）。累计视图＝自首条记录至今，永不清零。"},
+    {"key": "ok", "name": "成功", "icon": "✔", "color": COLORS["success"],
+     "default": True,
+     "tooltip": "状态为 completed（成功出片）的执行条数。"},
+    {"key": "rate", "name": "成功率", "icon": "％", "color": COLORS["purple"],
+     "default": True,
+     "tooltip": "成功率 = 成功条数 ÷ 执行总条数 × 100%。分母含失败与取消；"
+                "无任何记录时记 0%。"},
+    {"key": "fail", "name": "失败", "icon": "✖", "color": COLORS["danger"],
+     "default": True,
+     "tooltip": "状态为 failed 或 error 的执行条数（云端报错、素材异常等都算）。"},
+    {"key": "cancel", "name": "取消", "icon": "⊘", "color": COLORS["weak"],
+     "default": True,
+     "tooltip": "状态为 cancelled 的执行条数（手动中止或任务被取消）。"},
+    {"key": "run", "name": "正在运行", "icon": "◌", "color": COLORS["warning"],
+     "default": True,
+     "tooltip": "此刻仍在云端生成的瞬时条数；快照值，不做环比。"},
+    {"key": "dur", "name": "平均生成时长", "icon": "⏱", "color": COLORS["info"],
+     "default": True,
+     "tooltip": "成功记录在云端真正生成所用时间的均值（开始跑→出片，不含排队），越短越好；"
+                "早期未拆分排队/生成的记录按总用时计入。"},
+    {"key": "queued", "name": "平均排队时长", "icon": "⏳", "color": COLORS["warning"],
+     "default": False,
+     "tooltip": "成功记录从提交到真正开跑之间等待时间的均值；仅统计能拆出排队/生成"
+                "两段的记录，故样本可能少于成功总数。"},
+]
+
+
 def _fmt_metric(kind, v):
     """按单位种格式化指标值：时长走 secs，百分比留一位小数"""
     if kind == "pct":
@@ -249,18 +285,8 @@ class DashboardPage(QWidget):
                                       and 0 <= saved < len(self._RANGES) else 1)
         self.cb_range.currentIndexChanged.connect(self._on_range)
         head.addWidget(self.cb_range)
-        # 趋势折线开关：只影响总览 KPI 卡右侧的小折线，开关状态持久化。
-        # 用 ChipBtn（选中填主蓝）而非新造控件——组件库里已有同款胶囊。
-        saved_spark = app_state.get("dash_spark")
-        self._spark_on = saved_spark if isinstance(saved_spark, bool) else True
-        self.b_spark = QPushButton("📈 趋势折线")
-        self.b_spark.setObjectName("ChipBtn")
-        self.b_spark.setCheckable(True)
-        self.b_spark.setChecked(self._spark_on)
-        self.b_spark.setToolTip("KPI 卡右侧迷你走势线（按当前时间范围逐日统计）；\n"
-                                "关掉后卡片只留数字与环比。单日/累计无足够点位时自动不画。")
-        self.b_spark.toggled.connect(self._on_spark)
-        head.addWidget(self.b_spark)
+        # KPI 卡右侧趋势线：默认常开（曾给过开关，多余且常被忽略），单日/累计不足 2 点时自动不画。
+        self._spark_on = True
         self.b_report = QPushButton("📋 今日汇报")
         self.b_report.setObjectName("GhostBtn")
         self.b_report.setToolTip("今日截至目前 vs 昨日同时段的进度汇报；\n"
@@ -325,21 +351,24 @@ class DashboardPage(QWidget):
         self._stack.addWidget(area)
         self._area = area                     # 总览页滚动容器（六图装不下时页滚）
 
-        # ----- KPI 行 -----
-        kpis = QHBoxLayout()
-        kpis.setSpacing(14)
-        self.k_total = KpiCard("执行总条数", "▶", COLORS["primary"])
-        self.k_ok = KpiCard("成功", "✔", COLORS["success"])
-        self.k_rate = KpiCard("成功率", "％", COLORS["purple"])
-        self.k_fail = KpiCard("失败", "✖", COLORS["danger"])
-        self.k_cancel = KpiCard("取消", "⊘", COLORS["weak"])
-        self.k_run = KpiCard("正在运行", "◌", COLORS["warning"])
-        self.k_dur = KpiCard("平均生成时长", "⏱", COLORS["info"])
-        for k in (self.k_total, self.k_ok, self.k_rate, self.k_fail,
-                  self.k_cancel, self.k_run, self.k_dur):
-            k.setMinimumWidth(125)
-            kpis.addWidget(k)
-        lay.addLayout(kpis)
+        # ----- KPI 指标带（宽度自适应 + 展开/收起 + 指标可选，见 gui.kit.KpiBand）-----
+        # 不再把固定 7 张硬塞一行：窄窗口下卡片被压、环比百分比与趋势线叠字的老问题，
+        # 交给 KpiBand 按可用宽度算“一行放几张”，多出来的收进“展开”。
+        self.kpi = KpiBand()
+        self.kpi.set_defs(_KPI_DEFS)
+        self.kpi.picker = self._pick_kpi      # 「⚙ 指标」复用「字段管理」同款弹窗
+        saved_sel = app_state.get("dash_kpi_sel")
+        if isinstance(saved_sel, list) and saved_sel:
+            self.kpi.set_selected(saved_sel, notify=False)
+        saved_exp = app_state.get("dash_kpi_exp")
+        self.kpi.set_expanded(saved_exp if isinstance(saved_exp, bool) else False,
+                              notify=False)
+        # 选择 / 展开态落进 app_state（丢了不影响业务，只是回到默认）
+        self.kpi.selectionChanged.connect(
+            lambda keys: app_state.set_value("dash_kpi_sel", keys))
+        self.kpi.expandedChanged.connect(
+            lambda on: app_state.set_value("dash_kpi_exp", on))
+        lay.addWidget(self.kpi)
 
         # ----- 趋势 + 环形占比 -----
         mid = QHBoxLayout()
@@ -619,35 +648,7 @@ class DashboardPage(QWidget):
         scope = self._scope(days)
         cum = days is None        # 累计口径没有“上一个等长周期”，环比全部隐掉
 
-        def cmp(c, p, up_is_good):
-            return ("累计至今", None) if cum else self._cmp(c, p, up_is_good)
-
-        self.k_total.set_value(cur["total"], *cmp(cur["total"], prev["total"], True))
-        self.k_ok.set_value(cur["ok"], *cmp(cur["ok"], prev["ok"], True))
-        dt, up = _delta_text(round(cur["rate"]), round(prev["rate"]), True) \
-            if prev["total"] else ("", None)
-        self.k_rate.set_value(f"{cur['rate']}%", "累计至今" if cum else
-                              (dt if prev["total"] else
-                               ("—" if not cur["total"] else "全部基于本期")), up)
-        self.k_fail.set_value(cur["fail"], *cmp(cur["fail"], prev["fail"], False))
-        self.k_cancel.set_value(cur["cancel"], *cmp(cur["cancel"], prev["cancel"], False))
-        run = st["running"]
-        self.k_run.set_value(run, "云端生成中" if run else "空闲")
-        # 成功执行的平均生成用时（秒，不含排队），与上期对比，越短越好
-        avg_c, avg_p = cur.get("avg_dur") or 0, prev.get("avg_dur") or 0
-        dt, up = _delta_text(round(avg_c), round(avg_p), False) if avg_p else ("", None)
-        self.k_dur.set_value(secs(avg_c) if avg_c else "—",
-                             "累计至今" if cum else
-                             (dt if (avg_p and avg_c) else
-                              ("—" if not avg_c else "均基于本期")), up)
-        # 排队均值放 tooltip：同一条线只跑一个时，总用时里一大半是排队，
-        # 不拆开来就说不清“为什么上次看 15 分钟、这次只要 5 分钟”
-        q = cur.get("avg_queued") or 0
-        self.k_dur.setToolTip(
-                "只算视频在云端真正生成花的时间（开始跑→出片），不含排队"
-                + (f"；本期平均排队 {secs(q)}" if q else "；本期没采到排队时间")
-                + "\n没拆分（早期提交）的记录按总用时计，可用回填脚本补")
-
+        self._refresh_kpis(st, cur, prev, cum)
         self._apply_kpi_sparklines(st["daily"])
 
         self.trend.title = f"每日执行趋势 · {scope}（成功/失败/取消 堆叠）"
@@ -692,35 +693,97 @@ class DashboardPage(QWidget):
         for view in self._custom_views.values():
             view.refresh(days)
 
-    def _on_spark(self, on):
-        """折线开关：存下偏好，拿本次已缓存的 daily 直接重绘，不必重新查库。"""
-        self._spark_on = on
-        app_state.set_value("dash_spark", on)
-        st = getattr(self, "_st", None)
-        if st:
-            self._apply_kpi_sparklines(st.get("daily") or [])
+    def _pick_kpi(self, band):
+        """「⚙ 指标」：复用「字段管理」同款弹窗选顶部 KPI 展示哪几个字段 + 排序。
+        columns 用 (key, 中文名)；勾选＝显示、未勾＝隐藏；返回有序可见 key 列表给 band 应用。"""
+        from gui.tablekit import FieldManagerDialog
+        keys = band.keys()
+        cols = [(k, (band.meta(k) or {}).get("name", k)) for k in keys]
+        sel = band.selected()
+        hidden = {k for k in keys if k not in sel}
+        dlg = FieldManagerDialog(
+            self, cols, order=sel, hidden=hidden, title="KPI 指标 · 数据中台",
+            default_order=keys,
+            default_hidden=[d["key"] for d in _KPI_DEFS if not d.get("default", True)],
+            tip="勾选要在顶部用 KPI 卡展示的指标 · 右侧拖动调整顺序 · 悬停卡片看计算口径")
+        if not dlg.exec():
+            return None
+        return [k for k in dlg.order if k in keys] or None
+
+    def _refresh_kpis(self, st, cur, prev, cum):
+        """按选中项给每张 KPI 卡喂值 + 环比。口径/图标在 _KPI_DEFS 定义，这里只负责
+        “当前时间范围下这张卡该显示什么”；未选中的卡 card() 拿不到，直接跳过。"""
+        def cmp(c, p, up_is_good):
+            return ("累计至今", None) if cum else self._cmp(c, p, up_is_good)
+
+        def setv(key, v, delta="", up=None):
+            card = self.kpi.card(key)
+            if card is not None:
+                card.set_value(v, delta, up)
+
+        setv("total", cur["total"], *cmp(cur["total"], prev["total"], True))
+        setv("ok", cur["ok"], *cmp(cur["ok"], prev["ok"], True))
+        dt, up = _delta_text(round(cur["rate"]), round(prev["rate"]), True) \
+            if prev["total"] else ("", None)
+        setv("rate", f"{cur['rate']}%", "累计至今" if cum else
+             (dt if prev["total"] else
+              ("—" if not cur["total"] else "全部基于本期")), up)
+        setv("fail", cur["fail"], *cmp(cur["fail"], prev["fail"], False))
+        setv("cancel", cur["cancel"], *cmp(cur["cancel"], prev["cancel"], False))
+        run = st["running"]
+        setv("run", run, "云端生成中" if run else "空闲")
+        # 平均生成时长：与上期对比，越短越好
+        avg_c, avg_p = cur.get("avg_dur") or 0, prev.get("avg_dur") or 0
+        dt, up = _delta_text(round(avg_c), round(avg_p), False) if avg_p else ("", None)
+        setv("dur", secs(avg_c) if avg_c else "—",
+             "累计至今" if cum else
+             (dt if (avg_p and avg_c) else
+              ("—" if not avg_c else "均基于本期")), up)
+        # 平均排队时长（可选卡）：只统计可拆分记录，无则给占位
+        q_c, q_p = cur.get("avg_queued") or 0, prev.get("avg_queued") or 0
+        dt, up = _delta_text(round(q_c), round(q_p), False) if q_p else ("", None)
+        setv("queued", secs(q_c) if q_c else "—",
+             "累计至今" if cum else
+             (dt if (q_p and q_c) else
+              ("—" if not q_c else "均基于本期")), up)
+        # 生成时长卡 tooltip 追加本期排队：同一条线只跑一个时，总用时一大半是排队，
+        # 不拆开来就说不清“为什么上次 15 分钟、这次 5 分钟”
+        dur_card = self.kpi.card("dur")
+        if dur_card is not None:
+            q = cur.get("avg_queued") or 0
+            base = (self.kpi.meta("dur") or {}).get("tooltip", "")
+            dur_card.setToolTip(
+                base + (f"\n本期平均排队 {secs(q)}" if q
+                        else "\n本期没采到排队时间"))
 
     def _apply_kpi_sparklines(self, daily):
-        """给有按天序列的 5 张 KPI 卡接/摘迷你走势线。
-        正在运行（瞬时值）/平均时长（daily 行里没每日均值）无按天序列，始终不画。
-        开关闭合、或某天数据不足 2 点（如今日）时，统一 hide_sparkline 把弹簧补回。"""
-        def series(fn):
-            return [fn(r) for r in daily]
-        cards = [                      # (卡片, 取每日值的函数)
-            (self.k_total, lambda r: r["total"]),
-            (self.k_ok,    lambda r: r["ok"]),
-            (self.k_rate,  lambda r: (r["ok"] / r["total"] * 100) if r["total"] else 0.0),
-            (self.k_fail,  lambda r: r["fail"]),
-            (self.k_cancel, lambda r: r["cancel"]),
-        ]
-        for card in [c for c, _ in cards] + [self.k_run, self.k_dur]:
-            card.hide_sparkline()      # 先全部收回，避免切时间范围后残留上一条线
+        """给有按天序列的 KPI 卡接/摘迷你走势线。
+        正在运行（瞬时值）/平均时长/平均排队（daily 行里没逐日均值）无序列，始终不画。
+        开关闭合、或某卡数据不足 2 点（如今日）时，统一 hide_sparkline 把弹簧补回。"""
+        series = {                    # key → 取每日值的函数（仅这些有按天序列）
+            "total": lambda r: r["total"],
+            "ok": lambda r: r["ok"],
+            "rate": lambda r: (r["ok"] / r["total"] * 100) if r["total"] else 0.0,
+            "fail": lambda r: r["fail"],
+            "cancel": lambda r: r["cancel"],
+        }
+        for key in self.kpi.keys():   # 先全部收回，避免切时间范围后残留上一条线
+            card = self.kpi.card(key)
+            if card is not None:
+                card.hide_sparkline()
         if not self._spark_on:
             return
-        for card, fn in cards:
-            vals = series(fn)
-            if len(vals) >= 2:         # 不足 2 点画不成线，保持隐藏
+        for key in self.kpi.selected():
+            fn = series.get(key)
+            card = self.kpi.card(key)
+            if fn is None or card is None:
+                continue
+            vals = [fn(r) for r in daily]
+            if len(vals) >= 2:        # 不足 2 点画不成线，保持隐藏
                 card.set_sparkline(vals)
+        # 折线挂上/摘掉会改变卡片宽度（sizeHint），让指标带按新宽度重算一行放几张，
+        # 免得沿用挂线前的旧列数把一行撑得过宽、挤出横向滚动条。
+        self.kpi.relayout()
 
     def _refresh_extra(self, days, st, cur):
         """「其他图表」页签的五图：吃同一份时间范围，跟着 refresh 一起刷"""

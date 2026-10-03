@@ -177,7 +177,7 @@ class ApiManagerPage(QWidget):
                              "拖动/Ctrl 可多选行，删除只弹一次确认；点行末「🌐 打开」看"
                              "单条线路，要一次对比几条就用下方「🌐 打开选中」）："))
         self.acc_table = KitTable(0, 4, ["账号名", "接口地址", "并发数", "打开"],
-                                  zebra=False, row_number=True,
+                                  checkbox=False, zebra=False, row_number=True,
                                   select="rows", multi=True, edit=True)
         self.acc_table.horizontalHeader().setSectionResizeMode(COL_BASE,
                                                                QHeaderView.ResizeMode.Stretch)

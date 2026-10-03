@@ -220,7 +220,7 @@ class PublishPanel(BasePanel):
             head.addWidget(b)
         outer.addLayout(head)
 
-        self.table = KitTable(0, 5, ["选", "平台", "别名", "鉴权", "登录态"])
+        self.table = KitTable(0, 5, ["选", "平台", "别名", "鉴权", "登录态"], checkbox=False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setFixedHeight(150)
         outer.addWidget(self.table)

@@ -275,7 +275,7 @@ class LocalBuildPage(QWidget):
         """任务中心同款表格观感：斑马纹 + 表头点选排序 + 拖列调序 + 分列定宽。
         stretch_cols：自动撑满的文本列（默认末列）；widths：{列号: 宽度}；
         num_cols：按数值大小排序的计数列（避免 10 排到 9 前）。"""
-        tb = KitTable(0, len(cols), cols, zebra=True, row_number=False,
+        tb = KitTable(0, len(cols), cols, checkbox=False, zebra=True, row_number=False,
                       select="rows", multi=False, edit=False)
         tb.setSortingEnabled(True)                # 点表头排序（对齐任务中心）
         tb._num_cols = set(num_cols or ())
@@ -775,7 +775,7 @@ class LocalBuildPage(QWidget):
         bar.addWidget(b_all)
         v.addLayout(bar)
         self.tbl_bacct = KitTable(0, 5,
-            ["选", "别名", "归属（客户›执照）", "账户ID", "授权状态"])
+            ["选", "别名", "归属（客户›执照）", "账户ID", "授权状态"], checkbox=False)
         self.tbl_bacct.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         self.tbl_bacct.setFixedHeight(150)
@@ -793,7 +793,7 @@ class LocalBuildPage(QWidget):
             b.clicked.connect(slot)
             bar2.addWidget(b)
         v.addLayout(bar2)
-        self.tbl_plan = KitTable(0, 5, ["选", "方案名", "推广类型", "日预算", "素材"])
+        self.tbl_plan = KitTable(0, 5, ["选", "方案名", "推广类型", "日预算", "素材"], checkbox=False)
         self.tbl_plan.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         self.tbl_plan.setFixedHeight(130)

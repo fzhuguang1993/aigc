@@ -7,8 +7,9 @@ gui/kit.py —— 全站共享 UI 组件底座（单一真源）
 tooltip 气泡 TipBubble（_TipRouter 拦截原生 tooltip，单例只弹一个）、多级树下拉
 TreeSelect、日期选择器族（ModernDatePicker / DateRangePicker / ModernDateEdit /
 CompactCalendar）、浮动气泡滑块 KitSlider、可自由拉伸多行文本 ResizableTextEdit、
-定宽 KPI 卡 _FlowKpiCard，以及标题/对比色/取色等小工具。画廊页与后续各业务页都从
-这里复用，保证「同一套组件、同一口径」；颜色 / 字号 / 圆角一律吃 gui/ui_kit 令牌。
+自适应 KPI 指标带 KpiBand（数据中台 / 任务中心顶部指标条的标准件），以及标题/对比色/
+取色等小工具。画廊页与后续各业务页都从这里复用，保证「同一套组件、同一口径」；颜色 /
+字号 / 圆角一律吃 gui/ui_kit 令牌。
 """
 import json
 import re
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QTreeView, QAbstractItemView, QStyle, QMenu,
                                QStyleOptionSlider, QDialog, QApplication,
                                QTableWidgetSelectionRange, QStyledItemDelegate,
-                               QGroupBox)
+                               QGroupBox, QGridLayout)
 
 from gui import ui_kit
 from gui.header import page_header, Card, KpiCard
@@ -1224,126 +1225,15 @@ class _KitItemDelegate(QStyledItemDelegate):
         editor.setGeometry(r.left(), r.top(), w, max(r.height(), 28))
 
 
-class SortableTableHeader(QHeaderView):
-    """每列都画排序箭头的表头（对标飞书 / Excel）：
-    · 默认可见——非活动列画淡灰 ▼（表示「这列默认按降序」），当前排序列画主蓝 ▼/▲；
-    · 右缘预留 ARROW_W 给箭头，文字在其左侧省略号截断——列再窄也不与文字重合；
-    · 勾选 / 锁定列（no_arrow_cols）不画箭头、文字占满整格；
-    · 首点某列＝按降序（Qt 默认新列升序，这里翻转成符合直觉的降序），再点同一列才翻转。
-
-    只做「绘制 + 首点降序」两件事：点击 / 拖动 / 调整列宽 / sectionClicked 等一律沿用
-    QHeaderView 内建行为（不覆写 mousePress），因此接入方已有的排序、列锁定、点表头
-    全选等逻辑完全不受影响。排序方向直接读内建 sortIndicatorSection()/sortIndicatorOrder()，
-    与宿主 setSortIndicator/sortItems 单一真源。"""
-
-    ARROW_W = 16          # 右缘留给箭头的宽度
-    PAD_L = 8             # 文字左内边距（对齐 QSS QHeaderView::section 的 padding）
-
-    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
-        super().__init__(orientation, parent)
-        self.setSectionsClickable(True)
-        self.setHighlightSections(False)
-        # 关掉内建箭头，箭头一律由本类自绘（否则窄列会与文字挤在一起、且只有当前列有箭头）
-        self.setSortIndicatorShown(False)
-        self._no_arrow = set()        # 不画箭头的列（勾选 / 锁定）
-        self._last_col = None         # 上一次点过的排序列（决定「同列翻转 / 新列降序」）
-
-    def set_no_arrow_cols(self, cols):
-        self._no_arrow = set(cols)
-
-    def handle_section_click(self, logical):
-        """点某列文本区 → 该列成为当前排序列并定方向：
-        · 首次点这列（或点了新列）＝降序（符合「默认降序」直觉；Qt 内建对新列默认升序，这里翻正）；
-        · 连着点同一列＝在降/升之间翻转。
-        自持 _last_col 判定，不依赖基类是否在点击时改动指示列——本类把 setSortIndicatorShown(False)
-        关掉了内建箭头，基类松开鼠标时并不会自动拨动指示列，早期「读 super 前后差值」的判据在这张
-        表头上永远不成立（首点 / 翻转全失效）。勾选 / 锁定列（no_arrow_cols）直接跳过：它们的点击
-        交给宿主（如点勾选列表头全选）。"""
-        if logical is None or logical < 0 or logical >= self.count():
-            return
-        if logical in self._no_arrow:
-            return
-        if logical == self._last_col:
-            cur = self.sortIndicatorOrder()
-            new = (Qt.SortOrder.AscendingOrder
-                   if cur == Qt.SortOrder.DescendingOrder
-                   else Qt.SortOrder.DescendingOrder)
-        else:
-            new = Qt.SortOrder.DescendingOrder
-        self._last_col = logical
-        self.setSortIndicator(logical, new)
-        return new
-
-    def mouseReleaseEvent(self, e):
-        """松开：先让基类跑完内建点击 / 拖列 / sectionClicked 语义，再据「点的是文本、不是拖动列
-        边界」自订方向。sectionOffset 非 0 表示这是一次拖动改列位，不当成排序点击。"""
-        logical = (self.logicalIndexAt(e.position().toPoint())
-                   if e.button() == Qt.MouseButton.LeftButton else -1)
-        was_move = self.sectionOffset() != 0
-        super().mouseReleaseEvent(e)
-        if logical >= 0 and not was_move and self.sectionsClickable():
-            self.handle_section_click(logical)
-
-    def _text(self, logical_index):
-        h = self.model().headerData(logical_index, self.orientation(),
-                                    Qt.ItemDataRole.DisplayRole)
-        # PySide6 会把 headerData 直接转成 Python 值（多为 str）；兼容 QVariant 旧行为
-        if h is None:
-            return ""
-        if isinstance(h, str):
-            return h
-        return h.toString() if hasattr(h, "toString") else str(h)
-
-    def paintSection(self, painter, rect, logical_index):
-        # 勾选 / 锁定列：不画箭头、文字占满整格，交给基类原样渲染
-        if logical_index in self._no_arrow:
-            super().paintSection(painter, rect, logical_index)
-            return
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        # 背景铺满整格（含箭头带），复刻 QSS：浅底 + 底部 1px 分隔线（悬停略深一档）
-        bg = C["bg_field"] if self.underMouse() else C["disabled_bg"]
-        painter.fillRect(rect, QColor(bg))
-        painter.setPen(QColor(C["border_popup"]))
-        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
-        # 文字：只在「去掉箭头带」的左区绘制并右侧省略，从根上杜绝与箭头重合
-        text_rect = QRect(rect.left(), rect.top(), rect.width() - self.ARROW_W, rect.height())
-        painter.setPen(QColor(C["table_head"]))
-        fm = painter.fontMetrics()
-        avail = max(0, text_rect.width() - self.PAD_L - 2)
-        elided = fm.elidedText(self._text(logical_index),
-                               Qt.TextElideMode.ElideRight, avail)
-        painter.drawText(text_rect.adjusted(self.PAD_L, 0, -2, 0),
-                         int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                         elided)
-        # 箭头：当前排序列=主蓝、方向随内建指示；其余列=淡灰 ▼（默认降序示意）
-        active = self.sortIndicatorSection()
-        if logical_index == active:
-            up = (self.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder)
-            color = QColor(C["primary"])
-        else:
-            up = False
-            color = QColor(C["weak"])
-        self._draw_arrow(painter, rect, up, color)
-        painter.restore()
-
-    def _draw_arrow(self, painter, rect, up, color):
-        cx = rect.right() - self.ARROW_W // 2
-        cy = rect.center().y()
-        w, h = 4, 3
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(color)
-        if up:
-            poly = QPolygonF([QPointF(cx - w, cy + h), QPointF(cx + w, cy + h),
-                              QPointF(cx, cy - h)])
-        else:
-            poly = QPolygonF([QPointF(cx - w, cy - h), QPointF(cx + w, cy - h),
-                              QPointF(cx, cy + h)])
-        painter.drawPolygon(poly)
+# 排序箭头表头（SortableTableHeader）已按「严格按 UI 库样式」移除：
+# 升降序改由表头右键菜单「顺序调整」组承担（TableColumnKit._apply_sort，不画箭头）。
 
 
 class _MarqueeLayer(QWidget):
-    """复制后在选区外画 Excel 式「行走的虚线框」；也可平时给当前选区画一圈实线环。
+    """表格选区叠层：两种画法互斥，永远给「正在操作的那个东西」描边。
+    ① 复制后：在复制过的选区外画 Excel 式「行走的虚线框」（marquee）；
+    ② 平时（show_selection_ring=True）：给**当前单元格 currentIndex** 画一圈实线「活动单元格」
+       蓝框——配合整行选中淡蓝底，即「整行高亮 + 点中的那格再单独描边」（Excel 式）。
     做成 viewport 的透明叠层子控件：任何 QTableWidget 都能获得（不必是 KitTable），
     TableColumnKit attach 时自动挂上——把复制反馈从 KitTable 私有变成全站通用。"""
 
@@ -1383,9 +1273,19 @@ class _MarqueeLayer(QWidget):
         self.update()
 
     def _rect(self, rng):
+        """选区在视口里的包围盒。只在「可见」的列/行上取边界：隐藏列的 visualRect
+        是零宽且塌陷到最左，直接拿 leftColumn/rightColumn（整行选时 rightColumn 常是被
+        字段管理隐藏的最后一列）当边界，会把框压成勾选列左侧的一条竖线（任务中心
+        复制任务ID 单元格即命中）。"""
         m = self._t.model()
-        tl = self._t.visualRect(m.index(rng.topRow(), rng.leftColumn()))
-        br = self._t.visualRect(m.index(rng.bottomRow(), rng.rightColumn()))
+        top, bottom = rng.topRow(), rng.bottomRow()
+        left, right = rng.leftColumn(), rng.rightColumn()
+        vis_cols = [c for c in range(left, right + 1) if not self._t.isColumnHidden(c)]
+        vis_rows = [r for r in range(top, bottom + 1) if not self._t.isRowHidden(r)]
+        if not vis_cols or not vis_rows:
+            return QRect()
+        tl = self._t.visualRect(m.index(vis_rows[0], vis_cols[0]))
+        br = self._t.visualRect(m.index(vis_rows[-1], vis_cols[-1]))
         return QRect(tl.left(), tl.top(),
                      br.right() - tl.left() + 1, br.bottom() - tl.top() + 1)
 
@@ -1403,11 +1303,15 @@ class _MarqueeLayer(QWidget):
             for rng in self._ranges:
                 p.drawRect(self._rect(rng))
         elif self._ring:
-            pen = QPen(QColor(C["primary"]))
-            pen.setWidthF(1.2)
-            p.setPen(pen)
-            for rng in self._t.selectedRanges():
-                p.drawRect(self._rect(rng))
+            # 活动单元格：只给当前格 currentIndex 描一圈主蓝实线框（整行淡蓝底由选中色给出）。
+            # 点击设当前格、方向键移动当前格都会经 currentChanged→update 重画，框跟着点中的格走。
+            idx = self._t.currentIndex()
+            if idx.isValid():
+                pen = QPen(QColor(C["primary"]))
+                pen.setWidthF(1.6)
+                p.setPen(pen)
+                r = self._t.visualRect(idx)
+                p.drawRect(r.adjusted(0, 0, -1, -1))
         p.end()
 
 
@@ -1481,6 +1385,9 @@ class TableColumnKit(QObject):
         table.installEventFilter(self)              # 捕获 Ctrl+C / Esc
         table.viewport().installEventFilter(self)   # 视口尺寸变化时同步叠层
         table.selectionModel().selectionChanged.connect(self._marquee.update)
+        # 活动格随点击/方向键移动：视图自带的 currentChanged 在 PySide6 是虚方法不可 connect，
+        # 改用 selectionModel()（QItemSelectionModel）的同名信号。
+        table.selectionModel().currentChanged.connect(self._marquee.update)
         hh.sectionResized.connect(lambda *a: self._marquee.sync())
         hh.sectionMoved.connect(lambda *a: self._marquee.sync())
         table.verticalScrollBar().valueChanged.connect(lambda *a: self._marquee.sync())
@@ -1695,77 +1602,108 @@ class TableColumnKit(QObject):
         except Exception:
             pass
 
-    def enable_sort_arrows(self, no_arrow_cols=(0,)):
-        """把表格当前水平表头换成 SortableTableHeader（每列画排序箭头）：
-        迁移全局开关 / 默认对齐 / 逐列 resize 模式与列宽 / 可拖动开关，重挂表头右键
-        过滤器与叠层同步信号（旧表头已随之析构），并把 no_arrow_cols 列排除箭头。
+    # enable_sort_arrows 已随排序箭头机制一并移除：升降序走表头右键菜单「顺序调整」组。
 
-        供「想默认开排序箭头、又不想在建表时手写表头」的页面在建表配置完成后调用一次；
-        不需要首点降序以外的排序行为——点击 / 拖列 / 改列宽 / sectionClicked 全沿用内建。
-        返回新表头，供调用方进一步接线（如挂全选框 / 连自定义排序槽）。"""
-        table = self._t
-        old = table.horizontalHeader()
-        ncol = table.columnCount()
-        modes = [old.sectionResizeMode(c) for c in range(ncol)]
-        widths = [table.columnWidth(c) for c in range(ncol)]
-        new = SortableTableHeader()
-        new.setSectionsClickable(old.sectionsClickable())
-        new.setSectionsMovable(old.sectionsMovable())
-        new.setHighlightSections(old.highlightSections())
-        new.setDefaultAlignment(old.defaultAlignment())
-        new.setStretchLastSection(old.stretchLastSection())
-        new.setTextElideMode(old.textElideMode())
-        new.setDefaultSectionSize(old.defaultSectionSize())
-        new.setSortIndicatorShown(False)
-        # 换掉表头（旧表头交给视图销毁）：先装新头，再把逐列配置搬回去
-        table.setHorizontalHeader(new)
-        new.set_no_arrow_cols(no_arrow_cols)
-        for c, m in enumerate(modes):
-            new.setSectionResizeMode(c, m)
-        for c, (m, w) in enumerate(zip(modes, widths)):
-            if m != QHeaderView.ResizeMode.Stretch:      # Stretch 列宽由视图自管，别硬设
-                table.setColumnWidth(c, w)
-        # 本 kit 的表头右键过滤器原装在旧表头上（已析构）：重装到新表头
-        new.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        new.installEventFilter(self)
-        # 复制叠层原连在旧表头的 sectionResized/Moved 上：一并接到新表头，列变动作照同步
-        new.sectionResized.connect(lambda *a: self._marquee.sync())
-        new.sectionMoved.connect(lambda *a: self._marquee.sync())
-        return new
+
+def mount_header_checkbox(table, col, on_toggle, state_provider=None):
+    """在表头某一列挂一枚**可见**的全选勾选框（对标主流后台：勾选列表头就该有个框）。
+
+    为什么需要：以前只有「点表头那一格」才全选，格子上没框，用户根本不知道能全选、
+    也不知去哪全选。这里摆一枚三态框：本页全选=Checked、部分=PartiallyChecked、全不选=Unchecked。
+
+    on_toggle(state): 用户点框后回调（state 为点击后的新勾选态；宿主页据此全选/清空本页）。
+    state_provider(): 返回当前应有的三态；调用方在数据变化后调 cb.sync_state() 同步框态。
+    返回的 QCheckBox 以表头为父，随列宽 / 移动 / 横向滚动自动重定位；并带两个便捷方法：
+    reposition() 重新摆位、sync_state() 按 provider 刷新三态。"""
+    header = table.horizontalHeader()
+    cb = QCheckBox(header)
+    cb.setCursor(Qt.CursorShape.PointingHandCursor)
+    cb.setText("")                       # 只要那个方框，别占文字位
+    # 表头全选框必须和行里的勾选框**一般大**：行勾选框由样式按 PM_IndicatorWidth 绘制（跟随当前
+    # 平台原生尺寸，如 Fusion 14 / mac ≈14 / Windows vista ≈16），而 app 级 QSS 把
+    # QCheckBox::indicator 统一钉成了 18px——直接沿用会让表头比行里的框大一号。这里按本表行
+    # 勾选框的实际尺寸单独给这枚全选框定尺寸（只覆盖 ::indicator 的宽高，圆角/配色仍走全局 QSS），
+    # 使二者在当前平台上像素对齐。
+    ind_w = table.style().pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth, None, table)
+    ind_h = table.style().pixelMetric(QStyle.PixelMetric.PM_IndicatorHeight, None, table)
+    ind_w = ind_w if ind_w > 0 else 14
+    ind_h = ind_h if ind_h > 0 else ind_w
+    # QSS 的 ::indicator width/height 是内容宽、1px 边框另占两侧，外框 = 内容 + 2；
+    # 要让外框＝行勾选框尺寸 ind，就把内容宽设为 ind-2。
+    inner_w = max(9, ind_w - 2)
+    inner_h = max(9, ind_h - 2)
+    cb.setStyleSheet(
+        f"QCheckBox::indicator{{width:{inner_w}px;height:{inner_h}px;}}")
+    guard = {"on": False}
+
+    def reposition():
+        if header.isSectionHidden(col):
+            cb.hide()
+            return
+        w, h = header.sectionSize(col), header.height()
+        x = header.sectionViewportPosition(col)
+        box_w, box_h = ind_w, ind_h       # 与行勾选框同尺寸，在该列水平/垂直居中
+        cb.setGeometry(x + max(0, (w - box_w) // 2), max(0, (h - box_h) // 2), box_w, box_h)
+        cb.show()
+        cb.raise_()
+
+    def sync_state():
+        if state_provider is None:
+            return
+        guard["on"] = True               # 程序设态不触发 on_toggle（否则会误全选/清空）
+        cb.setCheckState(state_provider())
+        guard["on"] = False
+
+    def _changed(_state):
+        if guard["on"]:
+            return
+        on_toggle(cb.checkState())
+        sync_state()                       # 宿主改完行勾选后回写真实三态
+
+    cb.stateChanged.connect(_changed)
+    cb.reposition = reposition
+    cb.sync_state = sync_state
+    for sig in (header.sectionResized, header.sectionMoved, header.geometriesChanged):
+        sig.connect(lambda *a: reposition())
+    table.horizontalScrollBar().valueChanged.connect(lambda *a: reposition())
+    reposition()
+    return cb
 
 
 class KitTable(QTableWidget):
     """全站标准表格（UI 库基准）：把各页在裸 QTableWidget 上反复手写的公共装配收敛成一处，
-    页面按需传参、不再各自拼配置。默认形态＝最常见的「只读 · 整行选 · 斑马纹 · 单行省略 ·
-    隐藏行号」数据表；差异化用构造参数表达。
+    页面按需传参、不再各自拼配置。默认形态＝最常见的「首列勾选框 · 只读 · 整行选 · 斑马纹 ·
+    单行省略 · 隐藏行号」数据表；差异化用构造参数表达。
 
     构造参数（均关键字，默认值＝全站基准形态）：
+      checkbox      首列（第 0 列）作为标准勾选列：固定窄宽、居中，表头挂一枚三态
+                    全选框（点它全选 / 全不选本页）；默认 True。不需要批量勾选的表传 False。
+                    页头传 headers 时第 0 项给空串（表头由勾选框占据）。
       zebra         交替行底色（斑马纹）；默认 True。
       row_number    左侧行号列（纵向表头）显隐；默认 False（隐藏）。
       select        选择行为：'rows' 整行 / 'items' 单元格 / None 不可选；默认 'rows'。
       multi         True 可连续多选(Extended) / False 单选(Single)；select=None 时无意义。
       edit          True 双击/按键内联编辑（Excel 式）/ False 只读；默认 False。
-      sort_arrows   True 表头换成 SortableTableHeader（每列画排序箭头、首点降序）；默认 False。
-      no_arrow_cols sort_arrows 下不画箭头的列（如勾选列）；默认 ()。
 
-    列对齐 / 换行 / Ctrl+C 复制行走虚线框 / 表头右键多级菜单 / 偏好持久化统一由内部
-    TableColumnKit（self._colkit）承担。页面专属行为（自定义委托如进度条、单元格业务右键
-    菜单 CustomContextMenu、拖拽锁列、表头全选框、setSortingEnabled）一律作「单独微调」在
-    构造后自行接线——KitTable 不强行覆盖这些，构造里设的 NoContextMenu / NoEditTriggers /
-    默认委托都是可被页面后续 set 掉的初值。"""
+    对外勾选 API（checkbox=True 时可用）：make_check_item / set_all_checked / checked_rows /
+    is_row_checked / set_row_checked / refresh_check_all_state；信号 check_all_toggled(bool)
+    在点表头全选框时发出（True=全选、False=清空）。
+
+    列对齐 / 换行 / Ctrl+C 复制行走虚线框 / 表头右键多级菜单（含「顺序调整」升降序）/
+    偏好持久化统一由内部 TableColumnKit（self._colkit）承担。页面专属行为（自定义委托如
+    进度条、单元格业务右键菜单 CustomContextMenu、拖拽锁列）一律作「单独微调」在构造后自行
+    接线——KitTable 不强行覆盖这些，构造里设的 NoContextMenu / NoEditTriggers / 默认委托
+    都是可被页面后续 set 掉的初值。"""
+
+    check_all_toggled = Signal(bool)     # 点表头全选框：True=全选本页 / False=清空
 
     def __init__(self, rows, cols, headers, parent=None, *,
-                 zebra=True, row_number=False, select="rows", multi=True,
-                 edit=False, sort_arrows=False, no_arrow_cols=()):
+                 checkbox=True, zebra=True, row_number=False,
+                 select="rows", multi=True, edit=False):
         super().__init__(rows, cols, parent)
         self.setHorizontalHeaderLabels(headers)
-        # 表头：需要排序箭头时在建表之初就换上 SortableTableHeader，之后逐列配置（列宽 /
-        # resize 模式 / sectionClicked 连线）都落在这张表头上，避免事后换头冲掉既有连线；
-        # 勾选 / 锁定列（no_arrow_cols）不画箭头。
-        if sort_arrows:
-            hdr = SortableTableHeader()
-            hdr.set_no_arrow_cols(list(no_arrow_cols))
-            self.setHorizontalHeader(hdr)
+        self.check_col = 0 if checkbox else None
+        self._hdr_check = None
         hh = self.horizontalHeader()
         hh.setSectionsClickable(True)
         hh.setHighlightSections(False)
@@ -1812,10 +1750,74 @@ class KitTable(QTableWidget):
         # （单一真源）：都在 TableColumnKit 里，KitTable 仅复用、不再自带一份。放在 wordWrap 已置
         # False 之后创建，装配器读到的初始 _wrap 才与实际一致。
         self._colkit = TableColumnKit(self, baseline_h=38, show_selection_ring=True)
+        # 标准勾选列：第 0 列固定窄宽、居中，表头挂一枚三态全选框（点它全选/清空本页）。
+        # 全选框三态由本表第 0 列各行勾选态自动算出，页面只管往第 0 列塞 make_check_item，
+        # 并连 check_all_toggled 信号把全选/清空落到自己的业务选中集上。
+        if checkbox:
+            self._setup_check_column()
 
     def add_header_menu(self, title, items, key=None):
         """追加 / 覆盖一组表头右键菜单项（转发给内部 TableColumnKit，页面据此扩展标准菜单）。"""
         self._colkit.add_header_menu(title, items, key=key)
+
+    # ---------- 标准勾选列（checkbox=True 时启用）----------
+    def _setup_check_column(self):
+        self.setColumnWidth(self.check_col, 44)
+        self.horizontalHeader().setSectionResizeMode(
+            self.check_col, QHeaderView.ResizeMode.Fixed)
+        self._hdr_check = mount_header_checkbox(
+            self, self.check_col, self._on_hdr_check_toggle, self._check_all_state)
+
+    def _on_hdr_check_toggle(self, state):
+        # 表头全选框被点：点成 Checked→请求全选；其余（含从部分点过来）→请求清空。
+        # 页面在 check_all_toggled 槽里把勾选落到各行 + 同步业务选中集；mount_header_checkbox
+        # 会在本回调返回后自动 sync_state() 回写真实三态，这里无需再手动刷新。
+        self.check_all_toggled.emit(state == Qt.CheckState.Checked)
+
+    def _check_all_state(self):
+        """表头全选框三态：本页全选=Checked、部分=Partially、全不选=Unchecked。"""
+        items = [self.item(r, self.check_col) for r in range(self.rowCount())]
+        items = [it for it in items if it is not None]
+        if not items:
+            return Qt.CheckState.Unchecked
+        n = sum(1 for it in items if it.checkState() == Qt.CheckState.Checked)
+        if n == 0:
+            return Qt.CheckState.Unchecked
+        if n == len(items):
+            return Qt.CheckState.Checked
+        return Qt.CheckState.PartiallyChecked
+
+    def make_check_item(self, checked=False):
+        """造一枚标准勾选单元格（放第 0 列用）：可勾选 + 居中；页面再 setData/tooltip 挂业务值。"""
+        it = QTableWidgetItem()
+        it.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        return it
+
+    def is_row_checked(self, row):
+        it = self.item(row, self.check_col)
+        return it is not None and it.checkState() == Qt.CheckState.Checked
+
+    def set_row_checked(self, row, checked):
+        it = self.item(row, self.check_col)
+        if it is not None:
+            it.setCheckState(Qt.CheckState.Checked if checked
+                             else Qt.CheckState.Unchecked)
+
+    def checked_rows(self):
+        return [r for r in range(self.rowCount()) if self.is_row_checked(r)]
+
+    def set_all_checked(self, checked):
+        """把当前所有行勾选框设成 checked（只画格子勾选态，不碰页面业务选中集——
+        页面若需同步选中集，连 check_all_toggled 在自己的槽里处理）。"""
+        for r in range(self.rowCount()):
+            self.set_row_checked(r, checked)
+
+    def refresh_check_all_state(self):
+        """数据 / 勾选变化后刷新表头全选框三态（页面在 itemChanged / 重建表后调用）。"""
+        if self._hdr_check is not None:
+            self._hdr_check.sync_state()
 
     def _sync_tooltip(self, it):
         # setToolTip 也会触发 dataChanged→itemChanged，不同值才写，避免无限回环
@@ -1923,26 +1925,201 @@ class ModernDateEdit(QDateEdit):
             cal.setStyleSheet(_CAL_QSS)
 
 
-class _FlowKpiCard(KpiCard):
-    """画廊演示用：宽度钉成固定 W（供 FlowLayout 按此宽定位），高度只当“最小高”。
-    原生 KpiCard 内部 value/name 两个 QLabel 与固定 96px 的 spark 会把自身最小宽撑到 ~310，
-    setFixedWidth 压不动它（而 FlowLayout 又是按 sizeHint 定位）；这里显式覆盖 sizeHint
-    把宽锁到目标宽，高度取 max(最小高, 内容自然高)——内容装不下时卡片会自己长高。
-    （FlowLayout 按 sizeHint 定位、并用 sizeHint().height() 设行高，所以高度只要写进 sizeHint 即可自适应。）"""
+class KpiBand(QWidget):
+    """KPI 指标带：一排 KpiCard 的自适应容器（数据中台顶部的指标条即用它）。
 
-    def __init__(self, w, min_h, name, icon, color, parent=None):
-        super().__init__(name, icon, color, parent)
-        self._fw, self._minh = w, min_h
-        self.value.setMinimumWidth(0)     # 放开数字标签最小宽（spark 的最小宽由调用方放开）
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+    解决的问题：旧版把 7 张卡硬塞进一个 QHBoxLayout，窗口不够宽时每张被压到 ~120px，
+    卡片底部的环比百分比文字与右侧的趋势线叠在一起、糊成一片。这里按可用宽度算出
+    「一行塞得下几张」（低于舒适最小宽就不加列），从源头杜绝挤压：
 
-    def sizeHint(self):
-        # 宽固定；高取“最小高”与“内容自然高”的较大值，让内容多时卡片自动长高
-        natural = super().sizeHint().height()
-        return QSize(self._fw, max(self._minh, natural))
+    · 折叠态只排一行（能塞几张算几张），选中的多出来的藏起来，右侧给「展开」；
+    · 展开态按同一列数换行，把选中的指标全列出来（网格等宽拉伸，与单行观感一致）；
+    · 「⚙ 指标」勾选决定哪些字段参与展示；选择与展开态各发一个信号，持久化交给使用方
+      （本容器不认识 app_state，也不认识业务口径——只管「摆哪、摆几张、摆几行」）。
 
-    def minimumSizeHint(self):
-        return QSize(self._fw, self._minh)
+    卡片的数值 / 环比 / 趋势线仍由使用方经 card(key) 现算现喂；def 里的 tooltip 承载
+    该指标的计算口径（悬停即见），满足「KPI 卡片要配套它的计算逻辑」。"""
+
+    selectionChanged = Signal(list)     # 选中的 key 列表（按定义顺序）
+    expandedChanged = Signal(bool)      # 展开 / 折叠
+
+    MIN_CARD = 140          # 单张卡绝对下限宽：只用于防被压到 0，不再拿它当“舒适宽”算列数
+    SPACING = 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._defs = []
+        self._cards = {}
+        self._selected = []
+        self._expanded = False
+        # 防抖 + 重入锁 + 宽度记忆：三者兼顾“杜绝同步递归崩溃”与“不再误跳显示”
+        self._relaying = False
+        self._handled_w = -1      # 上次真正按之重排的宽度；纯高度抖动引发的 resize 据此跳过
+        self._rl = QTimer(self)   # 去抖：把 resize 触发的重排推到下一轮事件循环，不在同一调用栈里递归
+        self._rl.setSingleShot(True)
+        self._rl.setInterval(0)
+        self._rl.timeout.connect(self._relayout)
+        # picker：使用方注入的「选哪些字段 + 排序」回调 (band)->新的有序可见 key 列表（None=不改）。
+        # 数据中台 / 任务中心都接「字段管理」同款弹窗，故把弹层选择交给页面，本容器不依赖 tablekit。
+        self.picker = None
+        v = QHBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(self.SPACING)
+        self._grid_w = QWidget()
+        self._grid_w.setStyleSheet("background:transparent;")
+        self._grid = QGridLayout(self._grid_w)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(self.SPACING)
+        self._grid.setVerticalSpacing(self.SPACING)
+        v.addWidget(self._grid_w, 1)
+        # 右侧竖排控制栏：顶对齐→与首行卡片同一水平带，不再单独占一整行。
+        # 容器仍叫 ctrl（下面 ctrl.addWidget 沿用），但它是装进 self._rail 的竖向布局。
+        self._rail = QWidget()
+        self._rail.setStyleSheet("background:transparent;")
+        ctrl = QVBoxLayout(self._rail)
+        ctrl.setContentsMargins(0, 0, 0, 0)
+        ctrl.setSpacing(6)
+        self.b_expand = QPushButton("▼ 展开")
+        self.b_expand.setObjectName("GhostBtn")
+        self.b_expand.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.b_expand.clicked.connect(self._toggle_expand)
+        self.b_expand.hide()
+        self.b_pick = QPushButton("⚙ 指标")
+        self.b_pick.setObjectName("GhostBtn")
+        self.b_pick.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.b_pick.setToolTip("勾选要在顶部用 KPI 卡展示的字段")
+        self.b_pick.clicked.connect(self._open_picker)
+        ctrl.addWidget(self.b_pick)
+        ctrl.addWidget(self.b_expand)
+        ctrl.addStretch(1)
+        v.addWidget(self._rail, 0, Qt.AlignmentFlag.AlignTop)
+
+    # ---------- 装配 ----------
+    def set_defs(self, defs):
+        """defs = [{key,name,icon,color,tooltip,default,spark}]：一次性建好所有卡片，
+        可见性交给 _relayout 管。重复调用会先清掉旧卡片。"""
+        for card in self._cards.values():
+            self._grid.removeWidget(card)
+            card.setParent(None)
+            card.deleteLater()
+        self._cards = {}
+        self._defs = list(defs)
+        for d in self._defs:
+            card = KpiCard(d["name"], d["icon"], d["color"])
+            card.setMinimumWidth(self.MIN_CARD)
+            if d.get("tooltip"):
+                card.setToolTip(d["tooltip"])
+            self._cards[d["key"]] = card
+        self._selected = [d["key"] for d in self._defs if d.get("default", True)]
+        self._relayout()
+
+    def card(self, key):
+        return self._cards.get(key)
+
+    def keys(self):
+        return [d["key"] for d in self._defs]
+
+    def selected(self):
+        return list(self._selected)
+
+    def meta(self, key):
+        return next((d for d in self._defs if d["key"] == key), None)
+
+    # ---------- 选择 / 展开（供使用方回填持久化状态，notify=False 不反向触发保存） ----------
+    def set_selected(self, keys, notify=True):
+        # 保留传入 keys 的顺序：「字段管理」弹窗右侧可拖拽排序，回填时顺序即用户意图，
+        # 不能再用 _defs 顺序重排把拖拽结果抹掉。只过滤掉非法 key。
+        known = {d["key"] for d in self._defs}
+        valid = [k for k in (keys or []) if k in known]
+        self._selected = valid or [d["key"] for d in self._defs][:1]
+        self._relayout()
+        if notify:
+            self.selectionChanged.emit(self._selected)
+
+    def set_expanded(self, on, notify=True):
+        self._expanded = bool(on)
+        self._relayout()
+        if notify:
+            self.expandedChanged.emit(self._expanded)
+
+    def relayout(self):
+        """供使用方在改了会影响卡片宽度的东西（如挂上/摘掉趋势折线）后手动触发重排：
+        折线一上卡，卡的 sizeHint 会变宽，若不在下一轮 resize 前重算列数，就会短暂
+        撑出横向滚动条。列数由本容器根据宽度自定，使用方无需传参。"""
+        self._relayout()
+
+    # ---------- 排布 ----------
+    def _fit_cols(self):
+        """当前宽度一行塞得下几张——按选中卡片各自的**真实 sizeHint 宽**取最大值当舒适宽来算，
+        而不是写死一个常量：带趋势折线的卡天然更宽（折线固定 96px + 图标 + 长名称≈260），
+        纯数字卡窄得多（任务中心无折线≈150）。用实测舒适宽才能做到「根据卡片长度 + 窗口宽度
+        灵活显示」：够塞几张就几张，绝不把一行撑得超过视口宽（也就杜绝了横向滚动条、
+        以及卡片被挤叠、首张卡滚出视口左侧看起来「消失」的问题）。"""
+        active = [self._cards[k] for k in self._selected if k in self._cards]
+        if not active:
+            return 1
+        unit = max([self.MIN_CARD] + [c.sizeHint().width() for c in active])
+        # 扣掉右侧控制栏占的宽（顶对齐与首行同高）。展开键到底亮不亮取决于列数（循环依赖），
+        # 故不看它当前可见否，而按「是否可能有溢出」（选中数>1）预先为它保留一份宽，
+        # 避免“先算窄控制栏→多列→再亮展开键→变挤”的瞬态。只选一张时永不需要展开键。
+        pick_w = self.b_pick.sizeHint().width()
+        expand_w = self.b_expand.sizeHint().width() if len(active) > 1 else 0
+        rail = max(pick_w, expand_w)
+        avail = max(self.width() - rail - self.SPACING, unit)
+        return max(1, int((avail + self.SPACING) // (unit + self.SPACING)))
+
+    def _relayout(self):
+        # 重入保护：重排内部的 show/hide/addWidget 可能同步派发回 resize 事件，
+        # 若此时正在重排就直接忽略（去抖定时器会在下一轮再补一次），断开同步递归。
+        if self._relaying:
+            return
+        self._relaying = True
+        try:
+            self._handled_w = self.width()
+            while self._grid.count():
+                self._grid.takeAt(0)
+            for col in range(self._grid.columnCount()):
+                self._grid.setColumnStretch(col, 0)
+            cols = self._fit_cols()
+            active = [self._cards[k] for k in self._selected if k in self._cards]
+            show = active if self._expanded else active[:cols]
+            for c in self._cards.values():
+                c.hide()
+            for i, c in enumerate(show):
+                r, col = divmod(i, cols)
+                self._grid.addWidget(c, r, col)
+                c.show()
+            # 只给真正占用的列拉伸：折叠单行时占用列数＝卡片数（可能少于 cols），多给空列
+            # 拉伸会在末尾留出一格空白——把拉伸严格限制在实际占用列，杜绝这种幽灵间隔。
+            used_cols = min(cols, len(show)) if show else 1
+            for col in range(used_cols):
+                self._grid.setColumnStretch(col, 1)
+            overflow = len(active) > cols
+            self.b_expand.setVisible(overflow)
+            if overflow:
+                self.b_expand.setText("▲ 收起" if self._expanded else "▼ 展开")
+        finally:
+            self._relaying = False
+
+    def _toggle_expand(self):
+        self.set_expanded(not self._expanded)
+
+    def _open_picker(self):
+        """「选哪些字段用卡片展示 + 排序」交给注入的 picker（复用「字段管理」弹窗）；
+        回调返回新的有序可见 key 列表，None 或空视为未改动。没接 picker 就是空操作。"""
+        if self.picker is None:
+            return
+        keys = self.picker(self)
+        if keys:
+            self.set_selected(keys)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._relaying:
+            return                                  # 重排内部的同步再入，直接忽略
+        if self.width() == self._handled_w:
+            return                                  # 宽度未变（多为换行数变→带高变→又回环 resize）无需重排
+        self._rl.start(0)                           # 去抖：合并连续 resize，推到下一轮事件循环再重排
 
 
 # --------------------------------------------------------------------

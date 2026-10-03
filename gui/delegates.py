@@ -6,14 +6,20 @@ ProgressDelegate：running 状态绘制「渐变填充 + 往复流动光带」�
 import math
 
 from PySide6.QtCore import Qt, QRectF, QSize, QTimer, QElapsedTimer
-from PySide6.QtGui import QColor, QPainter, QFont, QPen, QLinearGradient
-from PySide6.QtWidgets import QStyledItemDelegate, QAbstractItemView
+from PySide6.QtGui import QColor, QPainter, QFont, QPen, QLinearGradient, QPalette
+from PySide6.QtWidgets import QAbstractItemView, QStyle, QStyleOptionViewItem
+
+from gui.kit import _KitItemDelegate
 
 # 自定义数据角色：填充行数据时用 item.setData(ProgressRole, 0-100) 写入
 ProgressRole = Qt.ItemDataRole.UserRole + 11
 
 
-class ProgressDelegate(QStyledItemDelegate):
+class ProgressDelegate(_KitItemDelegate):
+    """任务中心专用委托：在 UI 库标准单元格委托 _KitItemDelegate 的基础上，
+    给带 ProgressRole 的行额外自绘动画进度条。继承而非直接拿 QStyledItemDelegate，
+    是为了不弄丢库基准的「去原生焦点虚框 / 内联编辑框样式」——否则任务中心
+    会比其他 KitTable 多出一圈原生焦点框，看着像没套用库样式。"""
     BAR_H = 18
     ANIM_INTERVAL = 60          # ms：光带刷新间隔
 
@@ -46,6 +52,20 @@ class ProgressDelegate(QStyledItemDelegate):
                 viewport.update()
 
     # ---------- 绘制 ----------
+    def _paint_cell_bg(self, painter, option):
+        """进度格的单元格底色：与其他列一致地响应选中/悬停/斑马纹。
+        进度格是自绘的（不走 QStyledItemDelegate 的背景绘制），若不补底色，整行
+        高亮时它是唯一不跟着亮的一块死角。#EAF1FF / #F7F8FA 与 gui.theme QSS 里
+        ::item:selected / ::item:hover 同值，保证与普通列高亮一致。"""
+        st = option.state
+        if st & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect, QColor("#EAF1FF"))
+        elif st & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(option.rect, QColor("#F7F8FA"))
+        elif option.features & QStyleOptionViewItem.Feature.AlternateBackground:
+            painter.fillRect(option.rect,
+                             option.palette.brush(QPalette.ColorRole.AlternateBase).color())
+
     def paint(self, painter, option, index):
         pct = index.data(ProgressRole)
         # 非进度条单元格：走默认绘制
@@ -55,6 +75,7 @@ class ProgressDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._paint_cell_bg(painter, option)   # 先铺底色（悬停/选中/斑马纹），再叠进度条
         rect = option.rect.adjusted(6, 4, -6, -4)
         pct = max(0, min(int(pct), 100))
 
