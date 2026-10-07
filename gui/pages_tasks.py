@@ -1245,23 +1245,24 @@ class TasksPage(QWidget):
                             + "\n标签词库在「设置 → 🏷 内容标签」里维护")
         elif c == COL_REMARK:
             rk = str(row["备注"])
-            item.setText(rk[:24])
-            item.setToolTip((rk or "（双击可写备注，支持先勾选再批量写）")
-                            if not rk or len(rk) <= 24 else rk)
+            # 存全量、靠 Qt 的 ElideRight 视觉截断：早先在这里 [:24] 截断，导致拖选一列
+            # Ctrl+C 只拿到前半段（复制读的是 item.text()）；全文另由悬停浮层从行数据取。
+            item.setText(rk)
+            item.setToolTip(rk or "（双击可写备注，支持先勾选再批量写）")
         elif c == COL_JOB:
             item.setText(str(row["job_id"]))
             item.setToolTip(str(row["job_id"]))
         elif c == COL_URL:
             u = str(row["URL"])
-            item.setText(u[:40])
+            item.setText(u)          # 存全量（[:40] 会让复制丢尾），显示交给 ElideRight
             item.setToolTip(u)
         elif c == COL_SCRIPT:
             s = str(row["脚本"])
-            item.setText(s[:30])
+            item.setText(s)                              # 存全量（[:30] 会让复制丢尾），显示交给 ElideRight
             item.setToolTip("")                          # 单击/空格看全文
         elif c == COL_PROMPT:
             p = str(row["提示词"])
-            item.setText(p[:40])
+            item.setText(p)                              # 存全量（[:40] 会让复制丢尾），显示交给 ElideRight
             item.setToolTip("")                          # 用悬停浮层替代默认气泡
         elif c == COL_STATUS:
             show = status or "待执行"
@@ -1323,7 +1324,7 @@ class TasksPage(QWidget):
         elif c == COL_CANCEL:
             item.setData(Qt.ItemDataRole.DisplayRole, int(row["取消次数"] or 0))
         elif c == COL_VOICE:
-            item.setText(str(row["口播文案"])[:30])
+            item.setText(str(row["口播文案"]))            # 存全量（[:30] 会让复制丢尾），显示交给 ElideRight
             item.setToolTip("")
         elif c == COL_STORY:
             try:
