@@ -29,7 +29,7 @@ from gui.pages_remix import RemixPage
 from gui.pages_local_build import LocalBuildPage
 from gui.pages_ui_kit import UiKitPage
 from gui.menus import StyledMenu
-from gui.tools_registry import LAUNCHER_TOKEN, HOME_TOKEN, RESERVED_TOKENS
+from gui.tools_registry import LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN, RESERVED_TOKENS
 from gui.window_foreground import raise_to_front
 from store import app_state
 
@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
         # 数据中台第 0 项、默认选中（执行记录已并入数据中台弹窗，不再单列）
         self.nav.currentRowChanged.connect(self._on_nav_row)
         self._rebuild_nav()
+        self._ensure_default_page()      # 页 0 所属模块被关掉时，落到第一个可见页
 
         # ----- 侧栏底部：只留两个按钮——输出文件夹 + 登录/当前用户 -----
         # 登录按账号定身份：点按钮弹框输成员姓名+密码，登上来是什么角色就是什么角色；
@@ -189,6 +190,7 @@ class MainWindow(QMainWindow):
         self.apply_tool_shortcuts()
         self.apply_launcher_shortcut()
         self.apply_home_shortcut()          # 默认不给键，设了才注册
+        self.apply_recorder_shortcut()      # 录屏开/停（默认 Ctrl+Alt+R，可在设置改）
         self.apply_launcher_ball()          # 桌面悬浮球：开关关着就什么都不做
         self._update_identity()
 
@@ -302,11 +304,16 @@ class MainWindow(QMainWindow):
             for row, (kind, _v) in enumerate(self._nav_rows):
                 if kind == "group":
                     return row
+        # 目标页没进导航（所属模块被关掉）：落到第一个可见页面行，别死停在 0
+        for row, (kind, _v) in enumerate(self._nav_rows):
+            if kind == "page":
+                return row
         return 0
 
     # ---------- 导航：基础 7 页 + 素材工坊折叠组 + 组织结构(admin) + 固定工具（插到「设置」前面）+ 接口管理 ----------
     def _rebuild_nav(self):
         """按 app_state 里的固定列表重拼导航；选中页不变（行号可能因插入而顺移）"""
+        from core import modules
         from gui.pages_tools import TOOLS
         from store import org_store
         icons = {n: ico for n, ico, _d, _f in TOOLS}
@@ -320,16 +327,22 @@ class MainWindow(QMainWindow):
                 if org_store.is_admin():
                     rows.append(("page", 8))
                     items.append("🏢  组织结构")
-                for name in load_pinned():
-                    rows.append(("tool", name))
-                    items.append(f"{icons.get(name, '🧰')}  {name}")
-            if idx == 5:                          # 「素材工坊」分组插在「新手入门」前一位
+                # 固定工具项归「工具中心」模块：关掉工具中心就不露这些入口
+                if modules.is_enabled(modules.MODULE_TOOLS):
+                    for name in load_pinned():
+                        rows.append(("tool", name))
+                        items.append(f"{icons.get(name, '🧰')}  {name}")
+            if idx == 5 and modules.workshop_visible():   # 「素材工坊」分组插在「新手入门」前一位
                 rows.append(("group", "workshop"))
                 items.append(f"🗂  素材工坊 {'▾' if ws_open else '▸'}")
                 if ws_open:
                     for ctext, cidx in _WORKSHOP_PAGES:
+                        if not modules.page_visible(cidx):
+                            continue
                         rows.append(("page", cidx))
                         items.append(f"　　└ {ctext}")
+            if not modules.page_visible(idx):     # 模块关掉：这一页的入口收起
+                continue
             rows.append(("page", idx))
             items.append(text)
         if self._api_revealed:
@@ -351,6 +364,22 @@ class MainWindow(QMainWindow):
         if tray is not None and getattr(tray, "_menu", None) is not None:
             # 托盘装配还早，这里得先问过有没有（启动即 AttributeError 最冤）
             tray._rebuild_menu()                 # 托盘里的「固定工具」子菜单跟着走
+
+    def _ensure_default_page(self):
+        """默认落地页兜底：若页 0（数据中台）所属模块被关掉，切到第一个可见页。
+
+        开发/绿色/全开时页 0 恒可见，这里等价于什么都不做，零回归。"""
+        from core import modules
+        if modules.page_visible(self.pages.currentIndex()):
+            return
+        for row, (kind, val) in enumerate(self._nav_rows):
+            if kind == "page":
+                self.pages.setCurrentIndex(val)
+                self.nav.blockSignals(True)
+                self.nav.setCurrentRow(row)
+                self._page_row = row
+                self.nav.blockSignals(False)
+                return
 
     def _on_nav_row(self, row):
         if not (0 <= row < len(self._nav_rows)):
@@ -450,26 +479,75 @@ class MainWindow(QMainWindow):
         """按「设置 → 唤出面板 → 桌面悬浮球」开关显示/收起那颗悬浮球。
 
         关：收起球并关掉扇形菜单。开：重建球（show_launcher_ball 内部先收旧的，
-        同一时刻只留一颗），接上单击/双击/右键三个入口。球常驻，扇形懒建。
+        同一时刻只留一颗）。本版交互改为"移入展开、移出收起"：球 hover 展开扇形，
+        球与扇形谁被移到都往同一条宽限期计时器上报到，两端都离开才算收。
         """
         from gui import launcher_ball
         if not app_state.get("launcher_ball_on"):
             launcher_ball.hide_launcher_ball()
             if getattr(self, "_fan", None) is not None:
                 self._fan.hide_menu()
+            self._fan_cancel_collapse()
             return
         self._ball = launcher_ball.show_launcher_ball(
-            self._on_ball_single, self._on_ball_double,
+            self._fan_expand, self._on_ball_double,
             on_search=self._summon_launcher,
-            on_config=self._on_ball_config, on_index=self._on_ball_index)
+            on_config=self._on_ball_config, on_index=self._on_ball_index,
+            on_leave=self._fan_schedule_collapse)
 
-    # ---------- 悬浮球：单击展开扇形 / 双击开主程序 / 右键入口 ----------
-    def _on_ball_single(self):
-        """点球：以球为极点朝屏内展开扇形功能菜单（再点一下收起）。"""
+    # ---------- 悬浮球：移入展开扇形 / 双击开主程序 / 右键入口 ----------
+    def _fan_collapse_timer(self):
+        """宽限期计时器（懒建）：球与扇形都离开后，过了这个点还没回到任一区域就收起。"""
+        t = getattr(self, "_fan_collapse", None)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(320)
+            t.timeout.connect(self._fan_do_collapse)
+            self._fan_collapse = t
+        return t
+
+    def _pointer_in_launcher(self):
+        """当前全局鼠标点是否落在球或扇形任一窗口矩形里（宽限期到点时的几何裁决）。"""
+        from PySide6.QtGui import QCursor
+        gp = QCursor.pos()
+        for w in (getattr(self, "_fan", None), getattr(self, "_ball", None)):
+            if w is not None and w.isVisible() and w.geometry().contains(gp):
+                return True
+        return False
+
+    def _fan_do_collapse(self):
+        """宽限期到点：用全局鼠标坐标亲自再确认一次——只要还在球/扇形任一矩形里就不收。
+
+        不只靠 Enter/Leave 的先后：那两者在不同系统/窗口叠加下到达顺序不定，正是以前
+        “球穿到扇形半路被误收”反复抽风的根因，改成几何判断就与顺序无关了。"""
+        fan = getattr(self, "_fan", None)
+        if fan is None or not fan.isVisible():
+            return
+        if self._pointer_in_launcher():
+            return                    # 手还在区域里：保持展开，下次真离开会重新起计
+        fan.hide_menu()
+
+    def _fan_expand(self):
+        """鼠标移入球：取消待收起，以球为极点朝屏内展开扇形功能菜单。"""
         from gui.launcher_fan import LauncherFan, load_fan_items
+        self._fan_cancel_collapse()
         if getattr(self, "_fan", None) is None:
-            self._fan = LauncherFan(self._on_fan_pick, self._on_fan_changed)
-        self._fan.toggle(getattr(self, "_ball", None), load_fan_items())
+            self._fan = LauncherFan(self._on_fan_pick, self._on_fan_changed,
+                                    on_enter=self._fan_cancel_collapse,
+                                    on_leave=self._fan_schedule_collapse)
+        if not self._fan.isVisible():
+            self._fan.popup(getattr(self, "_ball", None), load_fan_items())
+
+    def _fan_schedule_collapse(self):
+        """球或扇形任一处 Leave：启动宽限期（途中回到另一处会被 _fan_cancel_collapse 抹掉）。"""
+        self._fan_collapse_timer().start()
+
+    def _fan_cancel_collapse(self):
+        """鼠标进到球/扇形任一区域：取消待收起，避免穿越两窗间隙时被误收。"""
+        t = getattr(self, "_fan_collapse", None)
+        if t is not None:
+            t.stop()
 
     def _on_fan_pick(self, item):
         """扇形项点落：智能混合——工具弹独立面板、搜索弹唤出面板、页面开主窗口到对应页。"""
@@ -544,6 +622,53 @@ class MainWindow(QMainWindow):
         sc.activated.connect(self.show_home)
         self._home_scuts.append(sc)
         self._log_hotkeys("主界面键")
+
+    def apply_recorder_shortcut(self):
+        """录屏开/停键：默认 Ctrl+Alt+R，全局优先，注册不上（被占/非 Windows）退回窗口内。
+
+        与总唤出/主界面键同口径：都活在主窗口（而非面板自己），所以面板从没开过也能按；
+        命中后由 toggle_record 去找/开面板并开停（录制中宿主窗被隐藏也照样找得到）。"""
+        from gui import global_hotkey as ghk
+        from gui.tools_registry import recorder_shortcut
+        seq = recorder_shortcut()
+        hk = ghk.manager
+        for s in getattr(self, "_rec_scuts", []):
+            s.setEnabled(False)
+            s.setParent(None)
+        self._rec_scuts = []
+        hk.forget(RECORDER_TOKEN)
+        if not seq:
+            return
+        if hk.available() and hk.register(RECORDER_TOKEN, seq):
+            hk.set_callback(RECORDER_TOKEN, lambda _t=None: self.toggle_record())
+            self._log_hotkeys("录屏开停键")
+            return
+        sc = QShortcut(QKeySequence(seq), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self.toggle_record)
+        self._rec_scuts.append(sc)
+        self._log_hotkeys("录屏开停键")
+
+    def toggle_record(self):
+        """录屏开/停热键动作：正在录→停；否则→打开（或唤起）录屏面板并开录。
+
+        面板实例在录制期间即使宿主窗被 hide 也仍挂在 page_tools._dialogs，按工具名取用即可，
+        不走 opened_tool（那个按可见性过滤，正录着时反而拿不到）。"""
+        name = "屏幕录制"
+        page = getattr(self, "page_tools", None)
+        if page is None:
+            return
+        dialogs = getattr(page, "_dialogs", None) or {}
+        dlg = dialogs.get(name)
+        panel = getattr(dlg, "panel", None) if dlg is not None else None
+        if panel is not None and panel.is_recording():
+            panel.toggle_record()
+            return
+        page.open_tool(name)                    # 未开则建窗并显示（_start_rec 需要可见宿主窗）
+        dlg = (getattr(page, "_dialogs", None) or {}).get(name)
+        panel = getattr(dlg, "panel", None) if dlg is not None else None
+        if panel is not None:
+            panel.toggle_record()
 
     def show_home(self):
         """把主界面拉回眼前：藏在托盘、最小化、被压在其它窗口下面都要露出来。
@@ -647,6 +772,9 @@ class MainWindow(QMainWindow):
         """托盘菜单/全局热键共用：藏在托盘时只抬工具窗，不弹主窗口
 
         （按 Ctrl+Alt+1 的人是要直接干活，不是来看导航的）。"""
+        from core import modules
+        if not modules.page_visible(4):     # 工具中心被关掉：热键/托盘也不再弹工具窗
+            return
         self.page_tools.open_tool(name)
         dlg = self.page_tools.opened_tool(name)
         if dlg is not None:

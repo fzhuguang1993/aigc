@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import Qt, QPoint, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QWidget, QApplication, QMenu
+from PySide6.QtCore import Qt, QPoint, QPointF, QTimer, QRectF
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtWidgets import QWidget, QApplication, QMenu, QToolTip
 
 from store import app_state
 
@@ -48,10 +48,28 @@ def _page_items():
             (13, "批量基建", "🏗"), (6, "设置", "⚙️")]
 
 
+def _item_visible(item):
+    """扇形项是否该出现：按其所属模块的启用状态过滤。
+
+    search / tool 都归「工具中心」（搜索面板、工具都靠 summon_tool/_summon_launcher，
+    工具中心关掉就不露）；page 项看该页入口是否可见。"""
+    from core import modules
+    kind = item.get("kind")
+    if kind in ("search", "tool"):
+        return modules.is_enabled(modules.MODULE_TOOLS)
+    if kind == "page":
+        try:
+            return modules.page_visible(int(item.get("ref") or 0))
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
 def fan_candidates():
     """可加进扇形的全部候选（搜索面板 + 工具 + 页面），带唯一 key 供去重。
 
-    kind：search=弹唤出面板；tool=summon_tool(name)；page=切主窗口到页栈索引。"""
+    kind：search=弹唤出面板；tool=summon_tool(name)；page=切主窗口到页栈索引。
+    候选按已启用模块过滤：工具中心关掉就不出 search/tool，关掉的页也不出。"""
     out = [{"kind": "search", "ref": "", "label": "搜索面板", "icon": "🔍"}]
     try:
         from gui.tools_registry import TOOLS
@@ -61,7 +79,7 @@ def fan_candidates():
         pass
     for idx, label, icon in _page_items():
         out.append({"kind": "page", "ref": idx, "label": label, "icon": icon})
-    return out
+    return [it for it in out if _item_visible(it)]
 
 
 def _key(item):
@@ -69,10 +87,16 @@ def _key(item):
 
 
 def load_fan_items():
-    """读扇形项（list[dict]）；没配过时给一组实用默认（搜索 + 任务中心 + 工具中心 + 设置）。"""
+    """读扇形项（list[dict]）；没配过时给一组实用默认（搜索 + 任务中心 + 工具中心 + 设置）。
+
+    存量和默认集都按已启用模块过滤：模块关掉后，其入口自动从扇形收起（不删记录，
+    重装模块即回来）；若过滤后为空则退回默认集（默认集本身也已过滤）。"""
     raw = app_state.get(K_FAN_ITEMS)
     if isinstance(raw, list) and raw:
-        return [dict(it) for it in raw if isinstance(it, dict)]
+        kept = [dict(it) for it in raw
+                if isinstance(it, dict) and _item_visible(it)]
+        if kept:
+            return kept
     idx = {(_k): it for _k, it in ((_key(c), c) for c in fan_candidates())}
     return [dict(idx[k]) for k in
             ("search:", "page:1", "page:4", "page:6") if k in idx]
@@ -129,21 +153,40 @@ def base_toward_center(bx, by, screen):
 
 # ==================== 扇形小窗 ====================
 class LauncherFan(QWidget):
-    """以球心为极点、朝屏内展开的放射菜单。on_pick(item) 选功能，on_add() 加功能。"""
+    """以球心为极点、朝屏内展开的放射菜单。on_pick(item) 选功能，on_add() 加功能；
+    on_enter()/on_leave() 把"鼠标进入/离开扇形这块区域"回报给调用方，与球共用同一条
+    宽限期计时器——这样鼠标从球穿到扇形途中不会因球的一条 Leave 被误收。"""
 
-    def __init__(self, on_pick, on_add, parent=None):
+    #: 悬停放大倍率与每帧缓动步长（纯放大视觉，不改命中圆心）
+    _SCALE_HI = 1.24
+    _SCALE_STEP = 0.28
+
+    def __init__(self, on_pick, on_add, on_enter=None, on_leave=None, parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # 扇形不夺焦点：hover 模态下它只该被“看到”不该“激活”，否则一 show 就把主界面
+        # 焦点抢了，还可能靠 focusOut 抢先收起（与宽限期相冲）。
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self._on_pick = on_pick
         self._on_add = on_add
+        self._on_enter = on_enter
+        self._on_leave = on_leave
         self._items = []
         self._points = []            # 与 _items + "+" 一一对应的按钮中心（窗口坐标）
+        self._scales = []            # 与 _points 一一对应的当前放大倍率（hover 缓动）
         self._hover = -1
         self._ball = None
         self._font = QFont("Microsoft YaHei")
+        # 关键：开鼠标追踪，否则不按鼠标时 mouseMoveEvent 根本不触发——
+        # 那会导致悬停不放大、移出不显名（之前"动效没做"的真因）。
+        self.setMouseTracking(True)
+        # 只在展开时跑：驱动 hover 放大的逐帧缓动，收起即停，不空转耗 CPU
+        self._anim = QTimer(self)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._animate)
 
     # ---------- 对外 ----------
     def popup(self, ball, items=None):
@@ -160,7 +203,43 @@ class LauncherFan(QWidget):
 
     def hide_menu(self):
         self._hover = -1
+        self._anim.stop()
+        QToolTip.hideText()
         self.hide()
+
+    # ---------- 悬停回报（与球共用宽限期） ----------
+    def enterEvent(self, e):
+        # 鼠标进到扇形这块方框里：取消"移出收起"，别让它半路关了
+        cb = self._on_enter
+        if callable(cb):
+            cb()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = -1
+        QToolTip.hideText()
+        cb = self._on_leave
+        if callable(cb):
+            cb()
+        self._anim.start()
+        self.update()
+        super().leaveEvent(e)
+
+    # ---------- 逐帧缓动：把悬停那颗的目标倍率平滑过去 ----------
+    def _animate(self):
+        target = [self._SCALE_HI if i == self._hover else 1.0
+                  for i in range(len(self._points))]
+        moving = False
+        for i, t in enumerate(target):
+            cur = self._scales[i] if i < len(self._scales) else 1.0
+            if abs(cur - t) > 0.005:
+                self._scales[i] = cur + (t - cur) * self._SCALE_STEP
+                moving = True
+            else:
+                self._scales[i] = t
+        self.update()
+        if not moving and self._hover < 0:
+            self._anim.stop()          # 都缓到位且没悬停：停表省电
 
     # ---------- 几何 ----------
     def _recompute_and_show(self):
@@ -176,6 +255,8 @@ class LauncherFan(QWidget):
         side = 2 * (RADIUS + BTN)
         cx = cy = side / 2.0
         self._points = fan_positions(n, cx, cy, RADIUS, base, spread)
+        self._scales = [1.0] * len(self._points)
+        self._hover = -1              # 重排后旧下标失效，先清悬停避免指错
         self.setFixedSize(side, side)
         self.move(int(bx - cx), int(by - cy))
         self.show()
@@ -197,15 +278,27 @@ class LauncherFan(QWidget):
             cb(item)
 
     def mouseMoveEvent(self, e):
-        i = pick_at(self._points, (e.position().x(), e.position().y()))
+        pos = (e.position().x(), e.position().y())
+        # 命中半径略放宽到放大后的视觉尺寸，鼠标靠大圆边缘也算悬停
+        i = pick_at(self._points, pos, r=BTN / 2 * self._SCALE_HI)
         if i != self._hover:
             self._hover = i
+            if i >= 0:
+                self._show_tip(i, e)
+            else:
+                QToolTip.hideText()
+            self._anim.start()          # 倍率要变：唤醒缓动循环
             self.update()
 
-    def leaveEvent(self, e):
-        self._hover = -1
-        self.update()
-        super().leaveEvent(e)
+    def _show_tip(self, i, e):
+        """悬停某颗：浮窗显示它的功能名（"+" 那颗给提示）。"""
+        if i == len(self._items):
+            text = "＋ 添加功能"
+        else:
+            text = str(self._items[i].get("label", "")) or "未命名"
+        gp = self.mapToGlobal(QPoint(int(self._points[i][0]),
+                                     int(self._points[i][1])))
+        QToolTip.showText(gp, text, self)
 
     def contextMenuEvent(self, e):
         """右键某颗 → 从扇形移除（"+" 那颗没有可移除的）。"""
@@ -249,24 +342,26 @@ class LauncherFan(QWidget):
         total = len(self._items) + 1
         for i in range(total):
             x, y = self._points[i]
-            rect = _circle_rect(x, y, BTN)
+            sc = self._scales[i] if i < len(self._scales) else 1.0
+            d = BTN * sc                 # hover 放大：以同圆心把直径拉大
+            rect = _circle_rect(x, y, d)
             is_plus = i == total - 1
             p.setPen(QPen(_RING, 2))
             p.setBrush(_HL if i == self._hover else _BG)
             p.drawEllipse(rect)
             it = None if is_plus else self._items[i]
             glyph = "＋" if is_plus else (it.get("icon", "▫"))
-            self._font.setPointSize(16 if is_plus else 18)
+            self._font.setPointSize(int(round((16 if is_plus else 18) * sc)))
             p.setFont(self._font)
             p.setPen(_GLYPH)
-            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, glyph)
+            _draw_glyph_centered(p, self._font, glyph, x, y)
             if not is_plus:
                 # 短标签画在按钮下方（截断到 4 字，扇形是看图不是看字）
                 label = str(it.get("label", ""))[:4]
                 self._font.setPointSize(9)
                 p.setFont(self._font)
                 p.setPen(_GLYPH)
-                lr = rect.adjusted(-10, BTN - 4, 10, BTN + 12)
+                lr = rect.adjusted(-10, d - 4, 10, d + 12)
                 p.drawText(lr, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, label)
         p.end()
 
@@ -279,3 +374,19 @@ class LauncherFan(QWidget):
 def _circle_rect(cx, cy, d):
     from PySide6.QtCore import QRectF
     return QRectF(cx - d / 2.0, cy - d / 2.0, d, d)
+
+
+def _draw_glyph_centered(p, font, text, cx, cy):
+    """把单个图标按墨迹精确居中到 (cx, cy)。
+
+    emoji 的逻辑行框上下留白不均，直接 AlignCenter 会看着“偏下”，故用
+    tightBoundingRect 把墨迹垂直中心对到圆心；量不到墨迹（空 rect）时退回 AlignCenter。"""
+    fm = QFontMetrics(font)
+    tb = fm.tightBoundingRect(text)
+    if tb.isNull() or tb.height() <= 0:
+        p.drawText(_circle_rect(cx, cy, fm.height()),
+                   Qt.AlignmentFlag.AlignCenter, text)
+        return
+    advance = fm.horizontalAdvance(text)
+    baseline = cy - (tb.top() + tb.height() / 2.0)   # tb.top 为负（基线以上）
+    p.drawText(QPointF(cx - advance / 2.0, baseline), text)

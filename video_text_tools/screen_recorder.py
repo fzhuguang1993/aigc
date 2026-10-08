@@ -9,11 +9,14 @@
 声音两条路：外部声音（麦克风）走 dshow 采集设备；内部声音（系统播放）
 优先 wasapi_loopback（FFmpeg 7+，无需声卡特殊支持），老构建退而求其次
 用 dshow 的「立体声混音」类设备（声卡没有就录不了，属尽力而为）。
-两种声音可同时勾选：每个音源单独落一个无损 WAV（视频文件不含声轨）。
-⚠ 每个产物一个 ffmpeg 子进程（控制层一起启停）：真机实测 ffmpeg 9.0
-单命令多输出时，只要视频输出在场，音频在 q 停止时只剩第一个大包
-（降负载/单音源都一样），拆进程后各自独立写入互不影响。
-停止录制 = 向各子进程的 stdin 写 `q`，让它正常收尾
+两种声音可同时勾选。
+⚠ 画面与声音【分进程录制】，停止后再合流进【同一个 MP4】：真机实测，
+把 gdigrab 与 dshow 塞进同一条 ffmpeg 命令时，两路实时输入会互相阻塞
+（head-of-line blocking）——只录画面不卡，一旦叠加音频，剧烈动态下画面就
+明显卡顿。分开成独立子进程（视频 1 条 + 每音源 1 条录裸 WAV），录制期各跑
+各的、互不背压；停止后一次性把无声视频（流 copy 不重编码）与 WAV（amix 混
+音、按声道处理）合流成带声成片。用户看到的产物仍是【一个自带声轨的 MP4】。
+停止录制 = 向每个子进程的 stdin 写 `q`，让它们各自正常收尾
 写完整容器索引（直接杀进程会损坏文件），超时再 terminate 兜底。
 
 非 Windows 平台：本模块可安全导入，抓取相关入口返回空/报"不支持"。
@@ -431,19 +434,6 @@ def _normalize_audio_list(audio):
     return out
 
 
-# 音源类型 -> WAV 文件名后缀（分开存放，剪辑时一眼认出哪轨是什么）
-AUDIO_SUFFIX = {"system": "内部声音", "mic": "麦克风"}
-
-
-def audio_out_paths(out_path, audio):
-    """每个音源的独立 WAV 落盘路径：[(规格, 路径)]，与视频同目录同基名
-
-    build_record_command 内部用同一套命名规则，两边不会漂移。"""
-    base, _ = os.path.splitext(out_path)
-    return [(spec, f"{base}_{AUDIO_SUFFIX[spec[0]]}.wav")
-            for spec in _normalize_audio_list(audio)]
-
-
 def _audio_input_args(spec):
     """按音频规格给出 ffmpeg 采集「输入」参数（不含可执行文件与全局开关）。
 
@@ -455,30 +445,104 @@ def _audio_input_args(spec):
     return ["-f", "dshow", "-i", f"audio={escape_dshow_name(spec[1])}"]
 
 
+# 声道处理：单麦只喂一路时，左右求和填进相同的两个声道 = 人声居中、双耳同响
+_PAN_CENTER = "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"
+
+# 视频限幅：实测本机 x264 veryfast 在 4K 全屏 + 音频合流时编码器只能跑到
+# ~23-25fps（剧烈动态下会掉帧→肉眼可见的卡顿），而 1080p+音频 能稳 28fps。
+# 自动把 >1080p 的源缩到 ≤1080p（force_divisible_by=2 保证 yuv420p 偶数要
+# 求）；源 ≤1080p 时无变化。真 4K 原生需换硬件编码（NVENC/AMF/QSV）另开。
+_VSCALE = "scale='min(1920,iw)':'min(1080,ih)':force_divisible_by=2"
+
+
+# 硬件编码器探测缓存：ffmpeg_path -> None=未探 / False=探过不可用 / "h264_nvenc"=可用
+_HW_ENC_CACHE = {}
+
+
+def pick_hw_encoder(ffmpeg_path):
+    """探测当前 ffmpeg + 本机 GPU/驱动能否用硬编 H.264。返回可用编码器名
+    或 None（不可用→走 libx264 软编）。进程内同一 ffmpeg_path 只探一次。
+
+    现阶段只探 NVENC（装机率最高，GTX 10 系 / RTX 全系都支持）。常见失败：
+    无 NVIDIA GPU / 驱动不够新（ffmpeg 9.x 需 NVENC API 13.1 → 驱动 ≥ 610.00） /
+    nvEncodeAPI64.dll 未加载。一律静默降级，不打断录制。
+    """
+    if ffmpeg_path in _HW_ENC_CACHE:
+        return _HW_ENC_CACHE[ffmpeg_path] or None
+    if not ffmpeg_path or not os.path.isfile(ffmpeg_path):
+        return None
+    # 探法：用 lavfi 生 64x64 空小图 10 帧跑一次 NVENC，rc=0 视为可用。
+    # 不接 gdigrab/dshow，开不到 0.3 秒，失败也不会卡录制启动。
+    cmd = [ffmpeg_path, "-hide_banner", "-y",
+           "-f", "lavfi", "-i", "nullsrc=size=64x64:duration=0.3:rate=30",
+           "-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "1M",
+           "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=8,
+                           creationflags=_devnull())
+        ok = (r.returncode == 0)
+    except Exception:
+        ok = False
+    _HW_ENC_CACHE[ffmpeg_path] = "h264_nvenc" if ok else False
+    return "h264_nvenc" if ok else None
+
+
+def _channel_output_args(mode):
+    """单路音源时的「声道」输出参数（命令行级 -af/-ac，不经 filter_complex）。
+
+    center：pan 左右求和填到两个相同声道（人声居中，单麦最常用）；
+    stereo：保留设备原生左右两路（需真接两路信号才有立体声）；
+    mono：直接输出单声道。"""
+    if mode == "stereo":
+        return ["-ac", "2"]
+    if mode == "mono":
+        return ["-ac", "1"]
+    return ["-af", _PAN_CENTER, "-ac", "2"]
+
+
+def _channel_filter(mode):
+    """多路 amix 之后在 filter_complex 里接的声道滤镜（作用于混音结果）。"""
+    if mode == "stereo":
+        return "aformat=channel_layouts=stereo"
+    if mode == "mono":
+        return "pan=mono|c0=0.5*c0+0.5*c1"
+    return _PAN_CENTER
+
+
 def build_record_command(ffmpeg_path, mode, out_path, *,
                          fps=30, bitrate="4M",
                          physical=None, title=None,
-                         audio=None, audio_bitrate="128k"):
-    """拼 ffmpeg 录屏命令，返回 [(命令, 产物路径)]：第一个是主视频，
-    其后每个音源一条独立 WAV 命令。
+                         audio=None, channel_mode="center"):
+    """拼 ffmpeg 录屏命令：画面与音源【分进程】，返回录制子进程计划
+    [(命令, 产物路径)]——第一条恒为视频（产物即最终 out_path，只是暂时无声），
+    其后是每个音源独立录成的裸 WAV。Recorder 停止后再把它们合流成【一个带声
+    MP4】（见 build_mux_command）。
 
-    为什么拆多条命令（一个产物一个子进程）：真机实测 ffmpeg 9.0，
-    单命令多输出时只要视频输出在场，音频在 q 停止时会丢尾巴——
-    WAV 只剩第一个大包（1.0s/0.5s），降低视频负载也救不回来。
+    为什么分进程：真机实测（RTX 4060 Ti / 驱动 572 / ffmpeg 9.0），把 gdigrab
+    + dshow 塞进同一条命令时两路实时输入互相阻塞——只录画面不卡，一旦加音频
+    （麦克风 / 内部声音 / 两者）剧烈动态下就掉帧卡顿。分开后视频进程无音频输入
+    竞争，编码不再被拖；音频各占一进程写 WAV，稳定。
+
+    画面进程要点：
+      · -thread_queue_size 2048 前置，喂饱 gdigrab；
+      · 优先硬编 NVENC（pick_hw_encoder 探测，驱动不够则降级 libx264 软编）；
+      · 视频链 -vf：scale 限幅 ≤1080p + fps={fps} 强制恒定帧率（gdigrab 是变帧
+        率源，不补 CFR 时间戳不均→卡顿；fps 滤镜落后补重复帧，保证成片总长=
+        录制时长）。分进程后视频轨不带音频（-an），最终由 mux 合入。
+    音频进程要点：每源一路，dshow/wasapi_loopback 采到 pcm_s16le WAV（44.1k
+    立体声原样存，声道/amix 处理留到合流时统一做）。
 
     mode: "fullscreen" | "region" | "window"
       - fullscreen：physical=None 录主屏；给物理包围盒则录该范围（多屏并集
         或指定某块屏——gdigrab 不给 size 时只截主屏，这是它的默认行为）
       - region：physical 必填（屏幕选择/框选结果换算成的物理矩形）
       - window：title 必填（gdigrab 只有子串匹配，标题取整窗口全标题）
-    audio：None/空 = 不录音；可传单个规格或规格列表（内部+外部多选）。
-      str = dshow 设备名（兼容写法，按麦克风）；("mic", 名字) = dshow
-      外部声音；("system", None) = wasapi_loopback 内部声音（需构建内含
-      该解复用器，探测不过时面板不会给出这一选项）；("system", 名字) =
-      立体声混音类 dshow 设备录内部声音。
-      ⚠ 音轨不再混进 MP4（视频一律 -an）：每源一个 WAV（pcm_s16le/
-      48k/双声道），命名见 audio_out_paths。
-    audio_bitrate：保留签名兼容旧调用，分开存 WAV 后不再使用。
+    audio：None/空 = 只录画面（单进程）；可传单个规格或规格列表（内部+外部
+      多选）。str = dshow 设备名（兼容写法，按麦克风）；("mic", 名字) = dshow
+      外部声音；("system", None) = wasapi_loopback 内部声音；("system", 名字) =
+      立体声混音类 dshow 设备录内部声音。同类型去重（最多一条内部 + 一条外部）。
+    channel_mode：center（默认，人声居中双耳同声）| stereo | mono。仅在最终
+      合流时生效（见 build_mux_command）。
     """
     if mode not in ("fullscreen", "region", "window"):
         raise ValueError(f"未知录制模式: {mode}")
@@ -488,7 +552,9 @@ def build_record_command(ffmpeg_path, mode, out_path, *,
         raise ValueError("区域录制缺少范围")
     aspecs = _normalize_audio_list(audio)
 
+    # ---- 视频进程（恒为 plans[0]，产物就是最终 out_path，只是暂时无声）----
     cmd = [ffmpeg_path, "-hide_banner", "-y",
+           "-thread_queue_size", "2048",
            "-f", "gdigrab", "-framerate", str(int(fps))]
     if mode == "window":
         cmd += ["-i", f"title={title}"]
@@ -501,64 +567,58 @@ def build_record_command(ffmpeg_path, mode, out_path, *,
             cmd += ["-offset_x", str(int(x)), "-offset_y", str(int(y)),
                     "-video_size", f"{int(w) & ~1}x{int(h) & ~1}"]
         cmd += ["-i", "desktop"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(bitrate),
-            "-pix_fmt", "yuv420p", "-an",
-            "-movflags", "+faststart", out_path]
+    # 编码：优先硬编（NVENC，不吃 CPU；需驱动 ≥ 610）→ 探测不可用降级 libx264
+    hw = pick_hw_encoder(ffmpeg_path)
+    if hw:
+        # NVENC: p1=最快档位、ll=low-latency tune（避免编码器内部大缓冲）
+        cmd += ["-c:v", hw, "-preset", "p1", "-tune", "ll",
+                "-b:v", str(bitrate), "-pix_fmt", "nv12"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                "-b:v", str(bitrate), "-pix_fmt", "yuv420p"]
+    # 画面限幅 + 恒定帧率；分进程后视频轨不带音频（-an），音频由 stop 后合入
+    vchain = _VSCALE + f",fps={int(fps)}"
+    cmd += ["-vf", vchain, "-an", "-movflags", "+faststart", out_path]
     plans = [(cmd, out_path)]
-    # 每个音源一条独立进程：dshow/wasapi 设备不同，可同时采集互不抢占
-    for spec, wav in audio_out_paths(out_path, aspecs):
-        acmd = [ffmpeg_path, "-hide_banner", "-y", *_audio_input_args(spec),
-                "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", wav]
+    if not aspecs:
+        return plans
+    # ---- 每个音源一个独立进程，录裸 WAV（临时旁路，合流后被 Recorder 删除）----
+    for i, spec in enumerate(aspecs):
+        wav = f"{out_path}.audio{i}.wav"
+        acmd = [ffmpeg_path, "-hide_banner", "-y",
+                "-thread_queue_size", "2048", *_audio_input_args(spec),
+                "-vn", "-ar", "44100", "-ac", "2",
+                "-c:a", "pcm_s16le", wav]
         plans.append((acmd, wav))
     return plans
 
 
-def pick_system_audio(ffmpeg_path):
-    """自动挑一个能录系统内部声音的源（测试 Demo 用，不提供设备选择 UI）。
+def build_mux_command(ffmpeg_path, video_path, audio_paths, out_path, *,
+                      channel_mode="center"):
+    """拼合流命令：无声视频 + 1~N 个 WAV → 带声 MP4。视频流 copy 不重编码
+    （瞬时完成），音频按 channel_mode 处理，多路先 amix 混成一条。
 
-    优先 wasapi 环回（若该 ffmpeg 支持），否则退到第一个「立体声混音」类
-    dshow 设备；都没有给 None（Demo 会只录画面，不算错误）。"""
-    if not ffmpeg_path:
+    out_path 必须与 video_path 不同（调用方写到临时再原子替换，避免同读写）。
+    audio_paths 为空返回 None（无需合流）。"""
+    audio_paths = [p for p in audio_paths if p]
+    if not audio_paths:
         return None
-    if has_wasapi_loopback(ffmpeg_path):
-        return ("system", None)
-    for n in list_audio_devices(ffmpeg_path):
-        if is_mix_device(n):
-            return ("system", n)
-    return None
-
-
-def build_av_record_command(ffmpeg_path, out_path, *, fps=30, bitrate="8M",
-                            audio=None, physical=None):
-    """极简录屏：全屏画面 +（可选）系统声音，混流成【单个】MP4（音画合一）。
-
-    与 build_record_command 的区别：那条把画面(-an)与每个音源拆成独立产物、
-    一个产物一个子进程；这里只拼一条命令、一个输出，交给 Recorder 直接跑，
-    用于「能不能把屏幕录下来」的测试 Demo。
-    audio：None = 只录画面；('system', None) = wasapi 环回；
-           ('system', 名字) = 立体声混音类 dshow 设备（用 pick_system_audio 挑）。
-    physical：多屏并集的物理包围盒 (x, y, w, h)，None = 只录主屏。
-    返回 (命令, 产物路径)。"""
-    cmd = [ffmpeg_path, "-hide_banner", "-y",
-           "-f", "gdigrab", "-framerate", str(int(fps))]
-    if physical:
-        x, y, w, h = physical
-        # 奇数宽高会让 yuv420p 报错，统一向下取偶（gdigrab 也要求偶数）
-        cmd += ["-offset_x", str(int(x)), "-offset_y", str(int(y)),
-                "-video_size", f"{int(w) & ~1}x{int(h) & ~1}"]
-    cmd += ["-i", "desktop"]
-    spec = _normalize_audio(audio)
-    if spec:
-        cmd += _audio_input_args(spec)
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(bitrate),
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-                "-ac", "2", "-ar", "44100",
-                "-movflags", "+faststart", out_path]
+    cmd = [ffmpeg_path, "-hide_banner", "-y", "-i", video_path]
+    for w in audio_paths:
+        cmd += ["-i", w]
+    n = len(audio_paths)
+    if n == 1:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+        cmd += _channel_output_args(channel_mode)
     else:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(bitrate),
-                "-pix_fmt", "yuv420p", "-an",
-                "-movflags", "+faststart", out_path]
-    return cmd, out_path
+        ins = "".join(f"[{i + 1}:a]" for i in range(n))
+        fc = (f"{ins}amix=inputs={n}:duration=longest:dropout_transition=0:"
+              f"normalize=0[mix];[mix]{_channel_filter(channel_mode)}[aout]")
+        cmd += ["-filter_complex", fc, "-map", "0:v:0", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100"]
+    cmd += ["-movflags", "+faststart", out_path]
+    return cmd
 
 
 # ====================================================================
@@ -638,20 +698,24 @@ def probe_audio_level(ffmpeg_path, audio, seconds=2):
 # 录制进程控制
 # ====================================================================
 class Recorder:
-    """一组录屏子进程（1 视频 + N 音轨）的生命周期：start / stop / 轮询 / 判定。
+    """分进程录屏：1 视频 + N 音轨(WAV) 子进程的生命周期 + 停止后合流。
 
-    收 build_record_command 的 plans=[(命令, 产物路径)]，第一个是主视频；
-    成败只看主产物，旁路 WAV 全 0 字节/缺失都不判失败（设备抽风时
-    至少保住画面）。stderr 每进程重定向到各自旁路日志（管道塞满会
-    反压 ffmpeg 卡死录制）：成功收尾后删，出错时读尾部作诊断信息。
+    收 build_record_command 的 plans=[(命令, 产物路径)]，第一条是视频（产物即
+    最终 out_path，暂时无声），其后每个音源录一路裸 WAV。stop 先向各进程写 `q`
+    优雅收尾，再用 build_mux_command 把无声视频（copy）与 WAV（amix/声道）合流
+    进 out_path，得到【一个带声 MP4】，删除旁路 WAV。合流失败也保住无声视频，
+    只回报错误。stderr 每进程重定向到各自旁路日志（管道塞满会反压 ffmpeg 卡死
+    录制）：成功收尾后删，出错时读尾部作诊断信息。
     """
 
-    def __init__(self, plans, out_path=None):
+    def __init__(self, plans, out_path=None, channel_mode="center"):
         self.plans = [(list(c), p) for c, p in plans]
         if not self.plans:
             raise ValueError("Recorder 需要至少一条 (命令, 产物) 计划")
         self.out_path = out_path if out_path is not None else self.plans[0][1]
-        self.audio_paths = [p for _c, p in self.plans[1:]]
+        self.audio_paths = [p for _c, p in self.plans[1:]]   # WAV 旁路（合流后删）
+        self.channel_mode = channel_mode
+        self.ffmpeg_path = self.plans[0][0][0]
         self.err_paths = [p + ".err.log" for _c, p in self.plans]
         self.err_path = self.err_paths[0]        # 主产物日志（测试/诊断入口）
         self._procs = []                          # [(Popen, err_path)]
@@ -694,8 +758,8 @@ class Recorder:
         return None
 
     def alive(self):
-        """任一子进程还活着算录制中（音轨先退不中断录制，视频退了就停）"""
-        return any(p.poll() is None for p, _e in self._procs)
+        """录制是否进行中：以视频进程为准（音轨先退不中断，视频退了就算停）"""
+        return bool(self._procs) and self._procs[0][0].poll() is None
 
     def elapsed(self):
         """已录秒数（供界面计时；未启动/已停止也有值，用于回显）"""
@@ -718,11 +782,11 @@ class Recorder:
                 pass
 
     def stop(self, timeout=10):
-        """停止全部子进程。返回 None=成功，str=失败原因（带 ffmpeg 报错尾部）。
+        """停止全部子进程并合流。返回 None=成功，str=失败原因（带 ffmpeg 报错尾部）。
 
-        逐进程写 `q` 让它们正常收尾（补全容器索引），超时才 terminate；
-        主产物为 0 字节一律判失败；旁路 WAV 为 0 字节的清掉（设备抽风
-        时别留空文件让用户以为录到了声音）。"""
+        逐进程写 `q` 让它们各自正常收尾（补全容器索引），超时才 terminate；
+        视频产物为 0 字节一律判失败（此时连无声画面都没了，没救）；有音轨时
+        把 0 字节的 WAV 剔掉，剩下的合流进 out_path。"""
         if not self._procs:
             return "没有在录制的任务"
         procs, self._procs = self._procs, []
@@ -750,11 +814,52 @@ class Recorder:
             tail = self._tail_err(self.err_paths[0])
             return (f"录制失败（ffmpeg 退出码 {code}）"
                     + (f"\n{tail}" if tail else ""))
+        # 有效音轨 = 非 0 字节的 WAV；抽风的（0 字节）清掉
+        wavs = [p for p in self.audio_paths
+                if os.path.isfile(p) and os.path.getsize(p) > 0]
         for p in self.audio_paths:
             try:
                 if os.path.isfile(p) and os.path.getsize(p) == 0:
                     os.remove(p)
             except OSError:
                 pass
+        mux_err = self._mux(wavs) if wavs else None
         self._clean_logs(self.err_paths)
-        return None
+        return mux_err
+
+    def _mux(self, wavs):
+        """把无声视频 + WAV 合流进 out_path：先写临时再 os.replace 原子替换（避免
+        读写同一文件）。成功 None；失败保留无声视频并回报原因（至少画面还在）。"""
+        tmp = f"{self.out_path}.mux.mp4"
+        cmd = build_mux_command(self.ffmpeg_path, self.out_path, wavs, tmp,
+                                channel_mode=self.channel_mode)
+        tail = ""
+        ok = False
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=120,
+                               creationflags=_devnull())
+            ok = (r.returncode == 0 and os.path.isfile(tmp)
+                  and os.path.getsize(tmp) > 0)
+            if not ok:
+                err = (r.stderr or b"").decode("utf-8", "replace").strip()
+                tail = err.splitlines()[-1] if err else ""
+        except Exception as e:
+            ok, tail = False, str(e)
+        if ok:
+            try:
+                os.replace(tmp, self.out_path)
+                for w in wavs:
+                    try:
+                        os.remove(w)
+                    except OSError:
+                        pass
+                return None
+            except OSError as e:
+                tail = f"替换成品失败：{e}"
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return (f"音轨合流失败，已保留无声视频：{tail}" if tail
+                else "音轨合流失败，已保留无声视频")

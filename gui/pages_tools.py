@@ -229,6 +229,9 @@ class ToolDialog(QDialog):
 
 
 class ToolsPage(QWidget):
+    #: 特殊卡片名：“本地文件搜索”不在 TOOLS 登记表，点击走唤出面板的搜索（不新建面板）
+    SEARCH_TOOL = "本地文件搜索"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._dialogs = {}          # name -> ToolDialog（保持引用防回收）
@@ -252,6 +255,15 @@ class ToolsPage(QWidget):
             card = ToolCard(name, icon, desc, factory, self._open)
             card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             self._cards.append(card)
+        # “本地文件搜索”卡：复用主窗唤出面板的搜索能力（不新建面板），归工具中心随其显隐
+        search_card = ToolCard(self.SEARCH_TOOL, "🔍",
+                               "全盘搜索本地文件：即输即搜，回车打开或定位", None,
+                               self._open)
+        search_card.factory = True            # 让它可点（open_tool 里按名路由到搜索）
+        search_card.setProperty("canopen", "1")
+        search_card.setCursor(Qt.CursorShape.PointingHandCursor)
+        search_card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._cards.insert(0, search_card)
         area.setWidget(holder)
         self._area = area
         lay.addWidget(area, 1)
@@ -286,6 +298,14 @@ class ToolsPage(QWidget):
     def open_tool(self, name):
         """按工具名打开窗口（卡片点击 / 左侧固定项 / 快捷键共用同一入口）：
         已有窗口则前置，否则新建；父挂主窗口，不随页面切换被藏掉"""
+        from core import modules
+        if not modules.page_visible(4):     # 工具中心关掉：任何路径都不弹工具（防热键绕过）
+            return
+        if name == self.SEARCH_TOOL:        # 本地文件搜索：直接弹唤出面板，不开工具窗
+            fn = getattr(self.window(), "_summon_launcher", None)
+            if callable(fn):
+                fn()
+            return
         factory = PANEL_FACTORIES.get(name)
         if factory is None:
             return

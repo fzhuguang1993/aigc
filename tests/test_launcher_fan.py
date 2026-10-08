@@ -13,6 +13,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PySide6.QtCore import Qt, QPoint
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from gui import launcher_fan as lf
@@ -118,7 +120,65 @@ def test_popup_positions_items_and_plus_button(qapp):
     fan.popup(_FakeBall(), items)
     assert fan.isVisible()
     assert len(fan._points) == len(items) + 1         # 末尾还有一颗 "+"
+    assert len(fan._scales) == len(items) + 1         # 每颗都配了一个初始倍率
     cx, cy = fan._points[0]
     assert lf.pick_at(fan._points, (cx, cy)) == 0
     fan.hide_menu()
     assert not fan.isVisible()
+
+
+def test_enter_leave_report_to_caller(qapp):
+    """hover 回报：鼠标进到扇形框里叫 on_enter（取消收起），离开叫 on_leave（请求收起）。"""
+    seen = []
+    fan = lf.LauncherFan(lambda it: None, lambda: None,
+                         on_enter=lambda: seen.append("enter"),
+                         on_leave=lambda: seen.append("leave"))
+    fan._on_enter()
+    fan._on_leave()
+    assert seen == ["enter", "leave"]
+
+
+def test_hover_scale_animates_toward_target(qapp):
+    """悬停某颗后逐帧缓动应把它拉到放大倍率，不悬停的回到 1.0。"""
+    class _FakeBall:
+        def x(self): return 100
+        def y(self): return 100
+        def width(self): return 72
+        def height(self): return 72
+
+    fan = lf.LauncherFan(lambda it: None, lambda: None)
+    items = [{"kind": "search", "ref": "", "label": "搜索面板", "icon": "🔍"},
+             {"kind": "page", "ref": 1, "label": "任务中心", "icon": "🎯"}]
+    fan.popup(_FakeBall(), items)
+    fan._hover = 0
+    for _ in range(40):                       # 迭代足够帧直到收敛
+        fan._animate()
+    assert fan._scales[0] == pytest.approx(lf.LauncherFan._SCALE_HI, abs=0.01)
+    assert fan._scales[1] == pytest.approx(1.0, abs=0.01)
+    fan.hide_menu()
+
+
+def test_fan_enables_mouse_tracking(qapp):
+    """扇形必须开鼠标追踪，否则不按鼠标时悬停不会触发 mouseMoveEvent。"""
+    fan = lf.LauncherFan(lambda it: None, lambda: None)
+    assert fan.hasMouseTracking()
+
+
+def test_plain_hover_move_sets_hover_and_wakes_scale(qapp):
+    """不按住鼠标的普通移入也要能命中小圆、启动放大缓动。"""
+    class _FakeBall:
+        def x(self): return 100
+        def y(self): return 100
+        def width(self): return 72
+        def height(self): return 72
+
+    fan = lf.LauncherFan(lambda it: None, lambda: None)
+    items = [{"kind": "search", "ref": "", "label": "搜索面板", "icon": "🔍"},
+             {"kind": "page", "ref": 1, "label": "任务中心", "icon": "🎯"}]
+    fan.popup(_FakeBall(), items)
+    cx, cy = fan._points[0]
+    QTest.mouseMove(fan, QPoint(int(cx), int(cy)))
+    QTest.qWait(10)
+    assert fan._hover == 0, "普通移入应命中小圆（靠 mouseMoveEvent）"
+    assert fan._anim.isActive(), "命中后应启动放大缓动循环"
+    fan.hide_menu()

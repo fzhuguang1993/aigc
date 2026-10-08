@@ -82,6 +82,21 @@ def _default_config_dir():
     return (Path(xdg) if xdg else Path.home() / ".config") / APP_NAME
 
 
+def _common_data_dir():
+    """机器级共享目录（安装期可写、运行期可读）：存放安装包选模块时写下的清单。
+
+    为什么不用 CONFIG_DIR（%APPDATA%）：装进 Program Files 是管理员权限跑的，
+    安装器写 %APPDATA% 会写到管理员账户的家，而不是日后双击运行的那个用户的家，
+    两边对不上。ProgramData（C:\\ProgramData）是“所有用户共用”的标准位置：
+    安装时以管理员写入，任何用户运行都能读到，正好当“安装选了哪些模块”的落点。
+    非 Windows 回退到配置家（无机器级/用户级权限分离的概念）。
+    """
+    if sys.platform.startswith("win"):
+        base = os.environ.get("COMMONAPPDATA") or r"C:\ProgramData"
+        return Path(base) / APP_NAME
+    return _default_config_dir()
+
+
 def _config_dir():
     """配置家：可用环境变量 AIGC_CONFIG_DIR 显式指定（测试隔离 / 多实例）。"""
     env = os.environ.get("AIGC_CONFIG_DIR")
@@ -213,6 +228,12 @@ RUNTIME_DIR, DATA_MODE = _data_home(APP_DIR)
 
 #: 凭证类配置（config.json / ui_state.json / api_text）的隐藏目录，可用 AIGC_CONFIG_DIR 指定。
 CONFIG_DIR = _config_dir()
+
+#: 机器级共享目录（Windows＝%COMMONAPPDATA%\AIGC视频助手）：安装期选模块写的
+#: install.json 落在这里（见 core/modules.py），运行期任意用户可读。
+#: 可用 AIGC_COMMON_DIR 显式指定（测试隔离）。
+COMMON_DATA_DIR = (Path(os.environ["AIGC_COMMON_DIR"])
+                   if os.environ.get("AIGC_COMMON_DIR") else _common_data_dir())
 
 # 立即建目录并把老用户散在运行目录的配置搬进来（core.config import 本模块后即读到新家）
 ensure_config_home()

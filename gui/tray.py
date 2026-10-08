@@ -159,16 +159,18 @@ class TrayController(QObject):
         self._menu.addAction("🖥  打开主界面", lambda: self.show_requested.emit())
         self._menu.addAction("🔍  唤出工具搜索", lambda: self.launcher_requested.emit())
         self._menu.addSeparator()
+        from core import modules
         from gui.tools_registry import load_pinned
-        pinned = load_pinned()
-        if pinned:
-            sub = self._menu.addMenu("🧰  固定工具")
-            for name in pinned:
-                self._tool_actions.append(
-                    sub.addAction(name, lambda n=name: self.tool_requested.emit(n)))
-        else:
-            act = self._menu.addAction("🧰  固定工具（还没有）")
-            act.setEnabled(False)
+        if modules.is_enabled(modules.MODULE_TOOLS):    # 工具中心关掉：固定工具子菜单整体不装
+            pinned = load_pinned()
+            if pinned:
+                sub = self._menu.addMenu("🧰  固定工具")
+                for name in pinned:
+                    self._tool_actions.append(
+                        sub.addAction(name, lambda n=name: self.tool_requested.emit(n)))
+            else:
+                act = self._menu.addAction("🧰  固定工具（还没有）")
+                act.setEnabled(False)
         self._menu.addSeparator()
         auto = self._menu.addAction("🚀  开机自启")
         auto.setCheckable(True)

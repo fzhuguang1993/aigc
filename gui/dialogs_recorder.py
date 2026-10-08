@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QWidget, QComboBox,
                                QLineEdit, QPushButton, QMessageBox, QFileDialog,
                                QSizePolicy, QFileIconProvider, QScrollArea,
                                QListWidget, QListWidgetItem, QInputDialog,
-                               QFrame, QCheckBox)
+                               QFrame, QCheckBox, QProgressBar)
 
 from core.config import DOWNLOAD_DIR
 from core.logger import log
@@ -71,11 +71,9 @@ TXT_MUTED = "#8F959E"       # 检测中·灰
 WDA_NONE = 0x0
 WDA_EXCLUDEFROMCAPTURE = 0x11
 
-# 全局录制热键（RegisterHotKey）：Ctrl+Alt+R 开始/停止切换
-WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
-MOD_CONTROL, MOD_ALT = 0x0002, 0x0001
-HOTKEY_MODS = MOD_CONTROL | MOD_ALT
-VK_TOGGLE = 0x52            # 'R'
+# 全局「录屏开/停」热键已上移到主窗口（gui/main_window.apply_recorder_shortcut），
+# 经 global_hotkey.manager 注册，键位在「设置-托盘与全局快捷键」里改。
+# 面板只暴露 is_recording()/toggle_record() 供主窗回调。
 
 
 # ====================================================================
@@ -708,6 +706,19 @@ QPushButton#RecordBtn:pressed { background:#2C5FDB; }
 QPushButton#RecordBtn:disabled { background:#F5F6F7; color:#C9CDD4; }
 """
 
+# OBS「控制」坞：面板底部固定的录制卡——白底细描边圆角，与上方
+# 目标/声音卡同一套卡片语言，但把主按钮与快捷键提示固定在一块里
+_CONTROL_QSS = """
+QWidget#ControlDock { background:#FFFFFF; border:1px solid #E1E6F0;
+    border-radius:12px; }
+"""
+
+# OBS「舞台」读数区：浅色画布 + 虚线描边，类比 OBS 预览视口（切目标时刷新大字读数）
+_STAGE_QSS = """
+QFrame#StageCanvas { background:#F7F8FA; border:1px dashed #C9CDD4;
+    border-radius:10px; }
+"""
+
 
 # 标题右上角的「?」帮助按钮：把说明收进悬停提示，正文区不再摆一行灰字
 _HELP_QSS = """
@@ -718,30 +729,36 @@ QPushButton#HelpBtn:hover { background:#EAF1FF; color:#3370FF; border-color:#337
 
 
 def _card(title, icon="", tint=PRIMARY, tint_bg="#EAF1FF", tip=""):
-    """分组卡：白底圆角 + 「图标徽章 + 加粗标题 +（可选）? 帮助 + 分隔线」的页眉。
+    """分组卡（OBS “坞”观感）：白底圆角 + 顶部一条淡色页眉带（图标徽章 + 加粗标题 +（可选）?）。
 
-    tip 非空时在标题行右上角放一枚圆形「?」按钮，说明文字收进它的悬停提示里——
-    正文区不再摆一行灰色长提示，卡片宽度也就不会被单行提示顶得比外框还宽。
-    返回 (卡片, 卡内 body 布局)：body 已排在页眉与分隔线之后，调用方继续 addWidget。
-    tint/tint_bg 决定徽章配色，各卡给不同色，拉开视觉层次。"""
+    页眉带给每张卡一条与 tint 同系的浅色标题条（类似 OBS 停靠面板的分区感），
+    徽章上实底 tint + 白字图标，与浅底拉开层次。tip 非空时右上角放一枚「?」。
+    tint/tint_bg 决定页眉带与徽章配色，各卡给不同色拉开层次。
+    返回 (卡片, 卡内 body 布局)：body 已排在页眉带之后，调用方继续 addWidget。"""
     c = QWidget()
     c.setObjectName("Card")
     root = QVBoxLayout(c)
-    root.setContentsMargins(16, 12, 16, 12)   # 紧凑刻度：去掉日志框后再压一层边距
-    root.setSpacing(8)
+    root.setContentsMargins(0, 0, 0, 0)      # 页眉带要贴边铺满，内边距交给 body
+    root.setSpacing(0)
 
-    head = QHBoxLayout()
-    head.setSpacing(8)
+    head = QWidget()
+    head.setObjectName("CardHead")
+    head.setStyleSheet(
+        f"#CardHead {{ background:{tint_bg}; "
+        f"border-top-left-radius:12px; border-top-right-radius:12px; }}")
+    hl = QHBoxLayout(head)
+    hl.setContentsMargins(14, 9, 12, 9)
+    hl.setSpacing(8)
     badge = QLabel(icon)
     badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    badge.setFixedSize(28, 28)
+    badge.setFixedSize(24, 24)
     badge.setStyleSheet(
-        f"background:{tint_bg}; color:{tint}; border-radius:9px; font-size:15px;")
+        f"background:{tint}; color:#FFFFFF; border-radius:7px; font-size:13px;")
     ttl = QLabel(title)
-    ttl.setStyleSheet(tokenize("background:transparent; color:#1F2329; font-size:14px; font-weight:700;"))
-    head.addWidget(badge)
-    head.addWidget(ttl)
-    head.addStretch(1)
+    ttl.setStyleSheet("background:transparent; color:#1F2329; font-size:14px; font-weight:700;")
+    hl.addWidget(badge)
+    hl.addWidget(ttl)
+    hl.addStretch(1)
     if tip:
         help_btn = QPushButton("?")
         help_btn.setObjectName("HelpBtn")
@@ -750,17 +767,14 @@ def _card(title, icon="", tint=PRIMARY, tint_bg="#EAF1FF", tip=""):
         help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         help_btn.setToolTip(tip)
         help_btn.setStyleSheet(_HELP_QSS)
-        head.addWidget(help_btn)
-    root.addLayout(head)
+        hl.addWidget(help_btn)
+    root.addWidget(head)
 
-    line = QFrame()
-    line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet("QFrame{background:#EEF0F3; border:none; max-height:1px;}")
-    root.addWidget(line)
-
-    v = QVBoxLayout()
+    body = QWidget()
+    v = QVBoxLayout(body)
+    v.setContentsMargins(16, 12, 16, 12)
     v.setSpacing(8)
-    root.addLayout(v)
+    root.addWidget(body, 1)
     return c, v
 
 
@@ -1174,64 +1188,6 @@ class RecordingsLibrary(QWidget):
 
 
 # ====================================================================
-# 全局热键：RegisterHotKey + 独立线程消息循环，Ctrl+Alt+R 开/停录制
-# ====================================================================
-class HotkeyGrabber(QThread):
-    """系统级热键监听（切到其它应用/全屏也生效）。
-
-    RegisterHotKey 用 NULL 句柄 → WM_HOTKEY 进本线程消息队列，故在本线程里
-    GetMessage 阻塞收取，命中就发 pressed(id) 回主线程。注册不上（被别的
-    程序占用）就静默跳过，不影响界面；退出时投递 WM_QUIT 让阻塞返回并注销。"""
-    pressed = Signal(int)
-
-    def __init__(self, hotkeys, parent=None):
-        super().__init__(parent)
-        self._hotkeys = dict(hotkeys)          # id -> (mods, vk)
-        self._tid = None
-        self._ready = threading.Event()
-
-    def run(self):
-        u32 = ctypes.windll.user32
-        u32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int,
-                                       ctypes.c_uint, ctypes.c_uint]
-        u32.RegisterHotKey.restype = wintypes.BOOL
-        u32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
-        u32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
-                                    wintypes.UINT, wintypes.UINT]
-        u32.GetMessageW.restype = ctypes.c_int
-        self._tid = ctypes.windll.kernel32.GetCurrentThreadId()
-        self._ready.set()
-        live = {}
-        for hid, (mods, vk) in self._hotkeys.items():
-            if u32.RegisterHotKey(None, hid, mods, vk):
-                live[hid] = True
-        if not live:                            # 一个都没注册上：静默收工
-            return
-        msg = wintypes.MSG()
-        while True:
-            r = u32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if r == 0 or r == -1:               # WM_QUIT / 出错 → 退出循环
-                break
-            if msg.message == WM_HOTKEY and int(msg.wParam) in live:
-                self.pressed.emit(int(msg.wParam))
-        for hid in live:
-            u32.UnregisterHotKey(None, hid)
-
-    def stop(self):
-        """投递 WM_QUIT 让阻塞中的 GetMessage 立即返回，线程收尾注销热键。"""
-        self._ready.wait(1.0)
-        if not self._tid:
-            return
-        try:
-            u32 = ctypes.windll.user32
-            u32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
-                                               wintypes.WPARAM, wintypes.LPARAM]
-            u32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
-        except Exception:
-            pass
-
-
-# ====================================================================
 # 设备检测：后台跑 ffmpeg 试录测电平，主线程只收结果（不卡 UI）
 # ====================================================================
 class LevelProbe(QThread):
@@ -1280,11 +1236,10 @@ class RecordingPanel(BasePanel):
         self._filter_on = False
         self._sys_spec = None       # 内部声音当前选型 ("system", None|名字)
         self._probes = {}           # kind(mic/sys) -> LevelProbe（同一时刻各一个）
-        self._hotkey = None         # HotkeyGrabber（全局 Ctrl+Alt+R 开/停，仅 Windows）
 
-        # ---- 双栏骨架：左＝(滚动的配置卡 + 固定底部的日志/录制按钮) / 右＝记录库 ----
-        # 日志与录制主按钮挂在左列底部不参与滚动：否则内容比窗口高时，
-        # 最该一眼看到的“开始录制”会被顶到滚动区外面去
+        # ---- OBS 式功能分区骨架 ----
+        # 左＝「录制目标」舞台（大号读数 + 场景条式模式切换）+ 画面 / 声音 两块源坞，整列可滚动
+        # 右＝竖排「控制」坞（录制主按钮 + 快捷键，置顶）压着「保存」坞，底部是记录库
         split = QHBoxLayout()
         split.setSpacing(12)
         left = QWidget()
@@ -1303,13 +1258,17 @@ class RecordingPanel(BasePanel):
         lcv.setContentsMargins(0, 0, 0, 0)
         lcv.setSpacing(10)
         lscroll.setWidget(lc)
-        leftv.addWidget(lscroll, 1)          # 只有三张配置卡滚动
-        self.library = RecordingsLibrary(self)
+        leftv.addWidget(lscroll, 1)          # 舞台 + 画面 + 声音 三块坞滚动
+        # 右列：控制坞（_build_control_dock 用 insertWidget(0) 落最上）→ 保存坞 → 记录库
+        right = QWidget()
+        rightv = QVBoxLayout(right)
+        rightv.setContentsMargins(0, 0, 0, 0)
+        rightv.setSpacing(10)
         split.addWidget(left, 1)
-        split.addWidget(self.library, 0)
+        split.addWidget(right, 0)
         outer.addLayout(split, 1)
 
-        # ---- 卡片 1：录制目标 ----
+        # ---- 舞台坞：录制目标（类比 OBS 预览区，切模式/选目标即刷新大字读数）----
         c1, v1 = _card("录制目标", "🎬", tip=(
             "<b>录制目标</b><br>"
             "· 全屏：录制整个显示器，可在下方切换主屏 / 所有屏。<br>"
@@ -1318,6 +1277,32 @@ class RecordingPanel(BasePanel):
             "（含已最小化的，开录时自动还原）；录制中指示框会跟着窗口移动。"))
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
+
+        canvas = QFrame()
+        canvas.setObjectName("StageCanvas")
+        canvas.setMinimumHeight(148)
+        canvas.setStyleSheet(tokenize(_STAGE_QSS))
+        cvl = QVBoxLayout(canvas)
+        cvl.setContentsMargins(16, 14, 16, 14)
+        cvl.setSpacing(4)
+        self.stage_glyph = QLabel("🖥")
+        self.stage_glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_glyph.setStyleSheet("background:transparent; font-size:40px;")
+        self.stage_text = QLabel("全屏 · 主屏幕")
+        self.stage_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_text.setStyleSheet(
+            "background:transparent; color:#1F2329; font-size:16px; font-weight:700;")
+        self.stage_sub = QLabel("录制整块屏幕的画面，可在下方切主屏 / 所有屏")
+        self.stage_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_sub.setWordWrap(True)
+        self.stage_sub.setStyleSheet("background:transparent; color:#8F959E; font-size:12px;")
+        cvl.addStretch(1)
+        cvl.addWidget(self.stage_glyph)
+        cvl.addWidget(self.stage_text)
+        cvl.addWidget(self.stage_sub)
+        cvl.addStretch(1)
+        v1.addWidget(canvas)
+
         tile_fs = _tile("🖥", "全屏", self._mode_group)
         tile_rg = _tile("⬚", "框选区域", self._mode_group)
         tile_wd = _tile("🎯", "指定窗口", self._mode_group)
@@ -1362,14 +1347,11 @@ class RecordingPanel(BasePanel):
         v1.addWidget(self.lbl_win)
         lcv.addWidget(c1)
 
-        # ---- 卡片 2：画面与声音 ----
-        c2, v2 = _card("画面与声音", "🎞", tint="#6C5CE7", tint_bg="#EDE9FE", tip=(
-            "<b>画面与声音</b><br>"
+        # ---- 画面坞（帧率 / 码率）----
+        pic, v2 = _card("画面", "🎞", tint="#6C5CE7", tint_bg="#EDE9FE", tip=(
+            "<b>画面</b><br>"
             "· 帧率 / 码率越高越清晰，文件也越大。<br>"
-            "· 内部声音＝系统播放的声音；外部声音＝麦克风，两者可同时勾选。<br>"
-            "· 每个音源单独存为 WAV 音轨，视频文件不含声轨，方便后期剪辑。<br>"
-            "· 录不到内部声音：确认 ffmpeg 支持 WASAPI 环回，或在声音设置里"
-            "启用『立体声混音』后点 ⟳ 重试。"))
+            "· 帧率常用 30，码率 8M 够一般录屏；录高清动态画面可上调。"))
         self.cb_fps = QComboBox()
         self.cb_fps.addItems(["10", "15", "24", "30"])
         self.cb_fps.setCurrentText("30")
@@ -1382,6 +1364,28 @@ class RecordingPanel(BasePanel):
         fr = _row(_tip("帧率"), self.cb_fps, _tip("视频码率"), self.cb_br)
         fr.addStretch(1)
         v2.addLayout(fr)
+        lcv.addWidget(pic)
+
+        # ---- 声音坞（混音器式：声道 + 源切换 + 各路设备/检测）----
+        aud, v3 = _card("声音", "🎧", tint="#12A150", tint_bg="#E6F6EE", tip=(
+            "<b>声音</b><br>"
+            "· 内部声音＝系统播放的声音；麦克风＝外部声音，两者可同时勾选。<br>"
+            "· 勾选的声音会与画面合流进同一个 MP4（成片自带音轨）；"
+            "两者都选时会自动混成一条音轨。<br>"
+            "· 声道：人声居中（单麦左右同响，最常用）/ 立体声 / 单声道。<br>"
+            "· 录不到内部声音：确认 ffmpeg 支持 WASAPI 环回，或在声音设置里"
+            "启用『立体声混音』后点 ⟳ 重试。"))
+        self.cb_chan = QComboBox()
+        self.cb_chan.addItem("人声居中（双耳同声）", "center")
+        self.cb_chan.addItem("立体声（左右独立）", "stereo")
+        self.cb_chan.addItem("单声道", "mono")
+        self.cb_chan.setFixedWidth(150)
+        self.cb_chan.setToolTip(
+            "单只麦克风只能算单声源，选「人声居中」把声音同时填到左右耳；\n"
+            "接了两路信号想要真立体声选「立体声」；只要一路选「单声道」。")
+        cr = _row(_tip("声道"), self.cb_chan)
+        cr.addStretch(1)
+        v3.addLayout(cr)
 
         self._audio_group = QButtonGroup(self)
         # 非互斥：内部/外部声音可同时勾选，各自单独落一条 WAV 音轨；
@@ -1391,7 +1395,7 @@ class RecordingPanel(BasePanel):
         self.chip_a_sys = _chip("🔊  内部声音", self._audio_group)
         self.chip_a_mic = _chip("🎤  麦克风", self._audio_group)
         self.chip_a_none.setChecked(True)
-        v2.addLayout(_row(self.chip_a_none, self.chip_a_sys, self.chip_a_mic))
+        v3.addLayout(_row(self.chip_a_none, self.chip_a_sys, self.chip_a_mic))
 
         # 内部声音：设备下拉（WASAPI 环回 / 各声卡立体声混音可切换）+ 检测
         self.cb_sys = QComboBox()
@@ -1404,9 +1408,9 @@ class RecordingPanel(BasePanel):
         srw.addWidget(_tip("内部声音设备"))
         srw.addWidget(self.cb_sys, 1)
         srw.addWidget(self.b_test_sys)
-        v2.addWidget(self.row_sys)
+        v3.addWidget(self.row_sys)
         self.lbl_test_sys = _tip("")
-        v2.addWidget(self.lbl_test_sys)
+        v3.addWidget(self.lbl_test_sys)
 
         # 麦克风：设备下拉（多声卡/多通道可切换）+ 检测 + ⟳ 刷新
         self.cb_mic = QComboBox()
@@ -1422,50 +1426,39 @@ class RecordingPanel(BasePanel):
         mr.addWidget(self.cb_mic, 1)
         mr.addWidget(self.b_test_mic)
         mr.addWidget(self.b_arefresh)
-        v2.addWidget(self.row_mic)
+        v3.addWidget(self.row_mic)
         self.lbl_test_mic = _tip("")
-        v2.addWidget(self.lbl_test_mic)
+        v3.addWidget(self.lbl_test_mic)
 
         self.lbl_audio = _tip("")
-        v2.addWidget(self.lbl_audio)
-        lcv.addWidget(c2)
+        v3.addWidget(self.lbl_audio)
+        lcv.addWidget(aud)
 
-        # ---- 卡片 3：保存位置 ----
-        c3, v3 = _card("保存位置", "📁", tint="#12A150", tint_bg="#E6F6EE", tip=(
+        # ---- 保存坞（右列控制坞下方，与录制主按钮同属右手边操作区）----
+        out, vo = _card("保存", "📁", tint="#0E9F8E", tint_bg="#E4F6F2", tip=(
             "<b>保存位置</b><br>"
             "· 录制文件保存到该目录，文件名自动生成：录屏_年月日_时分秒.mp4。<br>"
-            "· 勾选的音轨同目录存放，命名如 录屏_…_内部声音.wav、录屏_…_麦克风.wav。"))
+            "· 勾选的声音直接封进这个 MP4（不再另存旁路 WAV），双击即可带声播放。"))
         self.ed_out = QLineEdit(str(Path(DOWNLOAD_DIR) / "录屏"))
         self.b_dir = KitButton("浏览…", kind="ghost", obj_name="GhostBtn", explain=False)
-        v3.addLayout(_row(self.ed_out, self.b_dir))
+        vo.addLayout(_row(self.ed_out, self.b_dir))
         # 录完顺带生成字幕（逻辑走独立字幕模块，不干扰录制状态机）：勾选 + ⚙ 预配选项
         self.ck_subtitle = QCheckBox("录完顺带生成字幕")
         self.b_subopt = KitButton("⚙ 字幕选项", kind="ghost", obj_name="GhostBtn", explain=False)
         self.b_subopt.clicked.connect(self._edit_subtitle_opts)
-        v3.addLayout(_row(self.ck_subtitle, self.b_subopt))
+        vo.addLayout(_row(self.ck_subtitle, self.b_subopt))
         self._subtitle_opts = None
-        lcv.addWidget(c3)
 
-        # 录制主按钮固定在左列底部（不进滚动区），始终可见；
-        # 用户不需要日志框，说明信息统一走「?」悬停提示 + 弹窗，不再占一块列表
-        self.make_run_row(leftv, "⏺ 开始录制")
-        # 借骨架外观，换掉行为：录屏不需要 ToolWorker/进度条状态机
-        self.b_run.clicked.disconnect()
-        self.b_stop.clicked.disconnect()
-        self.b_run.clicked.connect(self._start_rec)
-        self.b_stop.clicked.connect(self._stop_rec)
-        # 停止交给录制期间置顶的浮条 RecBar，面板里的停止平时是死的灰按钮——
-        # 直接收起它和进度条，只留一整条通栏的录制主按钮，视觉更利落
-        self.b_stop.setVisible(False)
-        self.bar.setVisible(False)
-        self.b_run.setObjectName("RecordBtn")
-        self.b_run.setStyleSheet(_RECORD_QSS)
-        self.b_run.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.b_run.setMinimumHeight(42)
-        self.b_stop.setEnabled(False)
+        # 录制主按钮 + 快捷键提示固定在右列顶部「控制」坞（insertWidget(0) 落最上，始终可见）
+        self._build_control_dock(rightv)
+        rightv.addWidget(out)
+        # 记录库垫在右列底部，吃掉剩余高度
+        self.library = RecordingsLibrary(self)
+        rightv.addWidget(self.library, 1)
 
         # ---- 信号接线 ----
         self._mode_group.idClicked.connect(self._mode_changed)
+        self.cb_screen.currentIndexChanged.connect(self._update_stage)
         self.b_pick.clicked.connect(self._pick_region)
         self.b_pickwin.clicked.connect(self._pick_window)
         self.cb_window.activated.connect(self._window_from_combo)
@@ -1494,16 +1487,9 @@ class RecordingPanel(BasePanel):
             lambda: self.library.set_dir(self.ed_out.text().strip()))
         self.library.set_dir(self.ed_out.text().strip())
 
-        # ---- 全局热键：Ctrl+Alt+R 开始/停止（切到别的应用、全屏也生效）----
-        # 浮条已上幽灵模式（录不进画面），但用户可能在别的窗口想随手开关，
-        # 热键就是那条不依赖浮条可见性的兜底通道。随应用退出注销，免得泄漏。
-        if IS_WINDOWS:
-            self._hotkey = HotkeyGrabber({1: (HOTKEY_MODS, VK_TOGGLE)}, self)
-            self._hotkey.pressed.connect(self._on_hotkey)
-            self._hotkey.start()
-            app = QApplication.instance()
-            if app is not None:
-                app.aboutToQuit.connect(self._hotkey.stop)
+        # 全局「录屏开/停」热键已上移到主窗口（gui/main_window.apply_recorder_shortcut）：
+        # 经 global_hotkey.manager 注册，面板从没打开过也能一键开录，键位在设置里改。
+        # 命中后主窗调 self.toggle_record()，与下面主按钮走同两条路径，行为一致。
 
     @staticmethod
     def _lb_row(*ws):
@@ -1513,6 +1499,90 @@ class RecordingPanel(BasePanel):
             r.addWidget(w)
         r.addStretch(1)
         return r
+
+    def _build_control_dock(self, parent_layout):
+        """OBS「控制」坞：右列顶部的录制主按钮 + 快捷键提示，始终可见。
+
+        不走 BasePanel.make_run_row：录屏不需要 ToolWorker/进度条那套状态机，
+        停止也交给录制期间置顶的 RecBar；这里只要一条通栏大按钮 + 一行键位提示。
+        b_stop/bar 仍按名字挂上（隐藏的实占件）：_countdown/_finish 还按它们引用。
+        用 insertWidget(0)：无论何时调用都落到右列最上方，保持「控制」在保存/记录库之上。"""
+        dock = QWidget()
+        dock.setObjectName("ControlDock")
+        dock.setStyleSheet(tokenize(_CONTROL_QSS))
+        dv = QVBoxLayout(dock)
+        dv.setContentsMargins(14, 12, 14, 12)
+        dv.setSpacing(8)
+
+        cap = QLabel("🎛  录制控制")
+        cap.setStyleSheet(
+            "background:transparent; color:#1F2329; font-size:13px; font-weight:700;")
+        dv.addWidget(cap)
+
+        self.b_run = QPushButton("⏺  开始录制")
+        self.b_run.setObjectName("RecordBtn")
+        self.b_run.setStyleSheet(tokenize(_RECORD_QSS))
+        self.b_run.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.b_run.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.b_run.setMinimumHeight(46)
+        self.b_run.clicked.connect(self._start_rec)
+        dv.addWidget(self.b_run)
+
+        self.lbl_hotkey = QLabel(self._hotkey_hint_text())
+        self.lbl_hotkey.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_hotkey.setWordWrap(True)
+        self.lbl_hotkey.setStyleSheet(
+            "color:#8F959E; font-size:12px; background:transparent;")
+        dv.addWidget(self.lbl_hotkey)
+
+        # 停止/进度条挂成隐藏占位：状态机（_countdown/_finish）仍按名字引用它们
+        self.b_stop = QPushButton()
+        self.b_stop.setVisible(False)
+        self.b_stop.setEnabled(False)
+        self.b_stop.clicked.connect(self._stop_rec)
+        self.bar = QProgressBar()
+        self.bar.setVisible(False)
+
+        parent_layout.insertWidget(0, dock)
+
+    def _hotkey_hint_text(self):
+        """控制坞下面那行键位提示：从当前配置读，没配则引导去设置里配。"""
+        try:
+            from gui.tools_registry import recorder_shortcut
+            seq = recorder_shortcut()
+        except Exception:
+            seq = ""
+        if not seq:
+            return "未设快捷键：可在「设置 → 托盘与全局快捷键」为录屏开/停配一个"
+        return f"⌨ 快捷键 {seq} 开始 / 停止录制（设置中可改）"
+
+    def _update_stage(self):
+        """刷新「舞台」大字读数：随模式/选定目标变化，类比 OBS 预览区的当前场景。"""
+        if not hasattr(self, "stage_text"):
+            return
+        idx = self._mode_index()
+        if idx == 0:
+            self.stage_glyph.setText("🖥")
+            self.stage_text.setText("全屏 · " + self.cb_screen.currentText())
+            self.stage_sub.setText("录制整块屏幕的画面，开录时它就是你看到的全部")
+        elif idx == 1:
+            self.stage_glyph.setText("⬚")
+            if self._region is not None:
+                self.stage_text.setText(
+                    f"区域 {self._region.width()}×{self._region.height()}")
+                self.stage_sub.setText(
+                    f"屏幕坐标 ({self._region.x()}, {self._region.y()}) 起的那块方框")
+            else:
+                self.stage_text.setText("还没框选区域")
+                self.stage_sub.setText("点下方『开始框选』，在屏幕上拖出一个方框")
+        else:
+            self.stage_glyph.setText("🎯")
+            if self._win is not None:
+                self.stage_text.setText(self._win[1])
+                self.stage_sub.setText("只录这个窗口，录制中指示框会跟着它一起移动")
+            else:
+                self.stage_text.setText("还没选定窗口")
+                self.stage_sub.setText("点『在屏幕上点选』，或从下拉里挑一个（含最小化的）")
 
     def _append_log(self, msg):
         """面板不再摆日志框：录制进度/结果只写文件日志，异常另有 QMessageBox 弹窗。
@@ -1536,6 +1606,7 @@ class RecordingPanel(BasePanel):
         self.lbl_win.setVisible(idx == 2)
         # 切换目标就把上一轮的选定和指示框作废，防止拿着旧目标开录
         self._drop_target()
+        self._update_stage()
 
     def _drop_target(self):
         if self._glow:
@@ -1550,6 +1621,7 @@ class RecordingPanel(BasePanel):
                 f"已选 {rect.width()}×{rect.height()}"
                 f" @ ({rect.x()}, {rect.y()})")
             self._get_glow().show_rect(rect)
+            self._update_stage()
 
     def _pick_window(self):
         got = WindowPicker.pick(self.window())
@@ -1559,6 +1631,7 @@ class RecordingPanel(BasePanel):
         self._win = (hwnd, title, logical)
         self.lbl_win.setText(f"已选定：{title}")
         self._get_glow().show_window(hwnd)
+        self._update_stage()
 
     def _window_from_combo(self, index):
         """下拉里直接选（数据里带 hwnd，指示框同样能跟随）"""
@@ -1570,6 +1643,7 @@ class RecordingPanel(BasePanel):
         self._win = (hwnd, title, logical)
         self.lbl_win.setText(f"已选定：{title}")
         self._get_glow().show_window(hwnd)
+        self._update_stage()
 
     def _get_glow(self):
         if self._glow is None:
@@ -1764,7 +1838,7 @@ class RecordingPanel(BasePanel):
         return f"🎯 {self._win[1]}"
 
     def _collect_params(self):
-        """校验并组录制计划 [(命令, 产物)]（首项视频，其后音轨）；
+        """校验并组录制计划（单条合流命令 [(命令, 产物)]，声音直接封进 MP4）；
         不合法/缺 ffmpeg 时弹提示返回 None"""
         ffmpeg = _ffmpeg_usable()
         if not ffmpeg:
@@ -1815,11 +1889,16 @@ class RecordingPanel(BasePanel):
         plans = build_record_command(
             ffmpeg, ("window" if idx == 2 else ("region" if idx == 1 else "fullscreen")),
             out_path, fps=self.cb_fps.currentText(), bitrate=self.cb_br.currentText(),
-            physical=physical, title=title, audio=self._audio_specs())
+            physical=physical, title=title, audio=self._audio_specs(),
+            channel_mode=self.cb_chan.currentData() or "center")
         return plans
 
-    def _on_hotkey(self, hid):
-        """全局热键命中：录制中→停止，空闲→开始。跟面板按钮走同两条路径，行为一致。"""
+    def is_recording(self):
+        """是否正在录制（含倒计时/收尾）：主窗全局热键据此决定这次是开还是停。"""
+        return self._rec is not None
+
+    def toggle_record(self):
+        """主窗全局热键回调入口：录制中→停止，空闲→开始（与面板主按钮同两条路径，行为一致）。"""
         if self._rec is not None:
             self._stop_rec()
         else:
@@ -1833,7 +1912,8 @@ class RecordingPanel(BasePanel):
             return
         self._out_path = plans[0][1]
         self._audio_paths = [p for _c, p in plans[1:]]
-        self._rec = Recorder(plans)
+        self._rec = Recorder(plans,
+                             channel_mode=self.cb_chan.currentData() or "center")
 
         w = self.window()
         if w is not self and not self._filter_on:
@@ -1926,11 +2006,7 @@ class RecordingPanel(BasePanel):
         size = os.path.getsize(self._out_path) if os.path.isfile(self._out_path) else 0
         self._append_log(f"🎉 录制完成：{self._out_path}（{_fmt_secs(secs)}，"
                          f"{size / 1024 / 1024:.1f} MB）")
-        for p in self._audio_paths:
-            if os.path.isfile(p):          # 0 字节的旁路 WAV 已被 Recorder 清掉
-                self._append_log(
-                    f"　🔊 音轨：{os.path.basename(p)}"
-                    f"（{os.path.getsize(p) / 1024 / 1024:.1f} MB）")
+        # 分进程录的旁路 WAV 已由 Recorder 合流进 MP4 并删除，成片自带声轨
         reveal_in_folder(self._out_path)
         # 新成品即时入库（置顶）
         if getattr(self, "library", None) is not None:

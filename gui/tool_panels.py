@@ -1243,12 +1243,6 @@ def _build_recording_panel(parent=None):
     return RecordingPanel(parent)
 
 
-def _build_rec_demo_panel(parent=None):
-    """录屏测试 Demo（极简）面板：同样延迟导入断循环（它要从本模块拿 BasePanel）"""
-    from gui.dialogs_rec_demo import RecDemoPanel
-    return RecDemoPanel(parent)
-
-
 def _build_breakdown_panel(parent=None):
     """爆款拆解面板在 dialogs_breakdown 里；同样延迟导入断循环
     （dialogs_breakdown 要从本模块拿 BasePanel/ToolWorker）"""
@@ -1279,7 +1273,6 @@ PANEL_FACTORIES = {
     "视频溯源": _safe_factory(TracePanel),
     "素材提取": _safe_factory(MaterialPanel),
     "屏幕录制": _safe_factory(_build_recording_panel),
-    "录屏测试Demo": _safe_factory(_build_rec_demo_panel),
     "语音识别": _safe_factory(_build_asr_panel),
     "爆款拆解": _safe_factory(_build_breakdown_panel),
     "一键发布": _safe_factory(_build_publish_panel),

@@ -30,7 +30,6 @@ TOOLS = [
     ("视频溯源", "🔎", "溯源码池取码、按规则重命名并入库（需内网 MySQL）", "视频溯源"),
     ("素材提取", "🧲", "粘贴唞喑/筷手分享链接：提取去水印视频、图集、文案", "素材提取"),
     ("屏幕录制", "🎥", "全屏/框选区域/指定窗口录制，选帧率码率保存 MP4", "屏幕录制"),
-    ("录屏测试Demo", "🎬", "极简：一键录全屏，可选系统声音与画面混成单个 MP4（测试用）", "录屏测试Demo"),
     ("语音识别", "🎙", "选视频→Whisper 转口播逐字稿，导出 TXT/SRT 字幕、DeepSeek 纠错、可烧录", "语音识别"),
     ("爆款拆解", "🔥", "粘贴爆款链接：拆分镜/口播，产出画面/文案/复刻 3 类提示词与整体分析", "爆款拆解"),
     ("一键发布", "🚀", "选成品视频与平台账号，一键分发到抖音/快手/小红书/视频号", "一键发布"),
@@ -59,8 +58,15 @@ HOME_DEFAULT = ""
 #: 界面与日志里的人话名字（热键表里躺的是 token，直接拿它当提示看不懂）
 HOME_LABEL = "呼出主界面"
 LAUNCHER_LABEL = "总唤出面板"
-#: 参与热键表的两个保留 token：主窗口清理陈旧键位时要绕过它们
-RESERVED_TOKENS = frozenset({LAUNCHER_TOKEN, HOME_TOKEN})
+
+# ---------- 录屏开/停（全局切换：空＝不注册，默认 Ctrl+Alt+R） ----------
+RECORDER_KEY = "recorder_hotkey"
+RECORDER_TOKEN = "__recorder__"
+RECORDER_DEFAULT = "Ctrl+Alt+R"
+RECORDER_LABEL = "录屏开/停"
+
+#: 参与热键表的保留 token：主窗口清理陈旧键位时要绕过它们
+RESERVED_TOKENS = frozenset({LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN})
 
 
 def load_pinned():
@@ -106,6 +112,19 @@ def set_launcher_shortcut(seq):
     return seq
 
 
+def recorder_shortcut():
+    return str(app_state.get(RECORDER_KEY, RECORDER_DEFAULT) or "")
+
+
+def set_recorder_shortcut(seq):
+    """录屏开/停键：写盘 + 主窗口立即重注册；返回生效值（同 launcher/home 口径）"""
+    seq = (seq or "").strip()
+    _free_others(seq, RECORDER_KEY)
+    app_state.set_value(RECORDER_KEY, seq)
+    _reapply()
+    return seq
+
+
 def home_shortcut():
     return str(app_state.get(HOME_KEY, HOME_DEFAULT) or "")
 
@@ -127,12 +146,12 @@ def _free_others(seq, keep):
     却是唤出面板”，而界面上一堆 ✓ 看着全都对。"""
     if not seq:
         return
-    for key in (LAUNCHER_KEY, HOME_KEY):
+    for key in (LAUNCHER_KEY, HOME_KEY, RECORDER_KEY):
         if key == keep:
             continue
         if str(app_state.get(key) or "") == seq:
             app_state.set_value(key, "")
-    if keep in (LAUNCHER_KEY, HOME_KEY):
+    if keep in (LAUNCHER_KEY, HOME_KEY, RECORDER_KEY):
         scs = tool_shortcuts()
         gone = [k for k, v in scs.items() if v == seq]
         if gone:
@@ -150,7 +169,7 @@ def _reapply():
     if w is None:
         return
     for m in ("apply_tool_shortcuts", "apply_launcher_shortcut",
-              "apply_home_shortcut"):
+              "apply_home_shortcut", "apply_recorder_shortcut"):
         fn = getattr(w, m, None)
         if fn is not None:
             fn()

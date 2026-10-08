@@ -28,7 +28,9 @@ AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyPublisher}
 DefaultGroupName={#MyAppName}
 DefaultDirName={autopf}\{#MyAppName}
-; 单文件 exe 没有多组件可装，目录页留默认值即可（要改的用户自己点"浏览"）
+; 单文件 exe 全量代码都在包里；这里“分模块安装”只是让用户勾要启用哪些板块，
+; 勾的结果在装完后写进 ProgramData 清单，软件首启据此决定侧栏/扇形/工具区露不露入口。
+; 目录页仍关着（单 exe 无多目录可选），组件选择页由下面的 [Components] 自动出现。
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
 SourceDir=..
@@ -65,6 +67,19 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "cli";     Description: "同时安装命令行版（调试用，会开黑窗口）"; Flags: unchecked
 Name: "creator"; Description: "同时安装创作版（内置语音识别模型，包体大得多）"; Flags: unchecked
 
+; 安装类型：默认 full（四块全勾）；用户取消任一勾即转为 custom
+[Types]
+Name: "full";   Description: "完整安装（全部功能模块）"
+Name: "custom"; Description: "自定义安装"; Flags: iscustom
+
+; 四个功能模块：只是入口开关（代码全在单 exe 里），勾选结果由 [Code] 写进
+; {commonappdata}\AIGC视频助手\install.json，供 core/modules.py 首启采纳。
+[Components]
+Name: "dashboard"; Description: "数据中台：任务/产出多维统计看板、下钻明细与执行记录"; Types: full custom
+Name: "aigc";      Description: "AIGC板块 + 素材库：任务中心 · 产品中心 · 线路负载 · 爆款拆解 · 素材工坊"; Types: full custom
+Name: "build";     Description: "基建板块 + 素材库：批量基建（客户/执照/账户三级）· 素材工坊"; Types: full custom
+Name: "tools";     Description: "工具中心：录屏 / 语音识别 / 一键发布 等小工具 · 本地文件搜索"; Types: full custom
+
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\AIGC视频助手-命令行.exe"; DestDir: "{app}"; Flags: ignoreversion skipifdoesntexist; Tasks: cli
@@ -81,6 +96,35 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+// 安装写完后把勾选的功能模块记进机器级清单（ProgramData）：那是“所有用户共用”
+// 的位置，装时用管理员写、日后任意用户双击运行都能读到；软件首启据此把启用集
+// seed 进用户层（见 core/modules.py）。一个都没勾时写“全开”，免得首启侧栏是空的。
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Dir, Mods, Body: String;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+  Dir := ExpandConstant('{commonappdata}\AIGC视频助手');
+  if not ForceDirectories(Dir) then
+  begin
+    Log('无法创建 ProgramData 目录，跳过模块清单写入');
+    Exit;
+  end;
+  Mods := '';
+  if IsComponentSelected('dashboard') then Mods := Mods + '"dashboard",';
+  if IsComponentSelected('aigc')      then Mods := Mods + '"aigc",';
+  if IsComponentSelected('build')     then Mods := Mods + '"build",';
+  if IsComponentSelected('tools')     then Mods := Mods + '"tools",';
+  while (Length(Mods) > 0) and (Mods[Length(Mods)] = ',') do
+    Delete(Mods, Length(Mods), 1);
+  if Mods = '' then
+    Mods := '"dashboard","aigc","build","tools"';   // 全没勾：退成全开，不空侧栏
+  Body := '{"modules":[' + Mods + ']}' + #13#10;
+  if not SaveStringToFile(Dir + '\install.json', Body, False) then
+    Log('写入 install.json 失败');
+end;
+
 // 卸载默认不动数据家：成品视频与历史任务库都在那里，几十 GB 的东西绝不能跟着
 // 卸载消失（用户重装还要靠它）。真想清干净就在最后一步选"删除"。
 const

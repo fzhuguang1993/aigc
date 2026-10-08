@@ -41,9 +41,10 @@ from gui.mouse_gesture import (GESTURE_COMMANDS, COMMAND_LABELS,
 from gui.tools_registry import (TOOLS, set_tool_shortcut, tool_shortcuts,
                                 launcher_shortcut, set_launcher_shortcut,
                                 home_shortcut, set_home_shortcut,
+                                recorder_shortcut, set_recorder_shortcut,
                                 global_hotkey_enabled, set_global_hotkey_enabled,
-                                LAUNCHER_TOKEN, HOME_TOKEN,
-                                HOME_LABEL, LAUNCHER_LABEL)
+                                LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN,
+                                HOME_LABEL, LAUNCHER_LABEL, RECORDER_LABEL)
 from gui import global_hotkey
 from gui import tray
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, PANEL_FACTORIES
@@ -173,6 +174,16 @@ class SettingsPage(QWidget):
         head = page_header("设置", "修改保存后重启生效（命名规则除外：保存即生效）", icon="⚙️")
         head.setToolTip(f"配置文件：{CONFIG_JSON}")
         lay.addWidget(head)
+
+        # ---------- 功能模块管理：安装期没选的模块可在此增量启用（当前本地即时启用，联网下载留接口） ----------
+        card, cv = _section_card("功能模块管理", "只影响入口显示 · 卸载/重装请在程序卸载器完成")
+        self._mod_body = QWidget()
+        self._mod_body_v = QVBoxLayout(self._mod_body)
+        self._mod_body_v.setContentsMargins(0, 0, 0, 0)
+        self._mod_body_v.setSpacing(8)
+        cv.addWidget(self._mod_body)
+        lay.addWidget(card)
+        self._render_modules()
 
         # ---------- 账户与授权 ----------
         card, cv = _section_card("账户与授权", "姓名参与成品文件命名")
@@ -315,6 +326,23 @@ class SettingsPage(QWidget):
         hr.addStretch(1)
         cv.addLayout(hr)
         self.home_key.editingFinished.connect(self._save_home_key)
+
+        # 录屏开/停：全局一键切换录制（默认 Ctrl+Alt+R，与主窗口 apply_recorder_shortcut 同源）
+        rr = QHBoxLayout()
+        rr.setSpacing(10)
+        self.rec_key = QKeySequenceEdit(QKeySequence(recorder_shortcut()))
+        self.rec_key.setFixedWidth(220)
+        b_rk_clear = QPushButton("清空")
+        b_rk_clear.setObjectName("GhostBtn")
+        b_rk_clear.setToolTip("不配这条：开/停只靠录屏面板里的按钮")
+        b_rk_clear.clicked.connect(self._clear_recorder_key)
+        rr.addWidget(_form_label(RECORDER_LABEL))
+        rr.addWidget(self.rec_key)
+        rr.addWidget(b_rk_clear)
+        rr.addWidget(QLabel("焦点在其它软件里也能开/停录制"))
+        rr.addStretch(1)
+        cv.addLayout(rr)
+        self.rec_key.editingFinished.connect(self._save_recorder_key)
 
         self.lbl_hotkey = QLabel()
         self.lbl_hotkey.setWordWrap(True)
@@ -691,6 +719,95 @@ class SettingsPage(QWidget):
         self._refresh_filesearch_status()     # 索引进度是后台线程写的，跟着刷一次
         # 不自动覆盖用户正在编辑的内容（命名/线路等）
 
+    # ---------- 功能模块管理（增量启用 UI）----------
+    def _render_modules(self):
+        """按当前启用集重画模块行：已启用给「停用」，未启用给「安装」。"""
+        from core import modules
+        if not hasattr(self, "_mod_body_v"):
+            return
+        while self._mod_body_v.count():
+            it = self._mod_body_v.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        en = modules.enabled_modules()
+        for key in modules.MODULE_ORDER:
+            info = modules.MODULES[key]
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(2, 4, 2, 4)
+            h.setSpacing(10)
+            name = QLabel(f"{info['icon']}  {info['label']}")
+            name.setStyleSheet(tokenize(
+                "font-size:14px; font-weight:700; color:#1F2329; background:transparent;"))
+            h.addWidget(name)
+            desc = QLabel(info["desc"])
+            desc.setStyleSheet(tokenize(
+                "color:#8F959E; font-size:12px; background:transparent;"))
+            desc.setWordWrap(True)
+            h.addWidget(desc, 1)
+            on = key in en
+            state = QLabel("已启用" if on else "未安装")
+            state.setStyleSheet(tokenize(
+                "color:#00A870; font-size:12px; background:transparent;" if on else
+                "color:#8F959E; font-size:12px; background:transparent;"))
+            h.addWidget(state)
+            btn = QPushButton("停用" if on else "安装")
+            btn.setObjectName("GhostBtn")
+            if on:
+                btn.clicked.connect(lambda _=False, k=key: self._disable_module(k))
+            else:
+                btn.clicked.connect(lambda _=False, k=key, b=btn: self._install_module(k, b))
+            h.addWidget(btn)
+            self._mod_body_v.addWidget(row)
+
+    def _rebuild_nav_now(self):
+        """让主窗口立即按新的启用集重拼导航（页面本体早已全量构建，只是入口显隐）"""
+        fn = getattr(self.window(), "_rebuild_nav", None)
+        if callable(fn):
+            fn()
+
+    def _module_status(self, msg):
+        """轻提示：优先写主窗口状态栏（不弹遮眼对话框）；拿不到才退回消息框。"""
+        sb = getattr(self.window(), "statusBar", None)
+        if callable(sb):
+            try:
+                sb().showMessage(msg)
+                return
+            except Exception:
+                pass
+        self.setStatusTip(msg)
+
+    def _install_module(self, key, btn):
+        """「安装」：当前为本地即时启用——切「下载中…」占位跑一小段演示联网，
+        结束即 set_enabled 生效。★ seam：将来把下面的一次性演示换成从 server
+        下载对应资源、下载成功后再调 set_enabled(key, True)，其余不变。"""
+        from core import modules
+        if btn.text().startswith("⏳"):
+            return
+        btn.setText("⏳ 下载中…")
+        btn.setEnabled(False)
+
+        def done():
+            modules.set_enabled(key, True)
+            self._rebuild_nav_now()
+            self._render_modules()
+            self._module_status(f"✅ {modules.MODULES[key]['label']} 已安装，入口已即时出现在左侧导航。")
+        QTimer.singleShot(900, done)      # 占位演示；换成真下载后走回调即可
+
+    def _disable_module(self, key):
+        """「停用」：只收起入口，页面代码仍在包里；禁止停到零模块（至少留一个业务入口）。"""
+        from core import modules
+        en = modules.enabled_modules()
+        if key in en and len(en) <= 1:
+            QMessageBox.warning(self, "无法停用",
+                                "至少要保留一个功能模块，否则主界面会没有任何业务入口。")
+            return
+        modules.set_enabled(key, False)
+        self._rebuild_nav_now()
+        self._render_modules()
+        self._module_status(f"{modules.MODULES[key]['label']} 已停用，可在本区重新安装。")
+
     # ---------- 本地文件搜索（开关与目录都即时落盘，后台线程下一轮就认） ----------
     def _dir_box(self, hint, paths):
         """一行灰字说明 + 目录列表 + 「添加/移除」：文件名索引与文档正文两份清单
@@ -1063,7 +1180,8 @@ class SettingsPage(QWidget):
     def _hotkey_label(self, token):
         """热键表里的 token 翻成人话：工具名直接用，两个保留位是内部标识"""
         return {LAUNCHER_TOKEN: LAUNCHER_LABEL,
-                HOME_TOKEN: HOME_LABEL}.get(token, str(token))
+                HOME_TOKEN: HOME_LABEL,
+                RECORDER_TOKEN: RECORDER_LABEL}.get(token, str(token))
 
     def _refresh_hotkey_status(self):
         """如实回报系统热键注册结果。
@@ -1078,6 +1196,8 @@ class SettingsPage(QWidget):
             seqs.append(launcher_shortcut())
         if home_shortcut():
             seqs.append(home_shortcut())
+        if recorder_shortcut():
+            seqs.append(recorder_shortcut())
         if not hk.available():
             self._set_hotkey_text("#FF8D19", "⚠ 本机不支持系统级热键（仅 Windows）："
                                              "快捷键只在软件窗口内生效")
@@ -1162,6 +1282,19 @@ class SettingsPage(QWidget):
     def _clear_home_key(self):
         self.home_key.clear()
         self._save_home_key()
+
+    def _save_recorder_key(self):
+        """录屏开/停键：落盘 + 主窗口立即重注册，失败原因回到下方状态行。
+        与总唤出/主界面键同口径（半截组合不落盘、同键让位）。"""
+        seq = self._key_seq_or_hint(self.rec_key)
+        if seq is None:
+            return
+        set_recorder_shortcut(seq)
+        self._refresh_hotkey_status()
+
+    def _clear_recorder_key(self):
+        self.rec_key.clear()
+        self._save_recorder_key()
 
     # ---------- 鼠标手势：录制 / 绑定 / 解绑 ----------
     def _engine(self):

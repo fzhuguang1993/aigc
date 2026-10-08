@@ -11,7 +11,7 @@ import types
 import pytest
 
 from video_text_tools.screen_recorder import (
-    IS_WINDOWS, Recorder, audio_out_paths, build_record_command,
+    IS_WINDOWS, Recorder, build_record_command, build_mux_command,
     escape_dshow_name, has_wasapi_loopback, is_mix_device,
     list_audio_devices, list_windows, parse_dshow_devices, rect_to_physical,
     screen_physical, virtual_desktop, _normalize_audio_list,
@@ -103,11 +103,13 @@ def test_build_fullscreen_primary_default():
     assert len(plans) == 1 and plans[0][1] == "a.mp4"
     cmd = plans[0][0]
     s = _seg(cmd)
-    assert cmd[:5] == ["ffmpeg.exe", "-hide_banner", "-y", "-f", "gdigrab"]
+    assert cmd[:3] == ["ffmpeg.exe", "-hide_banner", "-y"]
+    assert "-thread_queue_size 2048 -f gdigrab" in s
     assert "-i desktop" in s
     assert "-offset_x" not in s          # 不给范围 = gdigrab 默认主屏
     assert "-an" in s and "dshow" not in s
-    assert "-c:v libx264 -preset veryfast -b:v 4M" in s
+    assert "-c:v libx264 -preset veryfast -tune zerolatency -b:v 4M" in s
+    assert "-vf" in s and "fps=30" in s        # 限幅+强制恒定帧率滤镜链
     assert "-pix_fmt yuv420p" in s and "-movflags +faststart" in s
     assert cmd[-1] == "a.mp4"
 
@@ -132,17 +134,23 @@ def test_build_window_mode():
     assert "-offset_x" not in s
 
 
-def test_build_with_audio_maps_and_escapes():
+def test_build_with_audio_splits_video_and_mic_into_two_procs():
+    """画面与麦克风分进程：plans[0] 视频(-an, gdigrab)，plans[1] 麦克风录裸 WAV"""
     plans = build_record_command("ffmpeg.exe", "fullscreen", "a.mp4",
                                  audio=r"Mic : 1=2")
-    assert len(plans) == 2                       # 视频 + 一条音轨两个子进程
-    vs, acmd = plans[0][0], plans[1][0]
-    assert "-an" in _seg(vs)                     # 视频不含声轨
-    s = _seg(acmd)
-    assert "-f dshow -i audio=Mic \\: 1\\=2" in s
-    assert "-c:a pcm_s16le -ar 48000 -ac 2" in s
-    assert plans[1][1] == "a_麦克风.wav" and acmd[-1] == "a_麦克风.wav"
-    assert "gdigrab" not in s                    # 音轨进程不碰视频
+    assert len(plans) == 2
+    vcmd, vout = plans[0]
+    s = _seg(vcmd)
+    assert vout == "a.mp4"
+    assert "gdigrab" in s and "-an" in s          # 视频进程绝不带音频输入
+    assert "dshow" not in s                        # 音频不挤进视频进程
+    assert "-c:v libx264 -preset veryfast -tune zerolatency -b:v 4M" in s
+    assert "fps=30" in s and vcmd[-1] == "a.mp4"
+    acmd, awav = plans[1]
+    a = _seg(acmd)
+    assert "-thread_queue_size 2048 -f dshow -i audio=Mic \\: 1\\=2" in a
+    assert "-vn" in a and "-c:a pcm_s16le" in a
+    assert awav == "a.mp4.audio0.wav" and acmd[-1] == awav
 
 
 def test_build_audio_str_shorthand_equals_mic_tuple():
@@ -154,16 +162,22 @@ def test_build_audio_str_shorthand_equals_mic_tuple():
 
 def test_build_audio_system_wasapi_loopback():
     plans = build_record_command("f", "fullscreen", "a.mp4", audio=("system", None))
+    assert len(plans) == 2
     acmd = plans[1][0]
     i = acmd.index("wasapi_loopback")
+    assert acmd[i - 3:i - 1] == ["-thread_queue_size", "2048"]  # 实时输入开读队列
     assert acmd[i - 1] == "-f" and acmd[i + 1] == "-i" and acmd[i + 2] == ""
-    assert plans[1][1] == "a_内部声音.wav"
+    assert "-c:a pcm_s16le" in _seg(acmd)
+    assert plans[1][1] == "a.mp4.audio0.wav"
+    assert "-an" in _seg(plans[0][0])               # 视频进程仍是无声独立一条
 
 
 def test_build_audio_system_dshow_mix_device():
     plans = build_record_command("f", "fullscreen", "a.mp4",
                                  audio=("system", "Stereo Mix (Realtek)"))
+    assert len(plans) == 2
     assert "audio=Stereo Mix (Realtek)" in plans[1][0]
+    assert "gdigrab" in plans[0][0]                 # 视频进程独立
 
 
 def test_build_audio_junk_spec_falls_back_to_no_audio():
@@ -174,26 +188,68 @@ def test_build_audio_junk_spec_falls_back_to_no_audio():
         assert "dshow" not in _seg(plans[0][0]) and "wasapi" not in _seg(plans[0][0])
 
 
-def test_build_dual_audio_two_wav_commands():
-    """内部+外部多选：一条视频命令 + 每源一条独立 WAV 命令"""
+def test_build_dual_audio_two_wav_procs():
+    """内部+外部同时勾：视频 1 条 + 两个音源各 1 条 WAV 进程（共 3 条）"""
     plans = build_record_command("f", "fullscreen", "a.mp4",
                                  audio=[("system", "Stereo Mix"), ("mic", "Mic X")])
     assert len(plans) == 3
-    assert [p for _c, p in plans] == ["a.mp4", "a_内部声音.wav", "a_麦克风.wav"]
-    assert "audio=Stereo Mix" in _seg(plans[1][0])
-    assert "audio=Mic X" in _seg(plans[2][0])
-    assert "Mic X" not in _seg(plans[1][0]) and "Stereo Mix" not in _seg(plans[2][0])
+    assert "-an" in _seg(plans[0][0])               # 视频不碰音频
+    allc = " ".join(_seg(c) for c, _p in plans[1:])
+    assert "audio=Stereo Mix" in allc and "audio=Mic X" in allc
+    assert plans[1][1] == "a.mp4.audio0.wav"
+    assert plans[2][1] == "a.mp4.audio1.wav"
 
 
-def test_audio_out_paths_naming():
-    assert audio_out_paths("d:/out/录屏_1.mp4",
-                           [("system", None), ("mic", "M")]) == [
-        (("system", None), "d:/out/录屏_1_内部声音.wav"),
-        (("mic", "M"), "d:/out/录屏_1_麦克风.wav")]
-    assert audio_out_paths("a.mp4", None) == []
-    # 单规格（非列表）也收；同类型去重只留第一个（文件名会撞）
-    assert audio_out_paths("a.mp4", ("mic", "A")) == [(("mic", "A"), "a_麦克风.wav")]
-    assert len(audio_out_paths("a.mp4", [("mic", "A"), ("mic", "B")])) == 1
+def test_build_mux_dual_audio_amix_into_one_track():
+    """合流：两路 WAV 先 amix 混成一条，视频流 copy，产出带声 MP4"""
+    cmd = build_mux_command("f", "v.mp4", ["v.a0.wav", "v.a1.wav"], "out.mp4",
+                            channel_mode="center")
+    s = _seg(cmd)
+    assert "-i v.mp4" in s and "-i v.a0.wav" in s and "-i v.a1.wav" in s
+    assert "-c:v copy" in s                         # 视频不重编码
+    assert "[1:a][2:a]amix=inputs=2" in s and "normalize=0" in s
+    assert "-map 0:v:0" in s and "-map [aout]" in s
+    assert "-c:a aac" in s
+    assert cmd[-1] == "out.mp4"
+
+
+def test_build_mux_single_audio_and_empty():
+    cmd = build_mux_command("f", "v.mp4", ["v.a0.wav"], "out.mp4",
+                            channel_mode="center")
+    s = _seg(cmd)
+    assert "-map 0:v:0 -map 1:a:0 -c:v copy" in s
+    assert "pan=stereo|c0=0.5*c0+0.5*c1" in s       # 默认人声居中
+    # 无音轨 → 不需要合流
+    assert build_mux_command("f", "v.mp4", [], "out.mp4") is None
+
+
+def test_build_command_uses_nvenc_when_probe_succeeds():
+    """探测到 NVENC 可用 → 编码器分支切到 h264_nvenc p1/ll（不吃 CPU）"""
+    from video_text_tools.screen_recorder import _HW_ENC_CACHE
+    # 直接塞缓存，绕过实际 subprocess 探测（测试环境无 ffmpeg）
+    _HW_ENC_CACHE["ffmpeg.exe"] = "h264_nvenc"
+    try:
+        plans = build_record_command("ffmpeg.exe", "fullscreen", "a.mp4",
+                                     fps=30, bitrate="4M")
+        s = _seg(plans[0][0])
+        assert "-c:v h264_nvenc -preset p1 -tune ll -b:v 4M" in s
+        assert "-pix_fmt nv12" in s
+        assert "libx264" not in s and "zerolatency" not in s
+    finally:
+        _HW_ENC_CACHE.pop("ffmpeg.exe", None)
+
+
+def test_build_command_falls_back_to_libx264_when_probe_says_no():
+    """探测结果为不可用（缓存 False）→ 回落 libx264、不影响启动"""
+    from video_text_tools.screen_recorder import _HW_ENC_CACHE
+    _HW_ENC_CACHE["ffmpeg.exe"] = False
+    try:
+        plans = build_record_command("ffmpeg.exe", "fullscreen", "a.mp4")
+        s = _seg(plans[0][0])
+        assert "-c:v libx264 -preset veryfast -tune zerolatency" in s
+        assert "h264_nvenc" not in s
+    finally:
+        _HW_ENC_CACHE.pop("ffmpeg.exe", None)
 
 
 def test_normalize_audio_list_accepts_mixed_forms():
@@ -313,17 +369,30 @@ if data:
 """
 
 
-def test_recorder_cleans_zero_byte_audio(tmp_path):
-    """分开存放的音轨：正常 WAV 保留，0 字节的（设备抽风）收尾清掉"""
+def _fake_mux_run(monkeypatch):
+    """把 screen_recorder.subprocess.run 替成『合流成功』的假体：把命令最后一个
+    参数（输出文件）写成非空，模拟 ffmpeg 把视频+WAV mux 成新 mp4。"""
+    import video_text_tools.screen_recorder as sr
+
+    def _run(cmd, **kw):
+        open(cmd[-1], "w").write("muxed")
+        return types.SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
+    monkeypatch.setattr(sr.subprocess, "run", _run)
+
+
+def test_recorder_merges_audio_wavs_and_cleans_temps(tmp_path, monkeypatch):
+    """分进程产物停止后合流：有效 WAV 并进 mp4 后删除，0 字节 WAV 丢弃"""
+    _fake_mux_run(monkeypatch)
     out = str(tmp_path / "rec.mp4")
-    wav_ok = str(tmp_path / "rec_麦克风.wav")
-    wav_empty = str(tmp_path / "rec_empty.wav")
+    wav_ok = str(tmp_path / "rec.audio0.wav")
+    wav_empty = str(tmp_path / "rec_empty.audio1.wav")   # 名字含 empty→假体写 0 字节
     exe = _fake_exe(tmp_path, _FAKE_FFMPEG_MULTI)
     rec = Recorder([(exe + [out], out), (exe + [wav_ok], wav_ok),
                     (exe + [wav_empty], wav_empty)])
     assert rec.start() is None
     assert rec.stop() is None
-    assert os.path.getsize(wav_ok) > 0
+    assert os.path.isfile(out) and os.path.getsize(out) > 0   # 合流后的成片
+    assert not os.path.exists(wav_ok)                          # 旁路 WAV 已并入并删
     assert not os.path.exists(wav_empty)
 
 
