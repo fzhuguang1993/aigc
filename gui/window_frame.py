@@ -47,6 +47,7 @@ RADIUS = 12                     # 卡片圆角半径
 TITLEBAR_H = 30                 # 自绘标题栏高度（与 TitleBar.setFixedHeight 对齐）；
                                 # 顶部总高＝MARGIN_T+此值＝32px，与 Win11 原生标题栏齐平
 _CARD_BG = "#F2F3F5"            # 卡片底色：与 theme.py 的窗口背景色一致
+_CARD_BORDER = "#D9DDE3"        # 卡片描边：白底上也勾得出轮廓（代替原来的 mask 硬切边）
 # 各方向 -> (光标, (lx, wx, ty, hy))：新尺寸由 left+=lx*d、width+=wx*d、
 # top+=ty*dy、height+=hy*dy 得出（拖左/上边时位移同时作用于位置与宽高）
 _EDGES = {
@@ -66,12 +67,19 @@ class _RoundedBg(QWidget):
 
     为什么这样不锯齿：逐像素 alpha 由合成器（DWM）混色，边缘是渐变而不是
     1bit 掩码的硬台阶。阴影不只是好看：透明带里像素 alpha>0，Windows 才会把
-    鼠标事件交给窗口，边缘把手才抓得住（alpha=0 的像素会直接穿透到桌面）。"""
+    鼠标事件交给窗口，边缘把手才抓得住（alpha=0 的像素会直接穿透到桌面）。
 
-    def __init__(self, window, radius=RADIUS, header_h=0):
+    card_bg / border 可自定义：不传就用两个常量，所以其它窗口一行代码不用改
+    也与从前逐像素相同。唤出面板拿它画“深灰 + 半透明”（QColor 带 alpha 就能
+    透，窗口本身已经是 WA_TranslucentBackground，逐像素 alpha 由 DWM 合成）。"""
+
+    def __init__(self, window, radius=RADIUS, header_h=0,
+                 card_bg=None, border=None):
         super().__init__(window)
         self._r = radius
         self._hh = header_h                   # 顶部白色标题带高（0＝无标题栏）
+        self._bg = QColor(card_bg) if card_bg is not None else QColor(_CARD_BG)
+        self._border = QColor(border) if border is not None else QColor(_CARD_BORDER)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setGeometry(window.rect())
         self.lower()                                # 压在兄弟控件最底下当背景
@@ -93,8 +101,9 @@ class _RoundedBg(QWidget):
                                             min(i, MARGIN_B) * 0.75),
                               self._r + i * f, self._r + i * f)
         # 卡片本体 + 1px 描边（白底上也勾得出轮廓，代替原来的 mask 硬切边）
-        p.setBrush(QColor(_CARD_BG))
-        p.setPen(QPen(QColor("#D9DDE3"), 1))
+        # 颜色取自构造参数：带 alpha 时卡片以外的透底依旧透明，桌面从底下露出来
+        p.setBrush(self._bg)
+        p.setPen(QPen(self._border, 1))
         p.drawRoundedRect(card, self._r, self._r)
         if self._hh:
             # 顶部白色标题带：裁进卡片轮廓再铺白矩形——带顶两角天然是窗口
@@ -140,7 +149,7 @@ class TitleBar(QWidget):
         if show_max:
             lay.addWidget(self.btn_max)
         lay.addWidget(self.btn_close)
-        self.btn_min.clicked.connect(window.showMinimized)
+        self.btn_min.clicked.connect(self._minimize)
         self.btn_max.clicked.connect(self.toggle_max)
         self.btn_close.clicked.connect(self._close)
         self.show_max_btn(show_max)
@@ -155,6 +164,17 @@ class TitleBar(QWidget):
 
     def show_max_btn(self, on):
         self.btn_max.setVisible(bool(on))
+
+    def _minimize(self):
+        """最小化：主窗口可以把这一动作改道收进托盘（设置里的开关）。
+
+        鸭子类型问一句窗口自己要不要，而不是在这里 import gui.tray：
+        工具小窗、对话框没有这个钩子，照常最小化；标题栏也就不依赖业务层。"""
+        win = self._win
+        hook = getattr(win, "try_minimize_to_tray", None)
+        if callable(hook) and hook():
+            return
+        win.showMinimized()
 
     def _close(self):
         win = self._win
@@ -305,7 +325,7 @@ def _first_row_titlebar(window):
 
 def apply_rounded(window, title="", radius=RADIUS, resizable=True,
                   show_min=True, show_max=True, add_titlebar=True,
-                  corner_grip=False):
+                  corner_grip=False, card_bg=None, border=None):
     """把任意顶层窗口装配成无边框圆角窗（逐像素透明，无锯齿）。
 
     window      ：QMainWindow / QDialog / 顶层 QWidget。
@@ -313,6 +333,9 @@ def apply_rounded(window, title="", radius=RADIUS, resizable=True,
                   主窗口这种特殊布局由调用方自己插好标题栏后传 False。
     corner_grip ：为 True 时右下角额外放一个原生 QSizeGrip（与边缘把手并存，
                   给“拉大放小”一个明显的斜角抓手）。
+    card_bg     ：卡片底色（可带 alpha，需要半透明就传带 alpha 的 QColor）；
+                  不传＝用默认浅底，与其它窗口逐像素相同。
+    border      ：卡片 1px 描边色，口径同上。
     返回创建的 TitleBar（未加标题栏时返回 None）。
 
     尺寸口径：内容区不因为换外壳被挤压——上/左/右缩进 BAND_T/L/R、底部
@@ -367,7 +390,7 @@ def apply_rounded(window, title="", radius=RADIUS, resizable=True,
     header_h = 0
     if titlebar is not None or _first_row_titlebar(window):
         header_h = TITLEBAR_H
-    bg = _RoundedBg(window, radius, header_h)
+    bg = _RoundedBg(window, radius, header_h, card_bg, border)
 
     # ③ 边缘把手（仅非固定尺寸且允许缩放时）
     edges = {}

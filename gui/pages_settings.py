@@ -9,25 +9,28 @@ gui/pages_settings.py —— 设置（编辑 config.json，保存后需重启软
 """
 import json
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QStandardPaths, QPoint
+from PySide6.QtCore import Qt, QStandardPaths, QPoint, QTimer
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QMessageBox, QScrollArea, QFrame,
                                QFileDialog, QInputDialog, QSpinBox, QComboBox,
                                QKeySequenceEdit, QCheckBox, QApplication,
-                               QDialog, QDialogButtonBox)
+                               QDialog, QDialogButtonBox, QListWidget)
 
 from core.config import (CONFIG_JSON, USER_NAME,
                          DOWNLOAD_DIR, EXPORT_DIR, MATERIAL_DIR, RUNTIME_DIR,
                          GATEWAY_MODE)
+from core.paths import DATA_HOME_INFO
 from core import license as lic
 from core import naming
 from core import tags as tag_lib
 from core import block_categories
+from core import fileindex
 from gui.header import page_header
 from gui.dialogs_naming import NamingEditor
 from gui.dialogs_tags import TagEditor
@@ -35,7 +38,14 @@ from gui.dialogs_blocks import BlockCategoryEditor
 from gui.maintainer import Gate, app_has_unlocked
 from gui.mouse_gesture import (GESTURE_COMMANDS, COMMAND_LABELS,
                               gesture_display, shape_distance, SHAPE_MAX_DIST)
-from gui.tools_registry import TOOLS, set_tool_shortcut
+from gui.tools_registry import (TOOLS, set_tool_shortcut, tool_shortcuts,
+                                launcher_shortcut, set_launcher_shortcut,
+                                home_shortcut, set_home_shortcut,
+                                global_hotkey_enabled, set_global_hotkey_enabled,
+                                LAUNCHER_TOKEN, HOME_TOKEN,
+                                HOME_LABEL, LAUNCHER_LABEL)
+from gui import global_hotkey
+from gui import tray
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, PANEL_FACTORIES
 from gui.widgets import VideoPlayerDialog
 from gui.menus import StyledMenu
@@ -213,7 +223,7 @@ class SettingsPage(QWidget):
         lay.addWidget(card)
 
         # ---------- 工具快捷键：一键呼出工具中心窗口（存 ui_state，保存即生效） ----------
-        card, cv = _section_card("工具快捷键", "全窗口任意页面按组合键即弹出工具窗口，保存即生效")
+        card, cv = _section_card("工具快捷键", "按组合键即弹出工具窗口（是否全局生效见下方「托盘与全局快捷键」）")
         self.tool_combo = QComboBox()
         self.tool_combo.setFixedWidth(220)
         for t_name, t_icon, _desc, t_fac in TOOLS:
@@ -244,6 +254,197 @@ class SettingsPage(QWidget):
         self.tool_key.editingFinished.connect(self._save_tool_shortcut)
         self._refresh_tool_combo()
         self._load_tool_key()
+        lay.addWidget(card)
+
+        # ---------- 托盘与全局快捷键：收进托盘后还能不能一键到位全靠这里 ----------
+        card, cv = _section_card("托盘与全局快捷键", "即时保存，无需重启")
+        self.ck_close_tray = QCheckBox("点关闭按钮收进托盘（不退出程序）")
+        self.ck_close_tray.setChecked(bool(app_state.get(tray.CLOSE_TO_TRAY_KEY, True)))
+        self.ck_min_tray = QCheckBox("点最小化也收进托盘")
+        self.ck_min_tray.setChecked(bool(app_state.get(tray.MINIMIZE_TO_TRAY_KEY, False)))
+        self.ck_global = QCheckBox("工具快捷键全局生效（焦点在其它软件里也认）")
+        self.ck_global.setChecked(global_hotkey_enabled())
+        self.ck_auto = QCheckBox("开机自动启动（启动后直接待在托盘）")
+        self.ck_auto.setChecked(tray.read_autostart())
+        for ck, key in ((self.ck_close_tray, tray.CLOSE_TO_TRAY_KEY),
+                        (self.ck_min_tray, tray.MINIMIZE_TO_TRAY_KEY)):
+            ck.toggled.connect(lambda on, k=key: self._tray_pref(k, on))
+        self.ck_global.toggled.connect(set_global_hotkey_enabled)
+        self.ck_global.toggled.connect(lambda _=False: self._refresh_hotkey_status())
+        self.ck_auto.toggled.connect(self._toggle_autostart)
+        if tray.tray_supported():
+            # 三个开关都靠托盘当入口：托盘不可用（被精简掉了、换了三方任务栏）
+            # 就把它们灰掉，而不是让用户设了一堆其实不生效的选项
+            cv.addWidget(self.ck_close_tray)
+            cv.addWidget(self.ck_min_tray)
+        else:
+            for ck in (self.ck_close_tray, self.ck_min_tray):
+                ck.setEnabled(False)
+                ck.setToolTip("本机没找到系统托盘，收进托盘不可用")
+                cv.addWidget(ck)
+        cv.addWidget(self.ck_global)
+        cv.addWidget(self.ck_auto)
+
+        lr = QHBoxLayout()
+        lr.setSpacing(10)
+        self.launch_key = QKeySequenceEdit(QKeySequence(launcher_shortcut()))
+        self.launch_key.setFixedWidth(220)
+        b_lk_clear = QPushButton("清空")
+        b_lk_clear.setObjectName("GhostBtn")
+        b_lk_clear.setToolTip("不用总唤出面板，只按每个工具自己的键")
+        b_lk_clear.clicked.connect(self._clear_launcher_key)
+        lr.addWidget(_form_label(LAUNCHER_LABEL))
+        lr.addWidget(self.launch_key)
+        lr.addWidget(b_lk_clear)
+        lr.addStretch(1)
+        cv.addLayout(lr)
+        self.launch_key.editingFinished.connect(self._save_launcher_key)
+
+        # 呼出主界面：与总唤出面板分开的两条键（面板是选工具，这条是直接回到界面）
+        hr = QHBoxLayout()
+        hr.setSpacing(10)
+        self.home_key = QKeySequenceEdit(QKeySequence(home_shortcut()))
+        self.home_key.setFixedWidth(220)
+        b_hk_clear = QPushButton("清空")
+        b_hk_clear.setObjectName("GhostBtn")
+        b_hk_clear.setToolTip("不配这条：只靠唤出面板或托盘图标回主界面")
+        b_hk_clear.clicked.connect(self._clear_home_key)
+        hr.addWidget(_form_label(HOME_LABEL))
+        hr.addWidget(self.home_key)
+        hr.addWidget(b_hk_clear)
+        hr.addStretch(1)
+        cv.addLayout(hr)
+        self.home_key.editingFinished.connect(self._save_home_key)
+
+        self.lbl_hotkey = QLabel()
+        self.lbl_hotkey.setWordWrap(True)
+        self.lbl_hotkey.setStyleSheet(tokenize(
+            "color:#8F959E; font-size:12px; background:transparent;"))
+        cv.addWidget(self.lbl_hotkey)
+        self._refresh_hotkey_status()
+        lay.addWidget(card)
+
+        # ---------- 本地文件搜索：唤出面板下面两段的后端，索引在启动时后台建 ----------
+        card, cv = _section_card("本地文件搜索", "在唤出面板里搜本地文件名与文档正文；即时保存，无需重启")
+        self._fs_stat_at = 0                # 状态行的取数时间（读 meta 已很快，这层只是防每帧重绘都查库）
+        self.ck_filesearch = QCheckBox("启用本地文件搜索")
+        self.ck_filesearch.setChecked(fileindex.enabled())
+        self.ck_filesearch.setToolTip(
+            "文件名索引自动覆盖所有本地固定磁盘（只认固定盘：U 盘/网络盘拔了会让\n"
+            "后台扫描反复报错，要搜就在下面“只搜指定目录”里手动加）。\n"
+            "扫描时自动跳过 Windows、AppData、node_modules 这些软件目录：\n"
+            "本机实测排除后约 95 万个文件，不排除是 173 万个（多出的一般是软件自带的 .py/.pyc）。\n"
+            "索引在软件启动后于后台线程建立，不占界面。")
+        cv.addWidget(self.ck_filesearch)
+
+        sr = QHBoxLayout()
+        sr.setSpacing(10)
+        self.combo_fs_scope = QComboBox()
+        self.combo_fs_scope.addItems(["全盘（所有本地固定磁盘）", "只搜指定目录"])
+        self.combo_fs_scope.setCurrentIndex(1 if fileindex.custom_roots() else 0)
+        self.combo_fs_scope.setFixedWidth(260)
+        sr.addWidget(_form_label("索引范围"))
+        sr.addWidget(self.combo_fs_scope)
+        sr.addStretch(1)
+        cv.addLayout(sr)
+        self.fs_roots_box, self.lst_fs_roots, b_fs_add, b_fs_del = self._dir_box(
+            "要纳入索引的目录（一行一个）", fileindex.custom_roots())
+        cv.addWidget(self.fs_roots_box)
+
+        self.ck_docsearch = QCheckBox("同时搜索文档正文（txt / md / docx / xlsx / pptx / pdf）")
+        self.ck_docsearch.setChecked(fileindex.doc_enabled())
+        self.ck_docsearch.setToolTip(
+            "正文只抽下面这些文档目录，不抽全盘：本机实测全盘 1.9 万个可抽文档里\n"
+            "有 1.5 万个是软件自带的 txt，抽了既慢又搜不到有用的东西。\n"
+            "中文按「二元组」建全文索引，所以搜「关节」能命中「关节不舒服」这种两字词。")
+        cv.addWidget(self.ck_docsearch)
+        self.fs_doc_box = QWidget()
+        fv = QVBoxLayout(self.fs_doc_box)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.setSpacing(8)
+        self.doc_roots_box, self.lst_doc_roots, b_doc_add, b_doc_del = self._dir_box(
+            "要抽正文的文档目录（留空＝用默认：文档/下载/桌面与本软件素材目录）",
+            fileindex.doc_roots())
+        fv.addWidget(self.doc_roots_box)
+        mr = QHBoxLayout()
+        mr.setSpacing(10)
+        self.spin_doc_mb = QSpinBox()
+        self.spin_doc_mb.setRange(1, 500)
+        self.spin_doc_mb.setSuffix(" MB")
+        self.spin_doc_mb.setValue(int(fileindex.doc_max_bytes() / 1024 / 1024))
+        mr.addWidget(_form_label("单文件上限"))
+        mr.addWidget(self.spin_doc_mb)
+        mr.addWidget(QLabel("超过就不抽（PDF / PPT 只取前 80 页）"))
+        mr.addStretch(1)
+        fv.addLayout(mr)
+        cv.addWidget(self.fs_doc_box)
+
+        # 唤出面板默认视图（列表/中图标/大图标）：存 app_state，唤出时读
+        vr = QHBoxLayout()
+        vr.setSpacing(10)
+        self.combo_fs_view = QComboBox()
+        self.combo_fs_view.addItems(["列表", "中图标网格", "大图标网格"])
+        _dft_view = app_state.get("launcher_view_default") or "list"
+        self.combo_fs_view.setCurrentIndex(
+            max(0, ("list", "medium", "large").index(_dft_view)))
+        self.combo_fs_view.setFixedWidth(260)
+        vr.addWidget(_form_label("默认视图"))
+        vr.addWidget(self.combo_fs_view)
+        vr.addWidget(QLabel("唤出面板打开时结果用哪种视图（面板内临时切换不写回这里）"))
+        vr.addStretch(1)
+        cv.addLayout(vr)
+
+        # 桌面悬浮球：点球即弹唤出搜索面板（给不想每次按键呼出的人）
+        br = QHBoxLayout()
+        br.setSpacing(10)
+        self.ck_ball = QCheckBox("在桌面显示唤出悬浮球")
+        self.ck_ball.setChecked(bool(app_state.get("launcher_ball_on")))
+        self.ck_ball.setToolTip(
+            "开启后桌面出现一颗可拖动的小球，点一下就打开搜索面板；右键小球可关闭。")
+        br.addWidget(self.ck_ball)
+        br.addWidget(QLabel("不想每次按热键呼出时的替代入口：点球即开"))
+        br.addStretch(1)
+        cv.addLayout(br)
+
+        ar = QHBoxLayout()
+        ar.setSpacing(10)
+        b_fs_rebuild = QPushButton("🔁 立即重建索引")
+        b_fs_rebuild.setObjectName("GhostBtn")
+        b_fs_rebuild.setToolTip(
+            "清掉整份索引重扫：改了目录、或怀疑索引不对时用。\n"
+            "在后台跑，不卡界面；索引库坏了也只是删了重扫，不连累业务数据。")
+        b_fs_rebuild.clicked.connect(self._fs_rebuild)
+        ar.addWidget(b_fs_rebuild)
+        self.lbl_filesearch = QLabel()
+        self.lbl_filesearch.setWordWrap(True)
+        self.lbl_filesearch.setStyleSheet(tokenize(
+            "color:#8F959E; font-size:12px; background:transparent;"))
+        self.lbl_filesearch.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        ar.addWidget(self.lbl_filesearch, 1)
+        cv.addLayout(ar)
+        # 初值灌完再接信号（与「界面偏好」同一口径）：否则 setValue 就当改过、多存一次
+        self.fs_roots_box.setVisible(self.combo_fs_scope.currentIndex() == 1)
+        self.fs_doc_box.setVisible(fileindex.doc_enabled())
+        self.ck_filesearch.toggled.connect(self._fs_set_enabled)
+        self.ck_docsearch.toggled.connect(self._fs_set_doc)
+        self.combo_fs_scope.currentIndexChanged.connect(self._fs_scope_changed)
+        self.spin_doc_mb.valueChanged.connect(self._fs_set_max_mb)
+        self.combo_fs_view.currentIndexChanged.connect(self._fs_set_default_view)
+        self.ck_ball.toggled.connect(self._set_ball)
+        b_fs_add.clicked.connect(lambda _=False: self._dir_add(
+            self.lst_fs_roots, self._fs_save_roots))
+        b_fs_del.clicked.connect(lambda _=False: self._dir_del(
+            self.lst_fs_roots, self._fs_save_roots))
+        b_doc_add.clicked.connect(lambda _=False: self._dir_add(
+            self.lst_doc_roots, self._doc_save_roots))
+        b_doc_del.clicked.connect(lambda _=False: self._dir_del(
+            self.lst_doc_roots, self._doc_save_roots))
+        for w in (self.ck_filesearch, self.ck_docsearch, self.combo_fs_scope,
+                  self.spin_doc_mb, b_fs_rebuild):
+            w.setEnabled(fileindex.enabled())
+        self._fs_stat_at = 0
+        self._refresh_filesearch_status()
         lay.addWidget(card)
 
         # ---------- 鼠标手势：按住右键划轨迹呼出命令（存 ui_state，保存即生效） ----------
@@ -344,6 +545,27 @@ class SettingsPage(QWidget):
             r.addWidget(b)
             cv.addLayout(r)
             self._dir_edits[key] = ed
+        # 数据家说明：装进 Program Files 后产物不再落在 exe 旁边，老用户升级上来
+        # 第一反应是“我的视频不见了”——把真正在写哪个目录明写在这里
+        home = DATA_HOME_INFO.get("home") or str(RUNTIME_DIR)
+        mode = {"installed": "安装版数据目录", "portable": "绿色版（随程序目录）",
+                "env": "AIGC_HOME 指定", "dev": "开发态（仓库目录）"}.get(
+            DATA_HOME_INFO.get("mode"), "数据目录")
+        row = QLabel(f"📁 {mode}：{home}")
+        row.setStyleSheet(tokenize("color:#8F959E; font-size:12px; background:transparent;"))
+        row.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cv.insertWidget(1, row)
+        if DATA_HOME_INFO.get("legacy_media"):
+            # 旧绿色版把几十 GB 产物堆在 exe 旁：不自动搬（那是别人的盘），
+            # 只给一个“把旧路径填进来”的入口，用户点保存才写盘
+            n = len(DATA_HOME_INFO["legacy_media"])
+            b_old = QPushButton(f"📂 旧目录里还有产物（{n} 个），帮我指过去")
+            b_old.setObjectName("GhostBtn")
+            b_old.setToolTip(
+                f"旧版本把产物放在程序目录：{DATA_HOME_INFO.get('legacy_home') or ''}\n"
+                "点一下把旧路径填进下面的输入框，再点「保存设置」并重启才生效。")
+            b_old.clicked.connect(self._fill_legacy_dirs)
+            cv.insertWidget(2, b_old)
         self.dirs_box.setVisible(self._dirs_unlocked)   # 当天验过口令才默认展开
         lay.addWidget(card)
 
@@ -396,7 +618,195 @@ class SettingsPage(QWidget):
     def refresh(self):
         if GATEWAY_MODE:
             self._update_license_label()
+        self._refresh_filesearch_status()     # 索引进度是后台线程写的，跟着刷一次
         # 不自动覆盖用户正在编辑的内容（命名/线路等）
+
+    # ---------- 本地文件搜索（开关与目录都即时落盘，后台线程下一轮就认） ----------
+    def _dir_box(self, hint, paths):
+        """一行灰字说明 + 目录列表 + 「添加/移除」：文件名索引与文档正文两份清单
+        共用同一形态，各写一遍迟早长歪。返回 (容器, 列表, 添加钮, 移除钮)。"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(24, 0, 0, 0)
+        v.setSpacing(4)
+        lb = QLabel(hint)
+        lb.setStyleSheet(tokenize("color:#8F959E; font-size:12px; background:transparent;"))
+        v.addWidget(lb)
+        lst = QListWidget()
+        lst.setFixedHeight(86)
+        for p in paths or []:
+            lst.addItem(str(p))
+        lst.setToolTip("选中一行再点「移除选中」：只是不再进索引，磁盘上的目录不动")
+        v.addWidget(lst)
+        r = QHBoxLayout()
+        r.setSpacing(8)
+        b_add = QPushButton("＋ 添加目录…")
+        b_add.setObjectName("GhostBtn")
+        b_del = QPushButton("－ 移除选中")
+        b_del.setObjectName("GhostBtn")
+        r.addWidget(b_add)
+        r.addWidget(b_del)
+        r.addStretch(1)
+        v.addLayout(r)
+        return w, lst, b_add, b_del
+
+    def _dir_paths(self, lst):
+        return [lst.item(i).text() for i in range(lst.count())]
+
+    def _dir_add(self, lst, save):
+        d = QFileDialog.getExistingDirectory(self, "选择要纳入的目录")
+        if not d:
+            return
+        for i in range(lst.count()):            # 同一目录列两遍＝扫两遍，没意义
+            if _same_path(d, lst.item(i).text()):
+                return
+        lst.addItem(os.path.normpath(d))
+        lst.setCurrentRow(lst.count() - 1)
+        save(self._dir_paths(lst))
+
+    def _dir_del(self, lst, save):
+        it = lst.currentItem()
+        if it is None:
+            self.lbl_filesearch.setText("先在列表里选中一行，再点「移除选中」")
+            return
+        lst.takeItem(lst.row(it))
+        save(self._dir_paths(lst))
+
+    def _fs_save_roots(self, paths):
+        fileindex.set_custom_roots(paths)
+        self._fs_kick()
+
+    def _doc_save_roots(self, paths):
+        fileindex.set_doc_roots(paths)
+        self._fs_kick()
+
+    def _fs_kick(self):
+        """改了范围/上限就催后台线程提前跑一轮：让人干等那 120 秒不像话"""
+        self._fs_stat_at = 0
+        try:
+            from workers import file_watcher
+            file_watcher.start()
+            file_watcher.kick()
+        except Exception:
+            pass
+
+    def _fs_set_enabled(self, on):
+        """开关是真能立刻停/起后台线程的：关了还在扫盘就是骗人"""
+        fileindex.set_enabled(on)
+        self._fs_stat_at = 0
+        for w in (self.ck_docsearch, self.combo_fs_scope, self.spin_doc_mb):
+            w.setEnabled(on)
+        try:
+            from workers import file_watcher
+            if on:
+                file_watcher.start()
+                file_watcher.kick()
+            else:
+                file_watcher.stop()
+        except Exception:
+            pass
+        self._refresh_filesearch_status()
+
+    def _fs_set_doc(self, on):
+        fileindex.set_doc_enabled(on)
+        self.fs_doc_box.setVisible(on)
+        self._fs_kick()
+
+    def _fs_scope_changed(self, i):
+        """全盘＝清空自定义清单（回到“所有固定盘”这个默认口径）；
+        指定目录＝改用列表里这几条。"""
+        self.fs_roots_box.setVisible(i == 1)
+        if i == 0:
+            self.lst_fs_roots.clear()
+            fileindex.set_custom_roots([])
+            self._fs_kick()
+        elif self.lst_fs_roots.count():
+            fileindex.set_custom_roots(self._dir_paths(self.lst_fs_roots))
+        # 列表还空着时不落盘：空清单本身就等于“全盘”，此时写下去等于什么都没改
+
+    def _fs_set_max_mb(self, mb):
+        fileindex.set_doc_max_mb(mb)
+        self._fs_kick()
+
+    def _fs_set_default_view(self, _i=None):
+        """唤出面板默认视图：写 app_state，下次 summon 生效（不改当次已开的面板）。"""
+        app_state.set_value(
+            "launcher_view_default",
+            ("list", "medium", "large")[self.combo_fs_view.currentIndex()])
+
+    def _set_ball(self, on):
+        """唤出悬浮球开关：落盘 + 主窗口立即显示/收起（不必重启）。"""
+        app_state.set_value("launcher_ball_on", bool(on))
+        w = self.window()
+        if hasattr(w, "apply_launcher_ball"):
+            w.apply_launcher_ball()
+
+    def _fs_rebuild(self):
+        """清库重扫：整条链丢给后台线程。首扫实测几十秒（冷盘 45 秒），
+        放在界面上就是点了按钮之后整个软件假死。"""
+        if QMessageBox.question(
+                self, "重建本地文件索引",
+                "清掉整份索引并重扫一遍（后台执行，不影响继续使用）。\n"
+                "本机首扫实测约 45 秒，期间搜索仍能命中已经收录的部分。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+            return
+        self.lbl_filesearch.setText("正在重建索引…（后台跑，稍后自动更新）")
+        self._fs_stat_at = time.time() + 30       # 刚清完的空库不该马上刷出“0 个文件”
+        threading.Thread(target=self._fs_rebuild_worker,
+                         daemon=True, name="file-index-rebuild").start()
+
+    def _fs_rebuild_worker(self):
+        from workers import file_watcher
+        try:
+            fileindex.rebuild()
+        except Exception as e:
+            err = "%s: %s" % (type(e).__name__, e)
+            QTimer.singleShot(0, lambda: self.lbl_filesearch.setText(
+                "⚠ 重建失败：%s｜索引库：%s（它坏了就手动删掉再重建）"
+                % (err, fileindex.DB_PATH)))
+            return
+        try:
+            file_watcher.start()
+            file_watcher.kick()
+        except Exception:
+            pass
+        self._fs_stat_at = 0
+        QTimer.singleShot(0, self._refresh_filesearch_status)
+
+    def _refresh_filesearch_status(self):
+        """状态行：已收录多少、上次扫到什么时候、下一轮多久后。
+        status() 只读 meta 里的缓存计数（不再对 95 万行做 COUNT(*)——那一下要
+        4.6 秒，正好卡在界面上），所以 2 秒一刷也没负担；这里只留 5 秒下限
+        避免页面重绘一次就开一次库。"""
+        if not hasattr(self, "lbl_filesearch"):
+            return
+        now = time.time()
+        if self._fs_stat_at and now - self._fs_stat_at < 5:
+            return
+        self._fs_stat_at = now
+        try:
+            st = fileindex.status()
+        except Exception as e:
+            self.lbl_filesearch.setText("⚠ 索引库暂不可用：%s" % type(e).__name__)
+            return
+
+        def _when(ts):
+            return (datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+                    if ts else "还没扫过")
+
+        from workers import file_watcher
+        ws = file_watcher.stats()
+        # 间隔是自适应的（一轮越慢下一轮推得越远），所以报“下轮多久后”而不是硬编 120 秒
+        nxt = int(ws.get("next_sec") or file_watcher.ROUND_SEC)
+        last = float(ws.get("last_sec") or 0)
+        self.lbl_filesearch.setText(
+            "已收录 %s 个文件 / %s 篇文档｜上次扫描 %s｜正文更新 %s｜后台%s（上轮 %.1f 秒，下轮 %d 秒后）"
+            % ("{:,}".format(int(st.get("files") or 0)),
+               "{:,}".format(int(st.get("docs") or 0)),
+               _when(st.get("last_scan") or 0), _when(st.get("last_docs") or 0),
+               "正在索引" if file_watcher.running() else "未运行",
+               last, nxt))
 
     # ---------- 授权/续费（网关模式） ----------
     def _update_license_label(self):
@@ -472,7 +882,9 @@ class SettingsPage(QWidget):
         seqs = app_state.get("tool_shortcuts") or {}
         for i in range(self.tool_combo.count()):
             name = self.tool_combo.itemData(i)
-            base = self.tool_combo.itemData(i, Qt.ItemDataRole.UserRole + 1)
+            # 没附基名的项（后续新增加的入口、外部 addItem）回退到当前文本：
+            # 这里一旦拿到 None，整个设置页刷新就直接 TypeError
+            base = self.tool_combo.itemData(i, Qt.ItemDataRole.UserRole + 1) or name or ""
             sc = seqs.get(name) or ""
             self.tool_combo.setItemText(i, base + (f"　[{sc}]" if sc else ""))
 
@@ -488,12 +900,128 @@ class SettingsPage(QWidget):
 
     def _save_tool_shortcut(self):
         """编辑完（失焦/回车）即落盘并让主窗口重注册快捷键，不用重启；
-        与工具卡片右键共用 set_tool_shortcut（互斥/清理由它统一维护）"""
+        与工具卡片右键共用 set_tool_shortcut（互斥/清理由它统一维护）。
+        半截组合键不落盘：否则旧键位被释放而新键位注册不上。"""
         name = self.tool_combo.currentData()
         if not name:
             return
-        set_tool_shortcut(name, self.tool_key.keySequence().toString())
+        seq = self._key_seq_or_hint(self.tool_key)
+        if seq is None:
+            return
+        set_tool_shortcut(name, seq)
         self._refresh_tool_combo()
+        self._refresh_hotkey_status()
+
+    # ---------- 托盘与全局快捷键：开关都即时生效，只有开机自启要写注册表 ----------
+    def _tray_pref(self, key, on):
+        """写偏好并让主窗口按新规矩接管 ✕ / 最小化（不必重启）"""
+        app_state.set_value(key, bool(on))
+        w = self.window()
+        if hasattr(w, "refresh_tray_prefs"):
+            w.refresh_tray_prefs()
+
+    def _hotkey_label(self, token):
+        """热键表里的 token 翻成人话：工具名直接用，两个保留位是内部标识"""
+        return {LAUNCHER_TOKEN: LAUNCHER_LABEL,
+                HOME_TOKEN: HOME_LABEL}.get(token, str(token))
+
+    def _refresh_hotkey_status(self):
+        """如实回报系统热键注册结果。
+
+        键位被微信/QQ 抢了，RegisterHotKey 只会返回 FALSE，界面不说就是一句
+        “设了键就是不灵”——用户只能靠猜，我们也只能靠日志翻。"""
+        if not hasattr(self, "lbl_hotkey"):
+            return
+        hk = global_hotkey.manager
+        seqs = [s for s in (tool_shortcuts() or {}).values() if s]
+        if launcher_shortcut():
+            seqs.append(launcher_shortcut())
+        if home_shortcut():
+            seqs.append(home_shortcut())
+        if not hk.available():
+            self._set_hotkey_text("#FF8D19", "⚠ 本机不支持系统级热键（仅 Windows）："
+                                             "快捷键只在软件窗口内生效")
+            return
+        if not global_hotkey_enabled():
+            self._set_hotkey_text("#8F959E", "未开启全局生效：快捷键只在本软件窗口内认，"
+                                             "焦点在其它软件里按不动")
+            return
+        bad = dict(hk.failures)
+        bound = len(hk.bound_tokens())
+        if bad:
+            detail = "；".join(f"{self._hotkey_label(t)}：{r}"
+                            for t, r in bad.items())
+            self._set_hotkey_text("#FF8D19", f"⚠ {detail}（这些键已退回“窗口内快捷键”，"
+                                          "软件开着才认；换一个组合键即可）")
+        elif bound:
+            self._set_hotkey_text("#3370FF", f"✓ 已注册 {bound} 个系统级热键："
+                                          "软件收进托盘、焦点在其它软件里也能一键弹工具")
+        elif seqs:
+            self._set_hotkey_text("#FF8D19", "已开启全局生效，但一个键都没注册上："
+                                          "到上方重新按一次组合键重试")
+        else:
+            self._set_hotkey_text("#8F959E", "还没配快捷键：到上方「工具快捷键」"
+                                          "或本卡「总唤出快捷键」设一个")
+
+    def _set_hotkey_text(self, color, text):
+        self.lbl_hotkey.setText(text)
+        self.lbl_hotkey.setStyleSheet(tokenize(
+            f"color:{color}; font-size:12px; background:transparent;"))
+
+    def _toggle_autostart(self, checked):
+        """开机自启写的是注册表，不是本地偏好：写不进去必须把勾退回并说清原因，
+        否则用户以为开机会有软件，第二天找不到还以为被安全软件删了。"""
+        ok, msg = tray.write_autostart(checked)
+        if ok:
+            w = self.window()
+            if hasattr(w, "refresh_tray_prefs"):
+                w.refresh_tray_prefs()        # 托盘菜单上的勾选态跟着同步
+            return
+        self.ck_auto.blockSignals(True)
+        self.ck_auto.setChecked(not checked)
+        self.ck_auto.blockSignals(False)
+        QMessageBox.warning(self, "开机自启", msg or "写入注册表失败")
+
+    def _key_seq_or_hint(self, ed):
+        """取输入框里的键位；只按了半截（比如手里只剩修饰键）就当没按完：返回 None。
+
+        QKeySequenceEdit 在 Ctrl+Alt+… 这种半截状态也会把变更发出来，而注册层是先释放
+        旧键再注新键：拿半截串落盘＝旧键位白丢、新键位又解析不出来，界面上一眼看去
+        还像设好了（本机日志里那几条“键位不可用（需带修饰键）”就是这么来的）。
+        判定口径直接用注册层的 parse_sequence，界面与注册不会两边不一致。"""
+        seq = ed.keySequence().toString()
+        if seq and global_hotkey.parse_sequence(seq) is None:
+            self._set_hotkey_text("#FF8D19", "⚠ 组合键没按完（现在只有修饰键）："
+                                             "请连着按出一个完整组合，旧键位暂时不变")
+            return None
+        return seq
+
+    def _save_launcher_key(self):
+        """总唤出键：落盘 + 主窗口立即重注册，失败原因回到下方状态行"""
+        seq = self._key_seq_or_hint(self.launch_key)
+        if seq is None:
+            return
+        set_launcher_shortcut(seq)
+        self._refresh_hotkey_status()
+
+    def _clear_launcher_key(self):
+        self.launch_key.clear()
+        self._save_launcher_key()
+
+    def _save_home_key(self):
+        """呼出主界面的键：落盘 + 主窗口立即重注册，失败原因回到下方状态行。
+
+        与总唤出键同口径：“半截组合”不落盘（见 _key_seq_or_hint），同键的
+        另一个槽位会让位（见 set_home_shortcut），不会出现两个动作抢一个键。"""
+        seq = self._key_seq_or_hint(self.home_key)
+        if seq is None:
+            return
+        set_home_shortcut(seq)
+        self._refresh_hotkey_status()
+
+    def _clear_home_key(self):
+        self.home_key.clear()
+        self._save_home_key()
 
     # ---------- 鼠标手势：录制 / 绑定 / 解绑 ----------
     def _engine(self):
@@ -634,6 +1162,31 @@ class SettingsPage(QWidget):
         d = QFileDialog.getExistingDirectory(self, "选择目录", start)
         if d:
             ed.setText(d)
+
+    def _fill_legacy_dirs(self):
+        """把旧版程序目录里的产物路径填进上面的输入框（只填还空着的）。
+
+        只填不存：填完用户还能换个盘，点「保存设置」才写盘——旧产物动辄几十 GB，
+        自动改配置或自动拷文件都不是好主意。"""
+        keys = {"outputs": "output", "exports": "export", "material": "material"}
+        filled = []
+        for d in DATA_HOME_INFO.get("legacy_media") or []:
+            key = keys.get(Path(d).name.lower())
+            ed = self._dir_edits.get(key)
+            if ed is None or ed.text().strip():
+                continue
+            ed.setText(str(d))
+            filled.append(Path(d).name)
+        if filled:
+            QMessageBox.information(
+                self, "已填好路径",
+                "已把旧目录填进上面的输入框：" + "、".join(filled) + "\n"
+                "确认无误后点「保存设置」并重启软件生效。")
+        else:
+            QMessageBox.information(
+                self, "不需要修改",
+                "旧目录要么已经是当前设置，要么对应输入框里已有路径；\n"
+                "想换位置直接在输入框里改就行。")
 
     def _save(self):
         data = {}

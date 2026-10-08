@@ -11,3 +11,8 @@ faster-whisper>=1.0.0
 # 拆解结果导出 Word 报告（取代旧的 Excel 回写）。python-docx 本体很轻（仅带 lxml），
 # 代码里同样延迟导入：没装时拆解照跑，只在导出环节提示装本文件。
 python-docx>=1.1.0
+
+# 唤出面板预览扫描件/纯图片 PDF（把首页渲染成位图）。PyMuPDF(fitz) 自带 MuPDF
+# 渲染引擎，体积不小，故不进基础包；代码（gui/launcher_preview）一律延迟导入：
+# 没装时 PDF 回退到 pypdf 抽文字，只有纯图片 PDF 显示不出预览，不报错。
+PyMuPDF>=1.24

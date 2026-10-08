@@ -73,6 +73,10 @@ current_duration = DEFAULT_DURATION
 
 
 def main():
+    # 崩溃留痕（与 GUI 入口同一个机制）：native 层一死也要把 Python 栈留在日志里
+    from core import crashdump
+    crashdump.enable()
+
     raw_info(f"启动 {datetime.now().isoformat()}")
     db.init()
     

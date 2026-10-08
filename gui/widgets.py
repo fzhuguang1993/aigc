@@ -86,7 +86,7 @@ class FlowLayout(QLayout):
             w = it.widget()
             if w is None:
                 continue
-            sz = w.sizeHint()
+            sz = self._cell_size(w)
             if row_h and x + sz.width() > rect.right() + 1:
                 x, y = rect.x(), y + row_h + self.vgap
                 row_h = 0
@@ -95,6 +95,17 @@ class FlowLayout(QLayout):
             x += sz.width() + self.hgap
             row_h = max(row_h, sz.height())
         return y + row_h - rect.y()
+
+    @staticmethod
+    def _cell_size(w):
+        """子项占位尺寸：把 sizeHint 夹在 [minimumSize, maximumSize] 之间。
+
+        为什么不能直接用 sizeHint：`setFixedSize` 把 min/max 钉成同一个值，但
+        sizeHint 仍返回内容自然尺寸（比 fixed 小）。旧代码拿 sizeHint 排格子，
+        固定尺寸的卡片就会彼此重叠（唤出面板网格卡的选中外框“重合”就是这么来的）。
+        夹一段后：固定尺寸卡片按真实外框排位，普通胶囊仍按 sizeHint（min=0/max=∞）。"""
+        sz = w.sizeHint()
+        return sz.boundedTo(w.maximumSize()).expandedTo(w.minimumSize())
 
 
 def _fmt_ms(ms):

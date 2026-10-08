@@ -40,9 +40,12 @@ if not defined FFMPEG_DATA (
 REM 精简版剪掉 whisper 及其编译型大件，守 onefile <300MB；字幕/拆解在精简版里走降级提示。
 REM 标准版对外分发：连 core.config_local 一并抹除（收费接口地址/key 不随包外泄），
 REM 装好即全新未配置态，首跑走引导自填地址。创作版/命令行版仍内置，方便维护人自用。
+REM pypdf 必须显式列：唤出面板搜本地文档正文时 core/fileindex 是在函数体里懒导入它的，
+REM PyInstaller 静态分析扫不到，漏了不会报错——就是“开发机能搜 PDF、打包后静默搜不到”。
+REM （命令行版入口 main.py 不带面板，所以不列。）
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
-    --hidden-import=openpyxl ^
+    --hidden-import=openpyxl --hidden-import=pypdf ^
     --hidden-import=volcengine.base.Service ^
     --hidden-import=volcengine.ApiInfo ^
     --hidden-import=volcengine.Credentials ^
@@ -62,7 +65,7 @@ if errorlevel 1 (
 )
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手-创作版" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
-    --hidden-import=openpyxl --hidden-import=core.config_local ^
+    --hidden-import=openpyxl --hidden-import=core.config_local --hidden-import=pypdf ^
     --hidden-import=volcengine.base.Service ^
     --hidden-import=volcengine.ApiInfo ^
     --hidden-import=volcengine.Credentials ^
@@ -90,8 +93,12 @@ echo  To distribute: put the exe together with a material\ folder.
 echo  First run opens a setup dialog (name + API addresses).
 echo  CREDENTIALS (config.json / ui_state.json / api_text) are saved to the
 echo  HIDDEN folder  %%APPDATA%%\AIGC视频助手  (NOT next to the exe).
-echo  Products (data/, logs/, outputs/, material/) still live next to the exe,
-echo  so launching from another folder never creates a second, empty copy.
+echo  Products (data/, logs/, outputs/, material/) go to the DATA HOME:
+echo    installed exe : %%LOCALAPPDATA%%\AIGC视频助手  (Program Files is not writable)
+echo    portable copy : next to the exe (drop a .aigc_portable marker file there)
+echo    dev / python  : the repo folder
+echo  An old data folder from a previous layout is adopted on first launch, so
+echo  upgrading never shows an empty library. See core/paths.py.
 echo  Re-configure: delete config.json inside %%APPDATA%%\AIGC视频助手 and restart.
 echo ============================================================
 goto :eof

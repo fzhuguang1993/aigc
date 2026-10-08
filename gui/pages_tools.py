@@ -141,7 +141,17 @@ class ToolCard(QWidget):
         v.addWidget(QLabel(f"为「{self.tool_name}」按下组合键（示例：F9 / Ctrl+Alt+1）：\n"
                            "同一键位只归一个工具，冲突时其它工具自动让位"))
         ed = QKeySequenceEdit(QKeySequence(cur))
-        ed.keySequenceChanged.connect(lambda ks: dlg.accept() if ks.toString() else None)
+        from gui import global_hotkey as ghk
+
+        def _commit(ks):
+            """只在“按完了”之后才收：QKeySequenceEdit 只按住 Ctrl+Alt 这种半截状态
+            也会发 keySequenceChanged，而 set_tool_shortcut 会先释放旧键位再注册新键位：
+            拿半截串去设＝旧键丢了、新键又没注册上，卡片上一眼看去还像设好了。"""
+            seq = ks.toString()
+            if seq and ghk.parse_sequence(seq) is not None:
+                dlg.accept()
+
+        ed.keySequenceChanged.connect(_commit)
         v.addWidget(ed)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
@@ -288,6 +298,11 @@ class ToolsPage(QWidget):
         dlg.activateWindow()
         # 首次打开该工具：面板布局稳定后尝试起分步引导（看过则自动跳过）
         QTimer.singleShot(600, lambda: self._maybe_tool_guide(name, dlg))
+
+    def opened_tool(self, name):
+        """当前开着的工具窗口（没开返回 None）：托盘/全局热键把它抬到最前要用"""
+        dlg = self._dialogs.get(name)
+        return dlg if dlg is not None and dlg.isVisible() else None
 
     def _maybe_tool_guide(self, name, dlg):
         """为首次打开的重点工具（爆款拆解/素材提取/屏幕录制）起高亮向导。

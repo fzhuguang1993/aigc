@@ -1,5 +1,6 @@
 pandas
 openpyxl
+pypdf>=5.0
 requests
 volcengine
 PySide6>=6.6

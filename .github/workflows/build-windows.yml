@@ -44,13 +44,46 @@ jobs:
         run: >
           pyinstaller --noconfirm --onefile --noconsole --name "AIGC视频助手"
           --icon=assets\app.ico --add-data "assets\app.ico;assets"
-          --hidden-import=openpyxl --hidden-import=core.config_local desktop.py
+          --hidden-import=openpyxl --hidden-import=core.config_local
+          --hidden-import=pypdf desktop.py
 
       - name: Build CLI (console)
         run: >
           pyinstaller --noconfirm --onefile --console --name "AIGC视频助手-命令行"
           --icon=assets\app.ico --add-data "assets\app.ico;assets"
           --hidden-import=openpyxl --hidden-import=core.config_local main.py
+
+      # 唤出面板搜本地文档正文时，core/fileindex 是在函数体里懒导入 pypdf 的：
+      # PyInstaller 静态分析扫不到函数内的 import，不显式列就是“开发机上能搜 PDF、
+      # 打出的 exe 静默搜不到”。看 Analysis 清单是最便宜的验收。
+      - name: Verify pypdf packed into the GUI exe
+        shell: bash
+        run: |
+          if ! grep -qa "pypdf" build/*/Analysis-00.toc; then
+            echo "::error::pypdf 没进分析清单：打包后的 exe 搜不到 PDF 正文"
+            exit 1
+          fi
+          echo "OK pypdf 已打进 GUI 包"
+
+      # 安装包（Inno Setup）：装进 Program Files，数据家自动落在 %LOCALAPPDATA%，
+      # 所以 exe 旁边不可写也不影响成品视频与任务库。choco 装完 ISCC.exe 就在
+      # 固定路径下（Program Files (x86)\Inno Setup 6），比 winget 适合 CI。
+      - name: Build Setup package
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after choco install" }
+          # 版本号只有一个事实源：core/config.py 的 APP_VERSION
+          $ver = (python installer/read_version.py).Trim()
+          if (-not $ver) { throw "cannot read APP_VERSION" }
+          & $iscc "/DMyAppVersion=$ver" installer/aigc.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aigc-windows-setup
+          path: dist/*Setup*.exe
 
       - uses: actions/upload-artifact@v4
         with:

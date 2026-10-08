@@ -1,5 +1,9 @@
 """
 desktop.py —— Windows 桌面版入口（GUI 模式，与命令行模式共用数据）
+
+启动参数：
+  --minimized / --tray   启动后直接待在托盘里（开机自启用的就是它）；
+                         没配好/没激活时该弹的向导照旧弹，不会“静默启动了一个不能用”的程序。
 """
 import importlib
 import sys
@@ -10,6 +14,22 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from PySide6.QtGui import QIcon
 
 import core.config as config
+
+#: 启动后直接进托盘的参数（开机自启注册表写的就是它）
+TRAY_FLAGS = ("--minimized", "--tray")
+
+
+def pop_tray_flag(argv=None):
+    """从 argv 里取走托盘旗标，返回是否带了。
+
+    必须取走再交给 QApplication：Qt 会把不认识的参数当自己的选项解析，
+    轻则刷一屏 QCoreApplication::unknownArgument 告警，重则弹一个错误框。"""
+    argv = sys.argv if argv is None else argv
+    hit = any(a in TRAY_FLAGS for a in argv)
+    for f in TRAY_FLAGS:
+        while f in argv:
+            argv.remove(f)
+    return hit
 
 
 def _icon_path():
@@ -24,8 +44,25 @@ def _icon_path():
 
 
 def main():
+    minimized = pop_tray_flag()
+    # 崩溃留痕：必须赶在 QApplication 与任何线程之前装。这次"反复崩溃"就是因为
+    # native 层一死什么都不留（只有 Qt 的 qFatal → abort），只能去 %LOCALAPPDATA%
+    # \CrashDumps 用 cdb 解 dump 才看到真凶。装上后 logs/crash.log + aigc.log
+    # 里会分别留下 Python 栈与 Qt 原话。详见 core/crashdump.py。
+    from core import crashdump
+    crashdump.enable()
+
     app = QApplication(sys.argv)
     app.setApplicationName("AIGC工厂")
+
+    # 单实例守护：托盘常驻 + 系统热键的形态下，第二个实例抢不到键位还会多跑
+    # 一份轮询线程，所以“已经开着”就是错：把已开的那个叫到前台，自己退出。
+    # 赶在任何对话框之前判：不能先弹完协议/登录框才发现“其实已经有一个在跑”。
+    from core import single_instance
+    if not single_instance.acquire():
+        single_instance.activate_existing()
+        sys.exit(0)
+
     from gui.theme import apply_theme
     apply_theme(app)
     icon = _icon_path()
@@ -77,8 +114,9 @@ def main():
     log_sink.install()
 
     from gui.main_window import MainWindow
-    win = MainWindow()
-    win.show()
+    win = MainWindow(start_minimized=minimized)
+    if not minimized:
+        win.show()
     sys.exit(app.exec())
 
 

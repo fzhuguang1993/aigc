@@ -41,6 +41,28 @@ class _ActivateWorker(QThread):
         self.done.emit(ok, info)
 
 
+#: 关窗时给在飞的线程留多久。写成常量是因为单位是个真坑：
+#: **QThread.wait() 收的是毫秒**，旧代码里的 wait(3) 等于等 3 毫秒，约等于没等。
+_SETTLE_WAIT_MS = 3000
+#: 等不到的线程寄存在这儿：QThread 对象必须比它起的线程活得久，否则 Qt 收尾时
+#: 析构一个还在跑的线程就是 qFatal("QThread: Destroyed while thread is still
+#: running")→ abort（与唤出面板缩略图同一个坑，本机 minidump 已实测到）。
+_PARKED = []
+
+
+def _park(worker):
+    """把“还没跑完就关了窗”的线程拾下来，跑完再自动摘掉（不靠对话框的 GC）。"""
+    _PARKED.append(worker)
+
+    def _release(w=worker):
+        try:
+            _PARKED.remove(w)
+        except ValueError:
+            pass
+
+    worker.finished.connect(_release)
+
+
 from gui.window_frame import apply_rounded
 
 
@@ -143,12 +165,22 @@ class LicenseDialog(QDialog):
             f"剩余天数：约 {info.get('days_remaining', lic.days_remaining())} 天")
         self.accept()
 
-    def reject(self):
-        """关闭窗口前先掐掉未完成的请求回调（线程随对话框销毁不安全）"""
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.done.disconnect()
-            self._worker.wait(3)
-        super().reject()
+    def done(self, r):
+        """accept / reject / Esc / 点 ✕ 都汇到这儿：先把在飞的激活线程安置好。
+
+        旧写法是 reject() 里 wait(3)：单位错（那是 3 毫秒）且只管 cancel 一条路，
+        激活成功后 accept 同样可能在 run() 还没返回时就关窗。"""
+        w = self._worker
+        if w is not None:
+            try:
+                w.done.disconnect()          # 不再往已经关掉的窗口上贴结果
+            except (RuntimeError, TypeError):
+                pass
+            if w.isRunning():
+                w.wait(_SETTLE_WAIT_MS)
+                if w.isRunning():
+                    _park(w)                 # 网络没回来：接管所有权，跑完自释
+        super().done(r)
 
 
 def ensure_valid(parent=None):

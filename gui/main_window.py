@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                                QListWidget, QStackedWidget, QLabel, QPushButton,
-                               QMessageBox)
+                               QMessageBox, QApplication)
 
 from utils.desktop_utils import open_path
 from gui.window_frame import TitleBar, apply_rounded
@@ -29,6 +29,8 @@ from gui.pages_remix import RemixPage
 from gui.pages_local_build import LocalBuildPage
 from gui.pages_ui_kit import UiKitPage
 from gui.menus import StyledMenu
+from gui.tools_registry import LAUNCHER_TOKEN, HOME_TOKEN, RESERVED_TOKENS
+from gui.window_foreground import raise_to_front
 from store import app_state
 
 
@@ -63,8 +65,10 @@ _WORKSHOP_INDEXES = {idx for _t, idx in _WORKSHOP_PAGES}
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, start_minimized=False):
         super().__init__()
+        self._quitting = False              # 只有走「退出」才置真，区分 ✕ 与真要退
+        self._start_minimized = bool(start_minimized)
         self._seed_demo_once()          # 首运行看板没内容时播一批演示任务（一次性）
         self.setWindowTitle("AIGC 工厂")
         self._setup_geometry()
@@ -183,18 +187,46 @@ class MainWindow(QMainWindow):
 
         # 定时刷新前先应用「设置-工具快捷键」里保存的一键呼出
         self.apply_tool_shortcuts()
+        self.apply_launcher_shortcut()
+        self.apply_home_shortcut()          # 默认不给键，设了才注册
+        self.apply_launcher_ball()          # 桌面悬浮球：开关关着就什么都不做
         self._update_identity()
+
+        # 本地文件索引：软件一启动就在后台建（用户点名要的不是“第一次用才扫”）。
+        # 首扫冷盘实测 45 秒，压在第一次搜索上就是“敲了没反应”；线程内部
+        # 延迟 3 秒才动手，不跟窗口首绘抢 IO，总开关关了就直接不装。
+        from workers import file_watcher
+        file_watcher.start()
 
         # 鼠标手势引擎：全局事件过滤器，右键划过阈值→匹配轨迹→按当前上下文派发
         from gui.mouse_gesture import MouseGestureEngine
         self.gesture = MouseGestureEngine(self)
         self.gesture.set_resolver(self._resolve_gesture)
 
+        # 托盘：装好即接管「关闭 = 收进托盘」；托盘不可用时 close_to_tray() 自己返
+        # 回 False，✕ 依旧直接退出（不能把用户锁在一个没有出口的后台进程里）
+        from gui.tray import TrayController
+        self.tray = TrayController(self, resource_path("assets/app.ico"))
+        self.tray.install()
+        self.tray.show_requested.connect(self.show_from_tray)
+        self.tray.quit_requested.connect(self.quit_application)
+        self.tray.launcher_requested.connect(self._summon_launcher)
+        self.tray.tool_requested.connect(self.summon_tool)
+        self.refresh_tray_prefs()      # 按已存偏好定下 ✕ 的归宿（含 quitOnLastWindowClosed）
+
         # 整窗改无边框圆角：标题栏上面已自备，故 add_titlebar=False
         apply_rounded(self, add_titlebar=False, resizable=True)
 
         # 默认停在数据中台：启动布局稳定后尝试起一次页面向导（看过则自动跳过）
-        QTimer.singleShot(700, lambda: self._maybe_page_guide(self.pages.currentIndex()))
+        # 开机自启（藏在托盘）不起向导：那是个看不见界面的启动，弹向导只会弹在
+        # 用户切回来时的脸上；顺便告诉他程序确实在后台跑着
+        if self._start_minimized:
+            QTimer.singleShot(800, lambda: self.tray.notify(
+                "已在托盘运行",
+                "双击右下角图标打开主界面；设过全局快捷键的话，"
+                "在其它软件里按也能直接弹工具。想改：设置 → 托盘与全局快捷键。"))
+        else:
+            QTimer.singleShot(700, lambda: self._maybe_page_guide(self.pages.currentIndex()))
 
     # ---------- 鼠标手势：同一命令在不同上下文映射到不同行为 ----------
     def _active_tool_dialog(self):
@@ -315,6 +347,10 @@ class MainWindow(QMainWindow):
         self._page_row = row
         self.nav.setCurrentRow(row)
         self.nav.blockSignals(False)
+        tray = getattr(self, "tray", None)      # _rebuild_nav 在 __init__ 里跑得比
+        if tray is not None and getattr(tray, "_menu", None) is not None:
+            # 托盘装配还早，这里得先问过有没有（启动即 AttributeError 最冤）
+            tray._rebuild_menu()                 # 托盘里的「固定工具」子菜单跟着走
 
     def _on_nav_row(self, row):
         if not (0 <= row < len(self._nav_rows)):
@@ -357,19 +393,211 @@ class MainWindow(QMainWindow):
 
     def apply_tool_shortcuts(self):
         """「设置-工具快捷键」保存后即时生效：全窗口任意页面一键呼出工具"""
+        from gui import global_hotkey as ghk
+        from gui.tools_registry import global_hotkey_enabled
+        hk = ghk.manager
         for s in getattr(self, "_tool_scuts", []):
             s.setEnabled(False)
             s.setParent(None)
         self._tool_scuts = []
         seqs = app_state.get("tool_shortcuts") or {}
+        use_global = hk.available() and global_hotkey_enabled()
         for name, seq in seqs.items():
             if not seq:
+                continue
+            hk.forget(name)
+            if use_global and hk.register(name, seq):
+                hk.set_callback(name, lambda n=name: self.summon_tool(n))
                 continue
             sc = QShortcut(QKeySequence(seq), self)
             sc.setContext(Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(lambda n=name: self.page_tools.open_tool(n))
             self._tool_scuts.append(sc)
+        # 配置里已经没有的键位（改键/清键剩下的）也要把系统热键放掉，
+        # 否则旧键一直占着系统：别的软件按不到，我们也不再响应它
+        want = {n for n, s in seqs.items() if s}
+        for token in hk.bound_tokens() - want - RESERVED_TOKENS:
+            hk.forget(token)
         self.page_tools.refresh_sc_hints()      # 卡片标题旁的快捷键提示跟着重注册刷新
+        self._log_hotkeys("工具快捷键")
+
+    def apply_launcher_shortcut(self):
+        """总唤出面板的键：系统级优先，注册不上（被占/非 Windows）退回窗口内"""
+        from gui import global_hotkey as ghk
+        from gui.tools_registry import launcher_shortcut
+        seq = launcher_shortcut()
+        hk = ghk.manager
+        for s in getattr(self, "_launcher_scuts", []):
+            s.setEnabled(False)
+            s.setParent(None)
+        self._launcher_scuts = []
+        hk.forget(LAUNCHER_TOKEN)
+        if not seq:
+            return
+        if hk.available() and hk.register(LAUNCHER_TOKEN, seq):
+            hk.set_callback(LAUNCHER_TOKEN, lambda _t=None: self._summon_launcher())
+            self._log_hotkeys("总唤出键")
+            return
+        sc = QShortcut(QKeySequence(seq), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self._summon_launcher)
+        self._launcher_scuts.append(sc)
+        # 走到这里＝系统级没注册上（键被占/非 Windows），已退回窗口内快捷键：
+        # 主窗口藏在托盘时按它不会有反应，必须在日志里留话，不然又是一桩悬案
+        self._log_hotkeys("总唤出键")
+
+    def apply_launcher_ball(self):
+        """按「设置 → 唤出面板 → 桌面悬浮球」开关显示/收起那颗点球即开搜索的浮球。
+
+        关：收起已有球。开：用指向 _summon_launcher 的回调重建（show_launcher_ball
+        内部先收旧的，同一时刻只留一颗）。与全局热键/托盘共用同一个唤出入口。"""
+        from gui import launcher_ball
+        if not app_state.get("launcher_ball_on"):
+            launcher_ball.hide_launcher_ball()
+            return
+        launcher_ball.show_launcher_ball(self._summon_launcher, None)
+
+    def apply_home_shortcut(self):
+        """呼出主界面的键：与总唤出面板各自一条（面板是选工具，这条是直接回到界面）。
+
+        默认没键（用户要求），所以设了才注册；其余口径与总唤出键一致：
+        系统级优先，注册不上就退回窗口内，成败都在日志里留一行。"""
+        from gui import global_hotkey as ghk
+        from gui.tools_registry import home_shortcut
+        seq = home_shortcut()
+        hk = ghk.manager
+        for s in getattr(self, "_home_scuts", []):
+            s.setEnabled(False)
+            s.setParent(None)
+        self._home_scuts = []
+        hk.forget(HOME_TOKEN)
+        if not seq:
+            return
+        if hk.available() and hk.register(HOME_TOKEN, seq):
+            hk.set_callback(HOME_TOKEN, lambda _t=None: self.show_home())
+            self._log_hotkeys("主界面键")
+            return
+        sc = QShortcut(QKeySequence(seq), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self.show_home)
+        self._home_scuts.append(sc)
+        self._log_hotkeys("主界面键")
+
+    def show_home(self):
+        """把主界面拉回眼前：藏在托盘、最小化、被压在其它窗口下面都要露出来。
+
+        不做“再按一次收起”：唤出面板那种小窗可以随手收，主界面是工作台，
+        误按一下就把界面收走的代价远大于多按一次。"""
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        raise_to_front(self)                 # 不补这一步会被前台锁拒掉，藏在用户正看着的窗口下面
+        self._refresh()
+
+    def _log_hotkeys(self, what):
+        """把系统级热键的注册结果写进日志。
+
+        这不是装饰：注册失败时界面只在那个设置页里画一行小字，用户不会去翻，
+        于是"按了没反应"变成一件无从查起的事——本轮排查就是靠日志里一条热键
+        记录都没有，只能在外面拿探针猜。成败都记一行，下次直接看日志。"""
+        from core.logger import log
+        from gui import global_hotkey as ghk
+        hk = ghk.manager
+        bound = sorted(hk.bound_tokens())
+        if not hk.failures:
+            log.info("%s：系统级已注册 %d 个 %s" % (what, len(bound), bound or "-"))
+            return
+        bad = "；".join("%s → %s" % (k, v) for k, v in hk.failures.items())
+        log.warning("%s：系统级已注册 %d 个 %s；没注册上：%s"
+                    % (what, len(bound), bound or "-", bad))
+
+    # ---------- 托盘：收进去 / 叫回来 / 真要退出 ----------
+    def refresh_tray_prefs(self):
+        """设置页拨了开关后立即照着改行为，不等重启。
+
+        关键是 quitOnLastWindowClosed 要跟着「关闭进托盘」开关走：开着它时主窗口
+        只是 hide（任务栏没有入口），若还留着"最后一个窗口关了就退出"，用户关掉
+        一个工具小窗就把整个程序带走了——看到的是"软件自己闪退"。"""
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(not self.tray.close_to_tray())
+        self.tray.refresh_menu()          # 开机自启的勾选态同步进托盘菜单
+
+    def try_minimize_to_tray(self):
+        """标题栏「最小化」按偏好分流；True＝已收进托盘（调用方就不再 showMinimized）"""
+        if not self.tray.minimize_to_tray():
+            return False
+        self.hide_to_tray()
+        return True
+
+    def hide_to_tray(self):
+        self.hide()
+        self.tray.notify_first_hide()          # 只有第一次会真弹（内部记账）
+
+    def show_from_tray(self):
+        self.tray.show_window()
+        self._refresh()
+
+    def quit_application(self):
+        """退出：先释放系统热键与托盘图标，再关窗退出事件循环。
+
+        顺序不能反：进程退了而图标还在，用户点一下就是一个“没响应”的孤儿图标。"""
+        if self._quitting:
+            return
+        self._quitting = True
+        from gui import global_hotkey as ghk
+        try:
+            ghk.manager.unregister_all()
+        except Exception:
+            pass
+        from workers import file_watcher
+        try:
+            file_watcher.stop()             # 后台扫描线程别留在退出流程里跑完一整盘
+        except Exception:
+            pass
+        try:                                # 缩略图线程不归面板管，归进程管：
+            from gui.launcher_preview import shutdown_img_worker   # 这儿主动收一次，
+            shutdown_img_worker()           # 免得 Qt 收尾时析构还在跑的 QThread（qFatal）
+        except Exception:
+            pass
+        self.tray.remove()
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def closeEvent(self, e):
+        """✕ 的两种归宿：收进托盘（默认，可在设置里改回直接退出）或真退出。
+
+        收进托盘时必须 ignore：真的 close 了就把窗口对象销毁了，托盘上点
+        「打开主界面」再也叫不回界面。"""
+        if self._quitting or not self.tray.close_to_tray():
+            e.accept()
+            return
+        e.ignore()
+        self.hide_to_tray()
+
+    # ---------- 一键唤出：工具窗口 / 搜索面板 ----------
+    def summon_tool(self, name):
+        """托盘菜单/全局热键共用：藏在托盘时只抬工具窗，不弹主窗口
+
+        （按 Ctrl+Alt+1 的人是要直接干活，不是来看导航的）。"""
+        self.page_tools.open_tool(name)
+        dlg = self.page_tools.opened_tool(name)
+        if dlg is not None:
+            dlg.showNormal()
+            dlg.raise_()
+            dlg.activateWindow()
+            raise_to_front(dlg)                 # 同唤出面板：不补这一步会被压在用户正看着的窗口下面
+
+    def _summon_launcher(self):
+        from gui.dialogs_launcher import LauncherDialog
+        if getattr(self, "_launcher", None) is None:
+            self._launcher = LauncherDialog(self.summon_tool, None)
+        self._launcher.summon()
 
     def _setup_geometry(self):
         """初始尺寸＝屏幕可用区的 75%，并居中；窗口仍可自由拉大放小
