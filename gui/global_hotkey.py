@@ -72,9 +72,16 @@ class _KBDLLHOOKSTRUCT(ctypes.Structure):
                 ("dwExtraInfo", ctypes.c_void_p)]
 
 
-#: WNDPROC：返回值与 LPARAM 都是指针宽度，64 位下用 c_int 会把地址截断
-_HOOK_PROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int,
-                                ctypes.c_void_p, ctypes.c_void_p)
+#: WNDPROC：返回值与 LPARAM 都是指针宽度，64 位下用 c_int 会把地址截断。
+#: ⚠ ctypes.WINFUNCTYPE 是 Windows 专有，非 Windows 平台（macOS/Linux）根本不存在这个
+#: 属性——若在模块顶层无条件构造，import 就会 AttributeError 直接拖垮整条依赖链
+#: （pages_settings 也 import 本模块，设置页随之崩）。故按平台降级：非 Win 置 None，
+#: 调用方本就靠 is_supported()/available() 把关，不会碰它。
+if sys.platform.startswith("win"):
+    _HOOK_PROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_void_p, ctypes.c_void_p)
+else:
+    _HOOK_PROC = None
 
 
 def _flag(x):
@@ -522,8 +529,12 @@ class GlobalHotkeyManager(QAbstractNativeEventFilter):
             self._try_fire(token, "键盘钩子")
 
     def _install_hook(self):
-        """挂上兜底的低级键盘钩子（只有键位注册着时才挂，装不上不影响主通道）"""
-        if self._hook or not is_supported() or self._user32 is None:
+        """挂上兜底的低级键盘钩子（只有键位注册着时才挂，装不上不影响主通道）
+
+        不再拿 is_supported() 做硬拦：谁显式塞了 _user32（含测试假对象）就让流程走到底，
+        平台缺原语（_HOOK_PROC 在 mac 未定义）会被 try/except 接住并记录"钩子没装上"，
+        与 SetWindowsHookExW 返回 0 走同一条日志出口，对调用方（register）透明。"""
+        if self._hook or self._user32 is None:
             return bool(self._hook)
         try:
             self._hook_cb = _HOOK_PROC(self._hook_proc)

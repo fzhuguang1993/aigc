@@ -1,4 +1,4 @@
-﻿﻿; installer/aigc.iss —— Windows 安装包（Inno Setup 6）
+﻿; installer/aigc.iss —— Windows 安装包（Inno Setup 6）
 ;
 ; 怎么编：先 build.bat 出 exe，再 build_installer.bat（它负责找 ISCC.exe 与读版本号）。
 ; 没装 Inno Setup 时只需装一次：  winget install JRSoftware.InnoSetup

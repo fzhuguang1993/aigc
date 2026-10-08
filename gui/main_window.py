@@ -447,15 +447,77 @@ class MainWindow(QMainWindow):
         self._log_hotkeys("总唤出键")
 
     def apply_launcher_ball(self):
-        """按「设置 → 唤出面板 → 桌面悬浮球」开关显示/收起那颗点球即开搜索的浮球。
+        """按「设置 → 唤出面板 → 桌面悬浮球」开关显示/收起那颗悬浮球。
 
-        关：收起已有球。开：用指向 _summon_launcher 的回调重建（show_launcher_ball
-        内部先收旧的，同一时刻只留一颗）。与全局热键/托盘共用同一个唤出入口。"""
+        关：收起球并关掉扇形菜单。开：重建球（show_launcher_ball 内部先收旧的，
+        同一时刻只留一颗），接上单击/双击/右键三个入口。球常驻，扇形懒建。
+        """
         from gui import launcher_ball
         if not app_state.get("launcher_ball_on"):
             launcher_ball.hide_launcher_ball()
+            if getattr(self, "_fan", None) is not None:
+                self._fan.hide_menu()
             return
-        launcher_ball.show_launcher_ball(self._summon_launcher, None)
+        self._ball = launcher_ball.show_launcher_ball(
+            self._on_ball_single, self._on_ball_double,
+            on_search=self._summon_launcher,
+            on_config=self._on_ball_config, on_index=self._on_ball_index)
+
+    # ---------- 悬浮球：单击展开扇形 / 双击开主程序 / 右键入口 ----------
+    def _on_ball_single(self):
+        """点球：以球为极点朝屏内展开扇形功能菜单（再点一下收起）。"""
+        from gui.launcher_fan import LauncherFan, load_fan_items
+        if getattr(self, "_fan", None) is None:
+            self._fan = LauncherFan(self._on_fan_pick, self._on_fan_changed)
+        self._fan.toggle(getattr(self, "_ball", None), load_fan_items())
+
+    def _on_fan_pick(self, item):
+        """扇形项点落：智能混合——工具弹独立面板、搜索弹唤出面板、页面开主窗口到对应页。"""
+        kind = (item or {}).get("kind")
+        if kind == "search":
+            self._summon_launcher()
+        elif kind == "tool":
+            self.summon_tool(item.get("ref"))
+        elif kind == "page":
+            try:
+                self._goto_page(int(item.get("ref", 0)))
+            except (TypeError, ValueError):
+                pass
+
+    def _on_fan_changed(self):
+        """扇形就地增删后：若设置页开着，让它把扇形管理列表跟着刷一遍。"""
+        try:
+            if hasattr(self.page_settings, "reload_fan_items"):
+                self.page_settings.reload_fan_items()
+        except Exception:
+            pass
+
+    def _on_ball_double(self):
+        """双击球：打开整个主程序并切到设置的默认页（未配置则回到上次所在页）。"""
+        idx = app_state.get("launcher_dblclick_page")
+        if idx is None:
+            idx = self.pages.currentIndex()
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = self.pages.currentIndex()
+        self._goto_page(idx)
+
+    def _on_ball_config(self):
+        """右键“功能项设置…”：开主窗口到设置页（那里有扇形项管理 + 双击默认页）。"""
+        self._goto_page(6)
+
+    def _on_ball_index(self):
+        """右键“索引设置”：与唤出面板「⚙ 索引」、设置页同一对话框（单一真源）。"""
+        from gui.dialogs_index_settings import IndexSettingsDialog
+        IndexSettingsDialog(self).exec()
+
+    def _goto_page(self, idx):
+        """把主窗口拉到眼前并切到页栈 idx（从托盘隐藏态/最小化都能唤回）。"""
+        self.show_home()
+        if 0 <= idx < self.pages.count():
+            self.pages.setCurrentIndex(idx)
+            self._sync_nav_to_page(self.pages.currentWidget())
 
     def apply_home_shortcut(self):
         """呼出主界面的键：与总唤出面板各自一条（面板是选工具，这条是直接回到界面）。

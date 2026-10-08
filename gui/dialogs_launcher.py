@@ -660,6 +660,18 @@ class LauncherDialog(QDialog):
             " background:rgba(51, 112, 255, 0.24); }" % _WEAK))
         self.btn_pin.clicked.connect(self._toggle_pin)
         tip.addWidget(self.btn_pin)
+        # ⚙ 索引：从搜索界面就地打开“每盘符索引设置”（选盘/看每盘更新时间/立即重扫），
+        # 不用绕回设置页——用户要的就是“在这个界面里就能把索引调了”。
+        self.btn_index = QToolButton()
+        self.btn_index.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_index.setToolTip("本地文件索引设置：选盘符 / 每盘更新时间 / 立即重扫")
+        self.btn_index.setText("⚙ 索引")
+        self.btn_index.setStyleSheet(tokenize(
+            "QToolButton { color:%s; background:transparent; border:none;"
+            " border-radius:5px; padding:2px 8px; font-size:12px; }"
+            " QToolButton:hover { background:rgba(255, 255, 255, 0.10); }" % _WEAK))
+        self.btn_index.clicked.connect(self._open_index_settings)
+        tip.addWidget(self.btn_index)
         lay.addLayout(tip)
 
         # 右侧预览窗：随选中项实时预览（文本/图片/视频/文档；其余“无法预览”）
@@ -1229,6 +1241,15 @@ class LauncherDialog(QDialog):
         self._pinned = bool(self.btn_pin.isChecked())
         self.btn_pin.setText("📌 已钉住" if self._pinned else "📌 钉住")
         app_state.set_value("launcher_pinned", self._pinned)
+
+    def _open_index_settings(self):
+        """从搜索面板就地拉起“每盘符索引设置”对话框（模态）。
+
+        懒 import：索引设置只在点 ⚙ 时才用，不在面板构造时就把它（及 fileindex
+        的一串依赖）拽进来，拖慢面板首开。对话框自己会读盘/读状态/接后台重扫。"""
+        from gui.dialogs_index_settings import IndexSettingsDialog
+        dlg = IndexSettingsDialog(self)
+        dlg.exec()
 
     def hideEvent(self, e):
         # 面板不在眼前就停表：定时器不该在背后一直跑（取数虽已是 O(1)，白刷也没道理）

@@ -42,6 +42,10 @@ _KICK = None                  # 设置页按「立即重建索引」用它把下
 _STATS = {"rounds": 0, "scans": 0, "docs": 0, "last": "", "error": "",
           "last_sec": 0.0, "next_sec": ROUND_SEC}
 _BUSY = False                 # 防重入：一轮没跑完就不再开第二轮
+#: 定向重扫待办队列（索引设置页“立即重扫此盘/所选盘”塞进来，loop 下一拍优先消费）：
+#: 保持单写者纪律——不另起并发线程，交给常驻线程同一把 _BUSY 锁串行跑。
+_PENDING = []
+_PENDING_LOCK = threading.Lock()
 
 
 def enabled():
@@ -98,6 +102,47 @@ def kick():
     return False
 
 
+def _requeue(roots):
+    """把定向重扫请求放回待办（去重）：本轮因正忙/未开没跑成时不能丢。"""
+    with _PENDING_LOCK:
+        for r in roots:
+            if r not in _PENDING:
+                _PENDING.append(r)
+
+
+def _take_pending():
+    """取走并清空当前待办（一次取干净，避免同一轮反复碰队列）。"""
+    with _PENDING_LOCK:
+        req = list(_PENDING)
+        del _PENDING[:]
+        return req
+
+
+def has_pending():
+    with _PENDING_LOCK:
+        return bool(_PENDING)
+
+
+def busy():
+    """后台正在跑一轮（无论全局还是定向）：索引设置页据此显“进度/在跑”。"""
+    return _BUSY
+
+
+def reindex_roots(roots):
+    """请求只重扫指定盘/根（“立即重扫此盘/所选盘”）。
+
+    异步：塞进待办队列 + kick 唤醒后台线程下一拍优先消费，**不阻塞调用线程**；
+    盘没起线程时先 start。返回后台线程是否活着（False 多半是总开关关了，
+    调用方可据此提示“请先启用本地文件搜索”）。"""
+    req = [str(r) for r in (roots or []) if str(r).strip()]
+    if not req:
+        return False
+    _requeue(req)
+    if not running():
+        start()
+    return kick()
+
+
 def stats():
     """给设置页状态行与日志用：跑过几轮、上一轮收了什么、下一轮等多久"""
     return dict(_STATS)
@@ -116,16 +161,23 @@ def next_interval():
     return _STATS["next_sec"]
 
 
-def run_once(stop=None, scan=True, docs=True):
-    """同步跑一轮（测试与「立即重建索引」用）；返回各步统计"""
+def run_once(stop=None, scan=True, docs=True, roots=None):
+    """同步跑一轮（测试与“立即重建索引”用）；返回各步统计。
+
+    roots 不为空时只扫这几个盘（定向重扫），且不动正文：正文抽取走 doc_roots
+    自己的节奏（按盘细分是以后的事），免得一重扫 C 盘就把整盘文档都抽一遍。"""
     from core import fileindex
     out = {}
     if not scan and not docs:
         return out
     if scan:
-        out["scan"] = fileindex.scan_once(stop=stop, pace=SCAN_PACE)
+        if roots is not None:
+            out["scan"] = fileindex.scan_once(roots=roots, stop=stop, pace=SCAN_PACE)
+        else:
+            out["scan"] = fileindex.scan_once(stop=stop, pace=SCAN_PACE)
         _STATS["scans"] += 1
-    if docs and fileindex.doc_enabled() and not (stop is not None and stop.is_set()):
+    if docs and roots is None and fileindex.doc_enabled() \
+            and not (stop is not None and stop.is_set()):
         out["docs"] = fileindex.index_docs(stop=stop)
         _STATS["docs"] += 1
     _STATS["rounds"] += 1
@@ -139,25 +191,34 @@ def _loop(stop, kick):
     if stop.wait(STARTUP_DELAY):
         return
     while not stop.is_set():
-        _round(stop)
-        # 等到下一轮，或者被 kick 提前叫醒（重建索引 / 改了范围）
+        req = _take_pending()
+        if req:
+            # 定向重扫优先：拿不到写锁/还没开就放回队列，不能把用户请求丢了
+            if not _round(stop, roots=req):
+                _requeue(req)
+        else:
+            _round(stop)
+        # 等到下一轮，或者被 kick 提前叫醒（重建索引 / 改了范围 / 定向重扫）
         kick.wait(next_interval())
         kick.clear()
 
 
-def _round(stop):
-    """一轮扫描：重入直接跳过（宁可这轮不跑，也不能两个线程同时写同一份库）"""
+def _round(stop, roots=None):
+    """一轮扫描：重入直接跳过（宁可这轮不跑，也不能两个线程同写一份库）。
+
+    返回是否真的跑了（False=因正忙/已开关而跳过），供 _loop 决定要不要把定向
+    请求放回队列。roots 不为空就是定向重扫（只扫指定盘、不抽正文）。"""
     global _BUSY
     from core import fileindex
     if _BUSY:
-        return
+        return False
     if not fileindex.enabled():
-        return
+        return False
     _BUSY = True
     t0 = time.perf_counter()
     out = {}
     try:
-        out = run_once(stop=stop)
+        out = run_once(stop=stop, roots=roots)
         _STATS["error"] = ""
     except Exception as e:                      # 后台线程绝不能把进程带崩
         _STATS["error"] = "%s: %s" % (type(e).__name__, e)
@@ -165,18 +226,20 @@ def _round(stop):
     finally:
         _BUSY = False
         _STATS["last_sec"] = round(time.perf_counter() - t0, 1)
-    _heartbeat(out)
+    _heartbeat(out, targeted=bool(roots))
+    return True
 
 
-def _heartbeat(out):
+def _heartbeat(out, targeted=False):
     """每轮写一行心跳。以前一个字都不打：用户说"电脑卡死"，日志里连一条
     "索引跑了多久"都翻不出来，只能靠外部探针现场量。有了这一行，下次直接看日志。"""
     sc = out.get("scan") or {}
     dc = out.get("docs") or {}
     sec = _STATS["last_sec"]
-    msg = ("本地文件索引：第 %d 轮 用时 %.1fs｜走访 %s 目录 收录 %s 文件"
+    tag = "定向重扫" if targeted else "第 %d 轮" % _STATS["rounds"]
+    msg = ("本地文件索引：%s 用时 %.1fs｜走访 %s 目录 收录 %s 文件"
            "（新增 %s 移除 %s）｜正文 %s 篇｜下轮 %ds 后"
-           % (_STATS["rounds"], sec, _fmt(sc.get("dirs")), _fmt(sc.get("files")),
+           % (tag, sec, _fmt(sc.get("dirs")), _fmt(sc.get("files")),
               _fmt(sc.get("added")), _fmt(sc.get("removed")),
               _fmt(dc.get("indexed")), next_interval()))
     # 一轮顶到间隔以上就是把机器顶满了，值得单独喊一句（设置页也看得到这一行）

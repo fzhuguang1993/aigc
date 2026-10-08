@@ -40,7 +40,10 @@ DB_PATH = Path(RUNTIME_DIR) / "data" / "file_index.db"
 #: 结构版本：改了表结构/切词口径就 +1，旧库自动整库重建（索引没有保留价值）
 #: 1→2：dirs 的增量签名从「只看 mtime」改成「mtime + 子项数」，旧库的 mark 全是
 #: 补出来的 0，留着会把正常目录误判成没变，索性整个作废重扫一遍。
-INDEX_VERSION = "2"
+#: 2→3：dirs 增 root（归属盘）列 + 新增 roots 表做「每盘独立时间戳/按盘清理」。
+#: 旧库的行没有 root 标记，按盘 purge 会把它们当游离行清不干净；索引没有保留
+#: 价值，直接整库重建最干净（老 dirs 行 root=NULL 也就不用再兼容回填了）。
+INDEX_VERSION = "3"
 
 #: 剪掉整棵子树的目录名（小写比对）。依据见模块头第 1 条。
 EXCLUDE_DIRS = {
@@ -94,7 +97,17 @@ CREATE TABLE IF NOT EXISTS dirs(
   path TEXT PRIMARY KEY,
   mtime REAL DEFAULT 0,
   mark INTEGER DEFAULT 0,
-  seen INTEGER DEFAULT 0
+  seen INTEGER DEFAULT 0,
+  root TEXT DEFAULT ''
+);
+-- 每盘（顶层根）各自的扫描成果：path 就是被扫的那个盘/根，last_scan 为墙上
+-- 时钟。有了它才能做到“每盘独立最近更新时间 + 单独立即重扫”，而全局
+-- last_scan 仍保留作“最近任意盘动过”的兜底。
+CREATE TABLE IF NOT EXISTS roots(
+  path TEXT PRIMARY KEY,
+  last_scan INTEGER DEFAULT 0,
+  files INTEGER DEFAULT 0,
+  dirs INTEGER DEFAULT 0
 );
 -- 文档登记表：id 显式当 FTS 的 rowid 用。为什么非要这层——FTS5 里按普通列
 -- DELETE（WHERE path=?）是整表扫，重抽一批文档就是几十次全表扫；按 rowid 删
@@ -168,7 +181,34 @@ def set_doc_max_mb(mb):
 
 
 def _split_roots(raw):
-    return [s.strip() for s in str(raw or "").split(os.pathsep) if s.strip()]
+    """把索引范围的存储串还原成路径列表。
+
+    存过两种格式：旧版用 os.pathsep 拼——mac/Linux 上 os.pathsep=':'，
+    一刀下去把 Windows 盘符路径 'D:\我的文档' 斜成 ['D','\我的文档']（实测就
+    红在这）；新版改存 JSON 列表，与平台无关。读取时先试 JSON，不是
+    JSON 就回退旧串：按 ';' （Windows 的 os.pathsep）切，单段不切
+    （不再碰 ':'，避免拆盘符）。"""
+    s = str(raw or "").strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        try:
+            import json
+            arr = json.loads(s)
+            if isinstance(arr, list):
+                return [str(x).strip() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+    if ";" in s:
+        return [x.strip() for x in s.split(";") if x.strip()]
+    return [s]
+
+
+def _join_roots(paths):
+    """路径列表→存储串：统一用 JSON，与运行平台无关（不再拿 os.pathsep 拼）。"""
+    import json
+    return json.dumps([str(p) for p in (paths or []) if str(p).strip()],
+                      ensure_ascii=False)
 
 
 def custom_roots():
@@ -177,7 +217,7 @@ def custom_roots():
 
 
 def set_custom_roots(paths):
-    return _set_pref(K_ROOTS, os.pathsep.join(str(p) for p in (paths or [])))
+    return _set_pref(K_ROOTS, _join_roots(paths))
 
 
 def default_doc_roots():
@@ -200,7 +240,7 @@ def doc_roots():
 
 
 def set_doc_roots(paths):
-    return _set_pref(K_DOC_ROOTS, os.pathsep.join(str(p) for p in (paths or [])))
+    return _set_pref(K_DOC_ROOTS, _join_roots(paths))
 
 
 def search_roots():
@@ -341,11 +381,13 @@ def _migrate(conn):
         return                      # 表都读不出来（多半是刚建/坏了），交给建库路径
     if "mark" not in cols:
         conn.execute("ALTER TABLE dirs ADD COLUMN mark INTEGER DEFAULT 0")
+    if "root" not in cols:
+        conn.execute("ALTER TABLE dirs ADD COLUMN root TEXT DEFAULT ''")
     conn.commit()
 
 
 def _wipe(conn):
-    for t in ("files", "dirs", "docs_meta", "docs_fts"):
+    for t in ("files", "dirs", "docs_meta", "docs_fts", "roots"):
         conn.execute("DELETE FROM %s" % t)
 
 
@@ -541,10 +583,15 @@ def scan_once(roots=None, stop=None, on_progress=None, pace=0.0, commit_every=20
     返回 {"files","dirs","added","removed","sec"}。增量口径见模块头第 3 条：
     全盘照走，只对「签名（mtime + 子项数）没变」的目录做数据库差分。
 
+    多个根（盘）**逐个走、逐个收尾清理**，而不是把所有盘塞进同一个栈一趟走完：
+    收尾清理是按盘作用域的（_purge 带 root），只重扫 C 盘绝不会把 D 盘的行
+    当残留删掉（这就是“每盘独立时间戳 + 单独立即重扫”能成立的前提）。每盘
+    走完把本轮成果记进 roots 表，供设置页渲染每盘最近更新时间。
+
     ⚠ 只改内容、不增删文件的目录会被跳过（NTFS 上写文件不动父目录 mtime），
     所以 files.mtime 可能偏旧。正文索引不受影响——那边每篇都自己 os.stat。
 
-    stop 置位时提前收工并**跳过清理**：本轮没走到的目录不等于被删了。
+    stop 置位时提前收工并**跳过该盘清理**：本轮没走到的目录不等于被删了。
 
     pace / commit_every 是节流旋钮（以前没有它们，就是本机卡死的其中一条）：
     12.3 万个目录逐个 commit，每次 commit 都是一轮 WAL 落盘/fsync，机械盘上
@@ -555,9 +602,39 @@ def scan_once(roots=None, stop=None, on_progress=None, pace=0.0, commit_every=20
     t0 = time.perf_counter()
     conn = connect()
     run = _next_run(conn)               # 轮次号不能用时间戳：同一秒内跑两轮会让
-    stack = [str(r) for r in (roots or search_roots())]   # _purge 把上轮的 seen 当本轮的，残留清不掉
+    root_list = [str(r) for r in (roots or search_roots())]   # _purge 把上轮的 seen 当本轮的
+    total = added = removed = ndirs = 0
+    for root in root_list:
+        st = _scan_root(conn, root, run, stop, on_progress,
+                        pace, commit_every, total)
+        total += st["files"]
+        added += st["added"]
+        removed += st["removed"]
+        ndirs += st["dirs"]
+        if not st["cut"]:               # 被打断的盘不记本轮：半程数字会骗人
+            _record_root(conn, root, st["files"], st["dirs"])
+    _safe_commit(conn)
+    stats = {"files": total, "dirs": ndirs, "added": added, "removed": removed,
+             "sec": round(time.perf_counter() - t0, 1)}
+    _set_meta(conn, "last_scan", int(time.time()))    # 展示用，必须是墙上时钟
+    # status() 的全局文件数取各盘 roots 表求和，而不是本轮走访数：单独重扫某盘
+    # 时本轮只走了那一盘，若把 last_scan_files 覆盖成它就把它盘记漏了。SUM 只扫
+    # 几行的 roots 表，绝不碰 95 万行的 files 表（冷缓存 COUNT 要 4.6 秒）。
+    _set_meta(conn, "last_scan_files", _sum_roots(conn, "files"))
+    _set_meta(conn, "last_scan_dirs", _sum_roots(conn, "dirs"))
+    _set_meta(conn, "last_scan_sec", stats["sec"])
+    conn.commit()
+    return stats
+
+
+def _scan_root(conn, root, run, stop, on_progress, pace, commit_every, base_total):
+    """对单个盘/根做一趟 DFS + 按盘作用域收尾清理，返回该盘统计（含 cut 标志）。
+
+    给 dirs 打上 root 归属后，本轮走到的目录都标 root=本盘、seen=本轮；收尾只清
+    “root=本盘 且本轮没见过”的行——别的盘的行 root 不匹配，绝不会被误删。"""
+    stack = [root]
     total = added = removed = ndirs = pending = 0
-    cut = False                     # 中途被 stop 打断：本轮没走完，绝不能做收尾清理
+    cut = False
     while stack:
         if stop is not None and stop.is_set():
             cut = True
@@ -574,9 +651,10 @@ def scan_once(roots=None, stop=None, on_progress=None, pace=0.0, commit_every=20
             row = conn.execute("SELECT mtime,mark FROM dirs WHERE path=?", (d,)).fetchone()
             if (row is not None and abs((row[0] or 0) - mt) < 1e-6
                     and int(row[1] if row[1] is not None else -1) == mark):
-                conn.execute("UPDATE dirs SET seen=? WHERE path=?", (run, d))
+                # 没变也要续期 seen（证明本轮见过了）+ 补 root（老行可能为空）
+                conn.execute("UPDATE dirs SET seen=?,root=? WHERE path=?", (run, root, d))
             else:
-                a, r = _sync_dir(conn, d, files, mt, run, mark)
+                a, r = _sync_dir(conn, d, files, mt, run, mark, root)
                 added += a
                 removed += r
             pending += 1
@@ -590,21 +668,15 @@ def scan_once(roots=None, stop=None, on_progress=None, pace=0.0, commit_every=20
             pending = 0
             continue
         if on_progress and ndirs % 200 == 0:
-            on_progress(total, d)
+            on_progress(base_total + total, d)
     if not cut:                     # 半程清理＝把还没走到的目录整个从索引里抹掉，
         try:                        # 表现为“一退出搜索就空了”；跳过的残留下一轮补上
-            removed += _purge(conn, run)
+            removed += _purge(conn, run, root)
         except sqlite3.Error:
             pass
     _safe_commit(conn)
-    stats = {"files": total, "dirs": ndirs, "added": added, "removed": removed,
-             "sec": round(time.perf_counter() - t0, 1)}
-    _set_meta(conn, "last_scan", int(time.time()))    # 展示用，必须是墙上时钟
-    _set_meta(conn, "last_scan_files", stats["files"])   # status() 靠它免掉 COUNT(*)
-    _set_meta(conn, "last_scan_dirs", ndirs)
-    _set_meta(conn, "last_scan_sec", stats["sec"])
-    conn.commit()
-    return stats
+    return {"files": total, "dirs": ndirs, "added": added, "removed": removed,
+            "cut": cut}
 
 
 def _safe_commit(conn):
@@ -630,12 +702,12 @@ def _next_run(conn):
     return nxt
 
 
-def _sync_dir(conn, d, files, mt, run, mark):
+def _sync_dir(conn, d, files, mt, run, mark, root=""):
     """把一个目录的内容对齐到库里，返回 (新增/更新行数, 删除行数)。
 
     先查这个目录已有的行、再与磁盘列表比对，而不是无脑 REPLACE 全量写：
     稳态下每个目录只发一条 SELECT 和零条写入，95 万文件的重扫才不会变成
-    95 万次 UPSERT。"""
+    95 万次 UPSERT。root 归属随写入落下，供按盘清理与每盘计数。"""
     have = {r["name"]: (r["size"], r["mtime"]) for r in conn.execute(
         "SELECT name,size,mtime FROM files WHERE dir=?", (d,))}
     now = {n: (sz, fmt) for n, sz, fmt in files}
@@ -650,20 +722,47 @@ def _sync_dir(conn, d, files, mt, run, mark):
                          "(path,dir,name,ext,size,mtime) VALUES(?,?,?,?,?,?)", ups)
     if gone:
         conn.executemany("DELETE FROM files WHERE path=?", [(p,) for p in gone])
-    conn.execute("INSERT OR REPLACE INTO dirs(path,mtime,mark,seen) VALUES(?,?,?,?)",
-                 (d, mt, mark, run))
+    conn.execute("INSERT OR REPLACE INTO dirs(path,mtime,mark,seen,root) VALUES(?,?,?,?,?)",
+                 (d, mt, mark, run, root))
     return len(ups), len(gone)
 
 
-def _purge(conn, run):
+def _purge(conn, run, root=None):
     """清掉本轮没见到的目录及其下所有文件行（整个文件夹被删的情况）。
+
+    传了 root 就只在本盘作用域内清（root=? AND seen<>run）：重扫某个盘时，
+    别的盘的行 root 不匹配不会被误删。root=None 是历史的全盘口径（保留兼容）。
 
     返回删掉的行数：整目录被删不走进 _sync_dir，不计这一笔的话
     stats["removed"] 就永远是 0，报不了“这一轮带走了多少文件”。"""
-    cur = conn.execute("DELETE FROM files WHERE dir IN"
-                       "(SELECT path FROM dirs WHERE seen<>?)", (run,))
-    conn.execute("DELETE FROM dirs WHERE seen<>?", (run,))
+    if root is None:
+        cur = conn.execute("DELETE FROM files WHERE dir IN"
+                           "(SELECT path FROM dirs WHERE seen<>?)", (run,))
+        conn.execute("DELETE FROM dirs WHERE seen<>?", (run,))
+    else:
+        cur = conn.execute("DELETE FROM files WHERE dir IN"
+                           "(SELECT path FROM dirs WHERE root=? AND seen<>?)", (root, run))
+        conn.execute("DELETE FROM dirs WHERE root=? AND seen<>?", (root, run))
     return max(cur.rowcount, 0)
+
+
+def _record_root(conn, root, files, dirs):
+    """把这一盘本轮的走访成果写进 roots 表（每盘独立时间戳/计数）。
+    last_scan 用墙上时钟，与全局口径一致，供 UI 算“几分钟前更新”。"""
+    conn.execute("INSERT OR REPLACE INTO roots(path,last_scan,files,dirs)"
+                 " VALUES(?,?,?,?)",
+                 (str(root), int(time.time()), int(files), int(dirs)))
+
+
+def _sum_roots(conn, col):
+    """各盘计数求和（只扫几行的 roots 表）：files/dirs 两列都安全。"""
+    if col not in ("files", "dirs"):
+        return 0
+    try:
+        return int(conn.execute("SELECT COALESCE(SUM(%s),0) FROM roots" % col)
+                    .fetchone()[0] or 0)
+    except sqlite3.Error:
+        return 0
 
 
 def _set_meta(conn, k, v):
@@ -1019,6 +1118,28 @@ def status():
     return {"files": nf, "docs": nd,
             "last_scan": int(last["v"]) if last and last["v"] else 0,
             "last_docs": int(lastd["v"]) if lastd and lastd["v"] else 0}
+
+
+def root_status():
+    """每盘（顶层根）各自的索引状态，供索引设置页渲染：
+
+    返回按盘符排序的列表，每项 {root, last_scan, files, dirs, indexed}。
+    last_scan=0 / indexed=False 表示这个盘还没扫过。只读几行的 roots 表，
+    不碰 95 万行的 files 表（同 status() 不 COUNT 的纪律）。
+    表还不存在（老库未迁移）也不能抛，回空列表。"""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT path,last_scan,files,dirs FROM roots ORDER BY path").fetchall()
+    except sqlite3.Error:
+        return []
+    out = []
+    for r in rows:
+        last = int(r["last_scan"] or 0)
+        out.append({"root": r["path"], "last_scan": last,
+                    "files": int(r["files"] or 0), "dirs": int(r["dirs"] or 0),
+                    "indexed": last > 0})
+    return out
 
 
 def rebuild():

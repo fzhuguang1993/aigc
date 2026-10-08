@@ -1,0 +1,2 @@
+# Inno Setup 脚本靠 CRLF 换行：不让 git 跨平台自动转换（mac 上 checkout 会弄丢 CR）
+*.iss  binary

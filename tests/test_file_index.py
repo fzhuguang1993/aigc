@@ -668,3 +668,85 @@ def test_each_thread_gets_its_own_connection(tree):
     t.join(5)
     assert box.get("same") is False, "两个线程拿到同一条连接，跨线程一用就抛"
     assert box.get("hits") == 1
+
+
+# ---------------- 按盘归属：单独重扫一个盘，绝不误删另一个盘 ----------------
+# 这是「每盘独立时间戳 + 单独立即重扫」能成立的地基：_purge 必须带 root 作用域，
+# 不然扫 C 盘那一轮的收尾清理会把 D 盘还没走到的行当残留全删了。
+
+@pytest.fixture
+def two_roots(tmp_path):
+    a = tmp_path / "driveA"
+    b = tmp_path / "driveB"
+    _mk(a / "a1.txt", "A 盘一号")
+    _mk(a / "sub" / "a2.txt", "A 盘二号")
+    _mk(b / "b1.txt", "B 盘一号")
+    return a, b
+
+
+def test_rescan_one_root_does_not_wipe_the_other(two_roots):
+    a, b = two_roots
+    fileindex.scan_once(roots=[str(a), str(b)])
+    assert len(fileindex.search_files("b1")) == 1        # 两盘都先入索引
+
+    # 单独重扫 A：本轮只有 A 的 seen 被刷新，B 的行 root 不匹配，不该被当成残留清掉
+    fileindex.scan_once(roots=[str(a)])
+    assert len(fileindex.search_files("a1")) == 1
+    assert len(fileindex.search_files("b1")) == 1, \
+        "重扫 A 盘把 B 盘的索引误删了：_purge 没有按盘作用域"
+
+
+def test_root_status_records_each_drive_separately(two_roots):
+    a, b = two_roots
+    fileindex.scan_once(roots=[str(a), str(b)])
+    st = {r["root"]: r for r in fileindex.root_status()}
+    assert str(a) in st and str(b) in st, "两盘都该各自有一行状态"
+    assert st[str(a)]["indexed"] and st[str(b)]["indexed"]
+    assert st[str(a)]["files"] >= 2 and st[str(b)]["files"] >= 1
+    assert st[str(a)]["last_scan"] > 0 and st[str(b)]["last_scan"] > 0
+
+    # 单独重扫 A：只有 A 的时间戳被推到最新，B 保持不动
+    b_last_before = st[str(b)]["last_scan"]
+    import time as _time
+    _time.sleep(1.1)
+    fileindex.scan_once(roots=[str(a)])
+    st2 = {r["root"]: r for r in fileindex.root_status()}
+    assert st2[str(a)]["last_scan"] > b_last_before, "重扫 A 后 A 的时间戳该往前推"
+    assert st2[str(b)]["last_scan"] == b_last_before, "B 没被重扫，时间戳不该变"
+
+
+def test_interrupted_root_is_not_recorded(tmp_path):
+    """被打断的那一盘不写 roots 表：半程数字会骗人（跟「全局时间戳」同一条纪律）。"""
+    root = tmp_path / "driveX"
+    _mk(root / "f1.txt", "占位")
+    stop = threading.Event()
+    stop.set()
+    fileindex.scan_once(roots=[str(root)], stop=stop)
+    assert all(r["root"] != str(root) for r in fileindex.root_status()), \
+        "这一盘被提前打断，不该在 roots 表里留下一行成功记录"
+
+
+# ---------------- 分隔符：Windows 盘符路径不能被 ':' 切开（历史红过的坑） ----------------
+
+@pytest.mark.parametrize("paths", [
+    ["D:\\我的文档"],
+    ["C:\\Users", "D:\\资料", "E:\\备份"],
+    ["/home/user/docs"],
+    [],
+])
+def test_split_join_roots_roundtrip(paths):
+    raw = fileindex._join_roots(paths)
+    assert fileindex._split_roots(raw) == [str(p) for p in paths], \
+        "盘符路径被切开/吞掉了：跨平台分隔符必须与 os.pathsep 无关"
+
+
+def test_split_roots_reads_legacy_pathsep_string():
+    """旧版用 os.pathsep 拼过串（Windows=';'，mac/Linux=':'）：读到非 JSON 的旧串
+    也要按 ';' 切，且单段绝不按 ':' 拆——不然又踩回老 bug（mac 上把 'D:\\我的文档'
+    斜成 ['D', '\\我的文档']）。"""
+    legacy_win = "C:\\Users;D:\\资料"
+    assert fileindex._split_roots(legacy_win) == ["C:\\Users", "D:\\资料"]
+    legacy_mac_single = "D:\\我的文档"          # 没有 ';'：不当分隔符拆，整段留着
+    assert fileindex._split_roots(legacy_mac_single) == ["D:\\我的文档"]
+    assert fileindex._split_roots("") == []
+    assert fileindex._split_roots(None) == []

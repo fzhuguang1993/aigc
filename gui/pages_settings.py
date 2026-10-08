@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QStandardPaths, QPoint, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtGui import QShortcut, QKeySequence, QCursor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QMessageBox, QScrollArea, QFrame,
                                QFileDialog, QInputDialog, QSpinBox, QComboBox,
@@ -408,6 +408,13 @@ class SettingsPage(QWidget):
 
         ar = QHBoxLayout()
         ar.setSpacing(10)
+        b_fs_index = QPushButton("🗂 按盘符索引设置…")
+        b_fs_index.setObjectName("GhostBtn")
+        b_fs_index.setToolTip(
+            "勾选哪几个盘进索引、看每盘各自最近更新时间、对单个盘立即重扫（后台异步）。\n"
+            "与唤出搜索面板里的「⚙ 索引」是同一个对话框（单一真源，不做两套）。")
+        b_fs_index.clicked.connect(self._open_index_settings)
+        ar.addWidget(b_fs_index)
         b_fs_rebuild = QPushButton("🔁 立即重建索引")
         b_fs_rebuild.setObjectName("GhostBtn")
         b_fs_rebuild.setToolTip(
@@ -441,10 +448,73 @@ class SettingsPage(QWidget):
         b_doc_del.clicked.connect(lambda _=False: self._dir_del(
             self.lst_doc_roots, self._doc_save_roots))
         for w in (self.ck_filesearch, self.ck_docsearch, self.combo_fs_scope,
-                  self.spin_doc_mb, b_fs_rebuild):
+                  self.spin_doc_mb, b_fs_rebuild, b_fs_index):
             w.setEnabled(fileindex.enabled())
         self._fs_stat_at = 0
         self._refresh_filesearch_status()
+        lay.addWidget(card)
+
+        # ---------- 悬浮球与扇形菜单：单击展开扇形选功能，双击打开主程序到指定页 ----------
+        # 与 gui/launcher_fan.py 共用同一份 app_state 数据（launcher_fan_items /
+        # launcher_dblclick_page）：这里改，扇形下一次展开就跟着变，不做第二套存储。
+        card, cv = _section_card("悬浮球与扇形菜单",
+                                  "开启上方「桌面悬浮球」后：单击＝放射扇形选功能，双击＝打开主程序")
+        dr = QHBoxLayout()
+        dr.setSpacing(10)
+        from gui.launcher_fan import _page_items
+        self.combo_ball_dblpage = QComboBox()
+        self.combo_ball_dblpage.addItem("（不跳转，只唤出主窗口）", None)
+        for _idx, _label, _icon in _page_items():
+            self.combo_ball_dblpage.addItem("%s %s" % (_icon, _label), _idx)
+        _saved_page = app_state.get("launcher_dblclick_page")
+        _pi = self.combo_ball_dblpage.findData(
+            int(_saved_page) if _saved_page is not None else -1)
+        self.combo_ball_dblpage.setCurrentIndex(max(0, _pi))
+        self.combo_ball_dblpage.setFixedWidth(240)
+        dr.addWidget(_form_label("双击悬浮球默认进入"))
+        dr.addWidget(self.combo_ball_dblpage)
+        dr.addWidget(QLabel("没选（第一项）：双击只把主窗口带出来，停在离开前的页面"))
+        dr.addStretch(1)
+        cv.addLayout(dr)
+
+        fr = QHBoxLayout()
+        fr.setSpacing(10)
+        self.lst_fan_items = QListWidget()
+        self.lst_fan_items.setFixedHeight(150)
+        self.lst_fan_items.setStyleSheet(tokenize(
+            "QListWidget { background:#FAFBFC; border:1px solid #DEE0E3;"
+            " border-radius:6px; }"))
+        fr.addWidget(self.lst_fan_items, 1)
+        fbtn = QVBoxLayout()
+        fbtn.setSpacing(6)
+        b_fan_add = QPushButton("➕ 添加")
+        b_fan_add.setObjectName("GhostBtn")
+        b_fan_add.clicked.connect(self._fan_add_item)
+        b_fan_del = QPushButton("✕ 移除")
+        b_fan_del.setObjectName("GhostBtn")
+        b_fan_del.clicked.connect(self._fan_remove_item)
+        b_fan_up = QPushButton("▲ 上移")
+        b_fan_up.setObjectName("GhostBtn")
+        b_fan_up.clicked.connect(lambda _=False: self._fan_move(-1))
+        b_fan_down = QPushButton("▼ 下移")
+        b_fan_down.setObjectName("GhostBtn")
+        b_fan_down.clicked.connect(lambda _=False: self._fan_move(1))
+        fbtn.addWidget(b_fan_add)
+        fbtn.addWidget(b_fan_del)
+        fbtn.addWidget(b_fan_up)
+        fbtn.addWidget(b_fan_down)
+        fbtn.addStretch(1)
+        fr.addLayout(fbtn)
+        cv.addLayout(fr)
+
+        self.lbl_fan = QLabel()
+        self.lbl_fan.setWordWrap(True)
+        self.lbl_fan.setStyleSheet(tokenize(
+            "color:#8F959E; font-size:12px; background:transparent;"))
+        cv.addWidget(self.lbl_fan)
+
+        self.combo_ball_dblpage.currentIndexChanged.connect(self._set_ball_dbl_page)
+        self._refresh_fan_items()
         lay.addWidget(card)
 
         # ---------- 鼠标手势：按住右键划轨迹呼出命令（存 ui_state，保存即生效） ----------
@@ -740,6 +810,76 @@ class SettingsPage(QWidget):
         w = self.window()
         if hasattr(w, "apply_launcher_ball"):
             w.apply_launcher_ball()
+
+    def _open_index_settings(self):
+        """拉起与唤出面板「⚙ 索引」同一个按盘索引对话框（单一真源）。
+        关掉后回本刷一下全局状态行（可能改了盘、重扫了）。"""
+        from gui.dialogs_index_settings import IndexSettingsDialog
+        IndexSettingsDialog(self).exec()
+        self._fs_stat_at = 0
+        self._refresh_filesearch_status()
+
+    # ---------- 悬浮球扇形项 / 双击默认页（与 gui/launcher_fan.py 共用 app_state 数据） ----------
+    def _set_ball_dbl_page(self, _idx=None):
+        """双击悬浮球落点页：写 app_state("launcher_dblclick_page")，与扇形 page 候选同口径。"""
+        app_state.set_value("launcher_dblclick_page",
+                            self.combo_ball_dblpage.currentData())
+
+    def _fan_key(self, item):
+        return "%s:%s" % (item.get("kind"), item.get("ref"))
+
+    def _refresh_fan_items(self):
+        """把 launcher_fan_items 灌进列表（图标 + 短名），顺序就是扇形展开顺序。"""
+        from gui.launcher_fan import load_fan_items
+        self._fan_items = load_fan_items()
+        self.lst_fan_items.clear()
+        for it in self._fan_items:
+            self.lst_fan_items.addItem("%s  %s" % (it.get("icon", "▫"),
+                                                     it.get("label", "")))
+        self.lbl_fan.setText(
+            "当前 %d 项，按顺序在扇形上展开；末尾还有一颗「＋」可以在扇形上就地加项。" %
+            len(self._fan_items))
+
+    def reload_fan_items(self):
+        """供主窗口在扇形上「＋添加 / 右键移除」后回调，让这里的列表跟着变（两边改的是同一份数据）。"""
+        self._refresh_fan_items()
+
+    def _fan_save(self):
+        from gui.launcher_fan import save_fan_items
+        save_fan_items(self._fan_items)
+        self._refresh_fan_items()
+
+    def _fan_add_item(self):
+        """加一项：弹还没在用的候选（工具 / 页面 / 搜索面板），点一个即 append。"""
+        from gui.launcher_fan import fan_candidates
+        used = {self._fan_key(it) for it in self._fan_items}
+        cands = [c for c in fan_candidates() if self._fan_key(c) not in used]
+        m = StyledMenu(self)
+        if not cands:
+            m.addAction("（没有可添加的了）", lambda: None)
+        for c in cands:
+            m.addAction("%s  %s" % (c.get("icon", "▫"), c.get("label", "")),
+                        lambda _c=c: self._fan_append(_c))
+        m.exec(QCursor.pos())
+
+    def _fan_append(self, item):
+        self._fan_items.append(dict(item))
+        self._fan_save()
+
+    def _fan_remove_item(self):
+        i = self.lst_fan_items.currentRow()
+        if 0 <= i < len(self._fan_items):
+            self._fan_items.pop(i)
+            self._fan_save()
+
+    def _fan_move(self, delta):
+        i = self.lst_fan_items.currentRow()
+        j = i + delta
+        if 0 <= i < len(self._fan_items) and 0 <= j < len(self._fan_items):
+            self._fan_items[i], self._fan_items[j] = \
+                self._fan_items[j], self._fan_items[i]
+            self._fan_save()
+            self.lst_fan_items.setCurrentRow(j)
 
     def _fs_rebuild(self):
         """清库重扫：整条链丢给后台线程。首扫实测几十秒（冷盘 45 秒），

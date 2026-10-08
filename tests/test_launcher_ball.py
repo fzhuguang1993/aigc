@@ -32,7 +32,7 @@ def test_click_fires_callback(qapp):
     fired = []
     ball = lb.show_launcher_ball(lambda: fired.append(1))
     assert isinstance(ball, lb.LauncherBall)
-    ball._summon()
+    ball._fire_single()
     assert fired == [1]
 
 
