@@ -64,7 +64,6 @@ Name: "default"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "cli";     Description: "同时安装命令行版（调试用，会开黑窗口）"; Flags: unchecked
 Name: "creator"; Description: "同时安装创作版（内置语音识别模型，包体大得多）"; Flags: unchecked
 
 ; 安装类型：默认 full（四块全勾）；用户取消任一勾即转为 custom
@@ -82,7 +81,6 @@ Name: "tools";     Description: "工具中心：录屏 / 语音识别 / 一键�
 
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\AIGC视频助手-命令行.exe"; DestDir: "{app}"; Flags: ignoreversion skipifdoesntexist; Tasks: cli
 Source: "dist\AIGC视频助手-创作版.exe"; DestDir: "{app}"; Flags: ignoreversion skipifdoesntexist; Tasks: creator
 
 [Icons]
