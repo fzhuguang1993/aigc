@@ -42,8 +42,8 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 ; 装进 Program Files 需要管理员；给"仅当前用户"留一条后路（选它就装到 %LOCALAPPDATA%\Programs）
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
@@ -81,7 +81,7 @@ Name: "tools";     Description: "工具中心：录屏 / 语音识别 / 一键�
 
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\AIGC视频助手-创作版.exe"; DestDir: "{app}"; Flags: ignoreversion skipifdoesntexist; Tasks: creator
+Source: "dist\AIGC视频助手-创作版.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Tasks: creator
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -110,10 +110,10 @@ begin
     Exit;
   end;
   Mods := '';
-  if IsComponentSelected('dashboard') then Mods := Mods + '"dashboard",';
-  if IsComponentSelected('aigc')      then Mods := Mods + '"aigc",';
-  if IsComponentSelected('build')     then Mods := Mods + '"build",';
-  if IsComponentSelected('tools')     then Mods := Mods + '"tools",';
+  if WizardIsComponentSelected('dashboard') then Mods := Mods + '"dashboard",';
+  if WizardIsComponentSelected('aigc')      then Mods := Mods + '"aigc",';
+  if WizardIsComponentSelected('build')     then Mods := Mods + '"build",';
+  if WizardIsComponentSelected('tools')     then Mods := Mods + '"tools",';
   while (Length(Mods) > 0) and (Mods[Length(Mods)] = ',') do
     Delete(Mods, Length(Mods), 1);
   if Mods = '' then
