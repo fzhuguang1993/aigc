@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import sys
 import threading
+import time
 import zipfile
 
 import pytest
@@ -410,6 +411,67 @@ def test_search_docs_pace_and_stop(docs):
     assert fileindex.status()["docs"] == 0
 
 
+def test_targeted_docs_pass_keeps_other_drives(tmp_path, docs, monkeypatch):
+    """按盘符定向抽文档，不许顺手把别的盘的正文索引清掉。
+
+    “针对某个盘做文档扫描”一按就把整库正文删干净，坏就坏在收尾清理把“本次
+    作用域”当成了全库口径：roots 只是子集时，别的盘的行不在 keep 里，旧写法一律
+    判成死链。"""
+    other = tmp_path / "other_drive"
+    _mk(other / "别家.txt", "膝关节 另一个盘里的正文")
+    monkeypatch.setattr(fileindex, "doc_roots", lambda: [str(docs), str(other)])
+    fileindex.index_docs(roots=[str(docs), str(other)], pace=0)   # 先按全盘口径抽一遍
+    assert {g["name"] for g in fileindex.search_docs("关节")} == {"笔记.md", "别家.txt"}
+    fileindex.index_docs(roots=[str(docs)], pace=0)               # 再只扫其中一个盘
+    assert {g["name"] for g in fileindex.search_docs("关节")} == {"笔记.md", "别家.txt"}, \
+        "定向扫描不能删掉范围外那个盘的正文行"
+    os.remove(str(other / "别家.txt"))                            # 真的没了
+    fileindex.index_docs(roots=[str(docs)], pace=0)               # 仍然只扫一个盘
+    assert "别家.txt" in {g["name"] for g in fileindex.search_docs("关节")}, \
+        "范围外的死链也轮不到这一轮清"
+    fileindex.index_docs(roots=[str(docs), str(other)], pace=0)   # 全盘口径才该清
+    assert [g["name"] for g in fileindex.search_docs("关节")] == ["笔记.md"]
+
+
+def test_covers_doc_scope_only_says_full_for_a_real_superset(tmp_path, docs, monkeypatch):
+    """“这次抽的根是否盖住了配置里的文档目录”得真比过：子集不是覆盖。"""
+    monkeypatch.setattr(fileindex, "doc_roots",
+                        lambda: [str(docs), str(tmp_path / "别处")])
+    assert fileindex._covers_doc_scope([str(docs)]) is False
+    assert fileindex._covers_doc_scope([str(tmp_path)]) is True      # 父目录盖住全部
+    monkeypatch.setattr(fileindex, "doc_roots", lambda: [])
+    assert fileindex._covers_doc_scope([]) is True                   # 没配目录没得清
+
+
+def test_last_docs_stamp_only_lies_on_a_finished_pass(docs):
+    """半程退出不能把 last_docs 记成“刚抽完”：启动的快速检查会信这个数，
+    六小时不再抽，那批文档一直是搜不到的状态。"""
+    stop = threading.Event()
+    stop.set()
+    fileindex.index_docs(roots=[str(docs)], stop=stop, pace=0)
+    assert fileindex.last_docs_scan() == 0
+    assert fileindex.docs_due() is True
+    fileindex.index_docs(roots=[str(docs)], pace=0)
+    assert fileindex.last_docs_scan() >= int(time.time()) - 60
+    assert fileindex.docs_due() is False
+    assert fileindex.docs_due(max_age=0) is True
+
+
+def test_due_roots_reads_the_roots_table_only(monkeypatch, tree):
+    """启动快速检查的地基：只读 roots 表那几行，表里没记录的盘算“到期”。"""
+    monkeypatch.setattr(fileindex, "root_status", lambda: [
+        {"root": str(tree), "last_scan": int(time.time()),
+         "files": 1, "dirs": 1, "indexed": True},
+        {"root": "D:\\", "last_scan": 0, "files": 0, "dirs": 0, "indexed": False}])
+    assert fileindex.due_roots(roots=[str(tree)]) == []
+    assert fileindex.due_roots(roots=["D:\\"]) == ["D:\\"]
+    assert fileindex.due_roots(roots=[str(tree), "D:\\"]) == ["D:\\"]
+    assert fileindex.due_roots(max_age=0, roots=[str(tree)]) == [str(tree)]
+    # 门槛拉到 0 谁都到期；拉到一百余年则连“从没扫过”的那个都等不到
+    assert fileindex.due_roots(max_age=10 ** 12, roots=[str(tree), "D:\\"]) == []
+    assert fileindex.due_roots(roots=[]) == []
+
+
 # ---------------- 文件名搜索的排序 ----------------
 
 def test_search_files_orders_prefix_then_contains_then_dir(tmp_path):
@@ -647,6 +709,108 @@ def test_round_does_nothing_once_the_switch_is_off(monkeypatch):
     monkeypatch.setattr(fileindex, "scan_once", lambda **kw: calls.append(1))
     file_watcher._round(threading.Event())
     assert calls == []
+
+
+def test_startup_round_is_a_quick_check(monkeypatch):
+    """启动那一拍只补“真到期”的盘，正文够新就整段跳过（用户点名修的“每次启动
+    都在强制检查索引”：开机那一刻磁盘队列被顶满）。"""
+    seen = {}
+    monkeypatch.setattr(fileindex, "due_roots", lambda **kw: ["D:\\"])
+    monkeypatch.setattr(fileindex, "docs_due", lambda **kw: False)
+    monkeypatch.setattr(fileindex, "scan_once",
+                        lambda **kw: seen.setdefault("scan", kw) or {"files": 1})
+    monkeypatch.setattr(fileindex, "index_docs",
+                        lambda **kw: seen.setdefault("docs", kw) or {})
+    out = file_watcher.run_once(quick=True)
+    assert seen["scan"]["roots"] == ["D:\\"], "快速检查只该扫到期的那个盘"
+    assert "docs" not in seen, "正文没到期就不该再抽一遍"
+    assert out["due"] == 1
+
+
+def test_quick_check_narrows_only_the_filename_pass(monkeypatch):
+    """quick 只收窄文件名那一档：正文照旧按自己的名单走全量。“今天只补了两个盘”
+    不能变成“只抽这两个盘的文档”，否则另几个盘的新文档永远落在索引外。"""
+    seen = {}
+    monkeypatch.setattr(fileindex, "due_roots", lambda **kw: ["D:\\"])
+    monkeypatch.setattr(fileindex, "docs_due", lambda **kw: True)
+    monkeypatch.setattr(fileindex, "scan_once", lambda **kw: {"files": 1})
+    monkeypatch.setattr(fileindex, "index_docs",
+                        lambda **kw: seen.setdefault("docs", kw) or {"indexed": 2})
+    file_watcher.run_once(quick=True, docs=True)
+    assert seen["docs"].get("roots") is None, "正文这一档不能跟着 quick 收窄"
+
+
+def test_quick_check_with_nothing_due_never_walks_the_disk(monkeypatch):
+    """一个盘都没到期、正文也没到期：这一拍连目录都不用走。"""
+    calls = []
+    monkeypatch.setattr(fileindex, "due_roots", lambda **kw: [])
+    monkeypatch.setattr(fileindex, "docs_due", lambda **kw: False)
+    monkeypatch.setattr(fileindex, "scan_once", lambda **kw: calls.append("scan"))
+    monkeypatch.setattr(fileindex, "index_docs", lambda **kw: calls.append("docs"))
+    out = file_watcher.run_once(quick=True)
+    assert calls == [] and out["due"] == 0
+
+
+def test_targeted_docs_request_actually_extracts(monkeypatch):
+    """“索引此盘文档”必须真走到 index_docs(roots=点名的盘)：旧写法定向那一档
+    永远跳过正文，点了就是没反应（按盘文档扫描坏掉的第一半）。"""
+    seen = {}
+    monkeypatch.setattr(fileindex, "enabled", lambda: True)
+    monkeypatch.setattr(fileindex, "doc_enabled", lambda: True)
+    monkeypatch.setattr(fileindex, "index_docs",
+                        lambda **kw: seen.setdefault("docs", kw) or {"indexed": 1})
+    monkeypatch.setattr(fileindex, "scan_once", lambda **kw: seen.setdefault("scan", kw))
+    file_watcher._round(threading.Event(), roots=["D:\\"], kind="docs")
+    assert seen["docs"]["roots"] == ["D:\\"], "定向文档请求只抽点名的那个盘"
+    assert "scan" not in seen, "只抽正文不该顺带走一遍目录"
+
+
+def test_targeted_scan_request_does_not_touch_docs(monkeypatch):
+    """反过来也一样：按「立即重扫此盘」不该顺手把整盘文档抽一遍。"""
+    seen = {}
+    monkeypatch.setattr(fileindex, "enabled", lambda: True)
+    monkeypatch.setattr(fileindex, "doc_enabled", lambda: True)
+    monkeypatch.setattr(fileindex, "scan_once",
+                        lambda **kw: seen.setdefault("scan", kw) or {})
+    monkeypatch.setattr(fileindex, "index_docs",
+                        lambda **kw: seen.setdefault("docs", kw) or {})
+    file_watcher._round(threading.Event(), roots=["D:\\"], kind="scan")
+    assert seen["scan"]["roots"] == ["D:\\"]
+    assert "docs" not in seen
+
+
+def test_reindex_docs_falls_back_to_the_doc_roots(monkeypatch):
+    """空手点「索引文档」= 按配置里的文档目录全集跑；总开关关了则一口都不接。"""
+    monkeypatch.setattr(file_watcher, "_PENDING", [])
+    monkeypatch.setattr(fileindex, "doc_roots", lambda: ["D:\\文档", "E:\\文档"])
+    monkeypatch.setattr(fileindex, "enabled", lambda: True)
+    monkeypatch.setattr(file_watcher, "running", lambda: True)
+    monkeypatch.setattr(file_watcher, "kick", lambda: True)
+    assert file_watcher.reindex_docs() is True
+    assert file_watcher._PENDING == [("docs", ("D:\\文档", "E:\\文档"))]
+    file_watcher._PENDING.clear()
+    monkeypatch.setattr(fileindex, "enabled", lambda: False)
+    assert file_watcher.reindex_docs(["D:\\"]) is False
+    assert file_watcher._PENDING == []
+    monkeypatch.setattr(fileindex, "enabled", lambda: True)
+    assert file_watcher.reindex_roots([]) is False    # 文件名定向没盘符就是非法调用
+    assert file_watcher._PENDING == []
+
+
+def test_dispatch_puts_unfinished_requests_back(monkeypatch):
+    """正忙时定向请求要能回到队列，不能用户点一下就被吞了。"""
+    monkeypatch.setattr(file_watcher, "_PENDING", [])
+    monkeypatch.setattr(file_watcher, "_round",
+                        lambda stop, roots=None, kind="all": False)
+    req = [("docs", ("D:\\",)), ("scan", ("E:\\",))]
+    assert file_watcher._dispatch(req, threading.Event()) is False
+    assert file_watcher._PENDING == req
+
+
+def test_first_round_quick_is_on_by_default():
+    """开机第一拍走快速检查是产品决定（用户点名）：改回 False 就是又回到
+    “每次启动都强制检查索引”。"""
+    assert file_watcher.FIRST_ROUND_QUICK is True
 
 
 # ---------------- 连接是线程本地的 ----------------

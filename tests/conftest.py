@@ -41,6 +41,11 @@ def _clean_state():
         db.execute("DELETE FROM runs")
         db.execute("DELETE FROM file_marks")
         db.execute("DELETE FROM material_clips")
+        # 成品库口播标记/逐字稿/视频类别（按路径存）：material_clips 的新列随行 DELETE 自然清空，
+        # 这三张扫盘元数据表要单独清，否则用例间互相泄漏。
+        db.execute("DELETE FROM output_transcripts")
+        db.execute("DELETE FROM output_voiceover")
+        db.execute("DELETE FROM output_categories")
         # 组织表与会话也归零：org 用例哪怕中途崩，也不能把成员泄给后续用例
         # （残留成员会让 org_enabled() 变 True，改变所有被过滤查询的口径）
         db.execute("DELETE FROM org_members")

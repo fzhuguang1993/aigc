@@ -118,3 +118,65 @@ def raise_to_front(widget, user32=None, kernel32=None):
         return bool(_foreground(u, k, hwnd))
     except Exception:
         return False
+
+
+# ====================================================================
+# 快贴面板用：把焦点交回“刚才那个窗口”，再模拟一次 Ctrl+V
+# ====================================================================
+#: 虚拟键码与 keybd_event 标志（只这里用，就近定义免得满屏常量）
+_VK_CONTROL = 0x11
+_VK_V = 0x56
+_KEYEVENTF_KEYUP = 0x0002
+
+
+def get_foreground_hwnd():
+    """当前前台窗口的原生句柄（整数）；拿不到给 0。
+
+    快贴面板在弹出前抓这一句，选中条目后把焦点还回这个窗——用户才能像
+    Win+V 那样“一键贴回刚才正在写的地方”。非 Windows / 异常一律 0，不抛。"""
+    if not is_supported():
+        return 0
+    try:
+        u = ctypes.windll.user32
+        _pin_signatures(u)
+        return int(u.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def focus_hwnd(hwnd):
+    """把某个原生句柄顶回前台。与 raise_to_front 同一套 AttachThreadInput 纪律：
+    本线程临时挂到目标线程输入队列上，SetForegroundWindow 才被认作“用户刚在那儿操过盘”。
+
+    与 raise_to_front 的区分：它吃 Qt widget，这里吃裸句柄（目标根本是我们的窗口时
+    widget 不存在）。同样不抛：顶不回前台只是贴不上，不能把快贴流程炸掉。"""
+    if not hwnd or not is_supported():
+        return False
+    try:
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        _pin_signatures(u)
+        return bool(_foreground(u, k, int(hwnd)))
+    except Exception:
+        return False
+
+
+def send_paste():
+    """模拟一次 Ctrl+V（keybd_event）：焦点已在目标窗口后才能调。
+
+    非 Windows 直接 False（无 Win32 键盘注入）；任何异常吞掉返回 False。
+    不声明 argtypes 也能跑（都是小整型与 0），但为 64 位下 ULONG_PTR 参数安全还是钉一下。"""
+    if not is_supported():
+        return False
+    try:
+        u = ctypes.windll.user32
+        u.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte,
+                                  _wintypes.DWORD, ctypes.c_void_p]
+        u.keybd_event.restype = None
+        u.keybd_event(_VK_CONTROL, 0, 0, None)
+        u.keybd_event(_VK_V, 0, 0, None)
+        u.keybd_event(_VK_V, 0, _KEYEVENTF_KEYUP, None)
+        u.keybd_event(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, None)
+        return True
+    except Exception:
+        return False

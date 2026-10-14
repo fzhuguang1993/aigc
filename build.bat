@@ -3,11 +3,13 @@ REM ============================================================
 REM build.bat —— Windows 一键打包脚本（在 Windows 上运行）
 REM 优先使用项目虚拟环境 .venv（和日常开发同一套依赖），
 REM 没有 .venv 时自动回退全局 python。
-REM 产物：
-REM   dist\AIGC视频助手.exe            桌面 GUI 正式版（对外分发，无黑窗口，不含 whisper，抹接口配置）
-REM   dist\AIGC视频助手-创作版.exe     桌面 GUI 创作版（内置 faster-whisper，维护人自用，保留全部接口配置）
-REM 两个 exe 共用同一个 data\aigc.db，在哪边跑都一样。
-REM 创作版需要打机 .venv 里装了 faster-whisper；没装则自动跳过（见下方 :skip_creator）。
+REM Outputs:
+REM   dist\AIGC视频助手.exe            formal GUI exe (for distribution, no console,
+REM                                    no whisper, API config stripped)
+REM   dist\AIGC视频助手-创作版.exe     creator GUI exe (built-in faster-whisper, maintainer
+REM                                    only, keeps ALL API config)
+REM Both exes share the same data\aigc.db, no matter which one runs first.
+REM Creator build needs faster-whisper in .venv; missing dep = auto skip (:skip_creator).
 REM ============================================================
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -36,11 +38,14 @@ if not defined FFMPEG_DATA (
     echo [WARN] on the user's PATH. Drop ffmpeg.exe into assets\ and rebuild.
 )
 
-REM 精简版剪掉 whisper 及其编译型大件，守 onefile <300MB；字幕/拆解在精简版里走降级提示。
-REM 标准版对外分发：连 core.config_local 一并抹除（收费接口地址/key 不随包外泄），
-REM 装好即全新未配置态，首跑走引导自填地址。创作版仍内置全部接口配置，方便维护人自用。
-REM pypdf 必须显式列：唤出面板搜本地文档正文时 core/fileindex 是在函数体里懒导入它的，
-REM PyInstaller 静态分析扫不到，漏了不会报错——就是“开发机能搜 PDF、打包后静默搜不到”。
+REM Lite build cuts whisper + its heavy compiled deps to keep onefile < 300MB;
+REM subtitle/breakdown show a graceful degrade hint there.
+REM Formal build for distribution: strip core.config_local too (paid API
+REM addresses/keys must never ship inside the installer); first run opens the
+REM setup dialog. Creator build keeps ALL API config (maintainer only).
+REM pypdf MUST be listed explicitly: core/fileindex lazy-imports it inside a
+REM function body, PyInstaller static analysis misses it - otherwise local doc
+REM search works in dev but silently finds no PDF in the packaged exe.
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --name "AIGC视频助手" ^
     --icon=assets\app.ico --add-data "assets\app.ico;assets" ^
     --hidden-import=openpyxl --hidden-import=pypdf ^
@@ -53,8 +58,9 @@ REM PyInstaller 静态分析扫不到，漏了不会报错——就是“开发�
     --exclude-module=core.config_local ^
     %FFMPEG_DATA% desktop.py || goto :error
 
-REM ---------- 创作版（内置 faster-whisper） ----------
-REM 不排除 whisper 大件；依赖打机 .venv 已装 faster-whisper（装模型/转写都靠它）。
+REM ---------- Creator build (bundled faster-whisper) ----------
+REM No whisper exclusion here; needs faster-whisper in the build .venv
+REM (model download + transcription both rely on it).
 %PY% -c "import faster_whisper" 2>nul
 if errorlevel 1 (
     echo [WARN] faster-whisper NOT installed - skipping the Creator build.
@@ -72,7 +78,8 @@ if errorlevel 1 (
     %FFMPEG_DATA% desktop.py || goto :error
 :skip_creator
 
-REM 两个产物都靠上面两条 PyInstaller 完成；命令行版已按维护人要求不再构建。
+REM Both outputs come from the two PyInstaller calls above; the CLI build was
+REM dropped by maintainer request.
 
 echo.
 echo ============================================================

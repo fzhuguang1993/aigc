@@ -57,6 +57,25 @@ def test_hide_is_idempotent(qapp):
     assert lb._ball_ref is None
 
 
+def test_right_click_close_hands_the_cleanup_to_the_caller(qapp, monkeypatch):
+    """关球必须把“收起已展开的扇形”这一步交回调用方：只 hide 球自己就是用户说的
+    “关了悬浮球，展开的内容居然还没关闭”（扇形是另一个顶层窗，不归球管）。
+    没传回调时退回“只收球”的老行为，不能抛。"""
+    closed = []
+    ball = lb.show_launcher_ball(lambda: None, on_close=lambda: closed.append(1))
+    ball._hide_requested()
+    assert closed == [1]
+    assert lb._ball_ref is ball          # 收干净归回调管，球自己不动单例
+    ball.stop()
+
+    plain = lb.show_launcher_ball(lambda: None)
+    hide = []
+    monkeypatch.setattr(lb, "hide_launcher_ball", lambda: hide.append(1))
+    plain._hide_requested()
+    assert hide == [1] and app_state.get("launcher_ball_on") is False
+    plain.stop()
+
+
 def test_show_stops_timers_on_hide(qapp):
     ball = lb.show_launcher_ball(lambda: None)
     assert ball._sample_timer.isActive() and ball._anim_timer.isActive()

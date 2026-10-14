@@ -361,105 +361,124 @@ class _RuleRow(QWidget):
 
 
 class RenamePanel(BasePanel):
+    """批量改名：复用成品库「批量重命名」拖拽拼名弹窗（同款 UI + 🔎预读规则），
+    对本地任意文件按拼名方案重命名。文件行带上由 mtime 生成的 created_at，
+    于是「日期/时刻」字段对任意文件也有效（不只是编号+原名）。"""
+
+    # 通用文件有意义的拼名字段（编号/原名/月日/时刻）；沿用成品库同款交互，字段池只留能对任意文件取值的项
+    _FIELDS = ("seq", "stem", "date", "time")
+
     def _build(self, outer):
         outer.addWidget(page_header("批量改名",
-                                    "按规则拼接新文件名：编号 + 文本 + 原文件名，先预览再执行",
+                                    "复用成品库同款拖拽拼名规则给本地文件批量改名：先预览再执行",
                                     icon="🏷"))
         self.files = FileListWidget("文件列表（按上下顺序套用编号）", video_only=False)
         outer.addWidget(self.files)
 
-        box = QGroupBox("命名规则（从上到下拼接）")
-        vbox = QVBoxLayout(box)
-        self.rule_rows = QWidget()
-        rl = QVBoxLayout(self.rule_rows)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(4)
-        vbox.addWidget(self.rule_rows)
-        br = QHBoxLayout()
-        b_add = QPushButton("＋ 添加规则")
-        b_add.setObjectName("GhostBtn")
-        b_add.clicked.connect(self._add_rule)
-        b_del = QPushButton("－ 删除末条")
-        b_del.setObjectName("GhostBtn")
-        b_del.clicked.connect(self._del_rule)
-        br.addWidget(b_add)
-        br.addWidget(b_del)
-        br.addStretch(1)
-        vbox.addLayout(br)
-        outer.addWidget(box)
-        self._add_rule()
-        self._add_rule()
-
         row = QHBoxLayout()
-        self.b_preview = QPushButton("👁 预览")
-        self.b_preview.setObjectName("GhostBtn")
-        self.b_preview.clicked.connect(self._preview)
-        row.addWidget(self.b_preview)
-        row.addStretch(1)
+        b_edit = QPushButton("🏷 拼新名称…（拖拽·可预读）")
+        b_edit.setObjectName("PrimaryBtn")
+        b_edit.clicked.connect(self._compose)
+        row.addWidget(b_edit)
+        self.lbl_plan = QLabel("尚未生成新名方案")
+        self.lbl_plan.setObjectName("PageTip")
+        row.addWidget(self.lbl_plan, 1)
         outer.addLayout(row)
 
         # 延迟导入：gui.kit → gui.widgets → gui.tool_panels 存在环，模块顶导入会触环
         from gui.kit import KitTable
         self.table = KitTable(0, 2, ["原文件名", "新文件名"], checkbox=False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.setFixedHeight(150)
+        self.table.setFixedHeight(180)
         outer.addWidget(self.table)
 
-        self.make_log_box(outer, 70)
+        self._plan = []          # [(row, new_stem)]——BatchRenameDialog 确认后回吏
+        self.make_log_box(outer, 90)
         self.make_run_row(outer, "▶ 执行改名")
 
-    def _add_rule(self):
-        rl = self.rule_rows.layout()
-        rl.addWidget(_RuleRow())
+    def _rows(self):
+        """把文件清单转成拼名弹窗需要的行：带 name/path + 由 mtime 造的 created_at。"""
+        from datetime import datetime
+        out = []
+        for p in self.files.paths():
+            src = Path(p)
+            try:
+                mt = datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except OSError:
+                mt = ""
+            out.append({"path": p, "name": src.name, "created_at": mt})
+        return out
 
-    def _del_rule(self):
-        rl = self.rule_rows.layout()
-        if rl.count() > 1:
-            w = rl.takeAt(rl.count() - 1).widget()
-            if w:
-                w.deleteLater()
-
-    def _pattern(self):
-        return [r.to_rule() for r in self.rule_rows.findChildren(_RuleRow)]
-
-    def _engine(self):
-        from video_text_tools.renamer import RenameEngine
-        return RenameEngine(self.files.paths(), self._pattern())
-
-    def _preview(self):
-        paths = self.files.paths()
-        if not paths:
+    def _compose(self):
+        rows = self._rows()
+        if not rows:
             QMessageBox.information(self, "提示", "请先添加文件")
             return
-        self._pending = self._engine().preview()
-        self._fill_table(self._pending)
+        from PySide6.QtWidgets import QDialog
+        from gui.dialogs_rename import BatchRenameDialog
+        dlg = BatchRenameDialog(self, rows, fields=self._FIELDS,
+                                title="批量改名（成品库同款·拖拽拼名）",
+                                ok_text="✓ 生成新名预览")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._plan = list(dlg.plan)
+        self._fill_table(self._plan)
+        self.lbl_plan.setText(f"已生成 {len(self._plan)} 条新名，核对无误后点「执行改名」")
 
-    def _fill_table(self, items):
-        self.table.setRowCount(len(items))
-        for i, it in enumerate(items):
-            self.table.setItem(i, 0, QTableWidgetItem(it["old_name"]))
-            self.table.setItem(i, 1, QTableWidgetItem(it["new_name"]))
+    def _fill_table(self, plan):
+        self.table.setRowCount(len(plan))
+        for i, (row, stem) in enumerate(plan):
+            src = Path(row["path"])
+            new_name = (stem or src.stem) + src.suffix
+            self.table.setItem(i, 0, QTableWidgetItem(src.name))
+            self.table.setItem(i, 1, QTableWidgetItem(new_name))
 
     def _task(self):
-        paths = self.files.paths()
-        if not paths:
-            QMessageBox.information(self, "提示", "请先添加文件")
+        if not self._plan:
+            QMessageBox.information(self, "提示", "先点「拼新名称」生成方案")
             return None
+        plan = list(self._plan)
         if QMessageBox.question(self, "确认改名",
-                                f"即将对 {len(paths)} 个文件重命名，无法撤销，确认执行？"
+                                f"即将对 {len(plan)} 个文件重命名，无法撤销，确认执行？"
                           ) != QMessageBox.StandardButton.Yes:
             return None
-        engine = self._engine()
 
         def fn(log, progress, should_stop):
-            res = engine.execute(progress_callback=progress)
-            log(f"改名完成：成功 {res['renamed']}，失败 {res['failed']}")
-            return res
+            total = len(plan)
+            ok = skip = fail = 0
+            for i, (row, stem) in enumerate(plan):
+                if should_stop():
+                    break
+                src = Path(row["path"])
+                progress(i, total, src.name)
+                if not src.exists():
+                    log(f"  ⚠ 跳过（不存在）：{src.name}")
+                    skip += 1
+                    continue
+                dst = src.with_name((stem or src.stem) + src.suffix)
+                if str(dst) == str(src):
+                    skip += 1
+                    continue
+                if dst.exists():
+                    log(f"  ⚠ 跳过（目标重名）：{dst.name}")
+                    skip += 1
+                    continue
+                try:
+                    src.rename(dst)
+                    log(f"  ✅ {src.name} → {dst.name}")
+                    ok += 1
+                except OSError as e:
+                    log(f"  ❌ 失败 {src.name}：{e}")
+                    fail += 1
+            progress(total, total, "完成")
+            return {"ok": ok, "skip": skip, "fail": fail}
         return fn
 
     def on_result(self, res):
-        if isinstance(res, dict) and res.get("results"):
-            self._fill_table(res["results"])
+        if isinstance(res, dict):
+            self._append_log(f"改名完成：成功 {res.get('ok', 0)} · 跳过 {res.get('skip', 0)} · 失败 {res.get('fail', 0)}")
+            self._plan = []
+            self.lbl_plan.setText("尚未生成新名方案")
 
 
 # ====================================================================
@@ -1201,6 +1220,25 @@ class MaterialPanel(BasePanel):
                     fails += 1
                     log(f"  ✗ 失败：{e}")
                 progress(i + 1, len(urls), "")
+            # 勾选了视频：把落盘的原片注册进素材库索引（素材库走库索引，需建行才在页上可见）。
+            # block_type="原片"、product=""；按归一化 path 去重，重跑/重复提取不堆脏行。
+            if want[0] and saved:
+                try:
+                    from store import material_store
+                    from store.output_store import VID_EXT
+                except Exception:
+                    material_store = None
+                if material_store is not None:
+                    for p in saved:
+                        try:
+                            if Path(str(p)).suffix.lower() not in VID_EXT:
+                                continue
+                            if material_store.find_by_path(p) is not None:
+                                continue
+                            material_store.add(str(p), block_type="原片", product="",
+                                               log=log)
+                        except Exception as e:
+                            log(f"  ⚠ 原片入素材库索引失败：{e}")
             return {"saved": saved, "fails": fails, "total": len(urls),
                     "corpus": str(corpus) if want[1] else ""}
         return fn
@@ -1264,6 +1302,30 @@ def _build_publish_panel(parent=None):
     return PublishPanel(parent)
 
 
+def _build_screenshot_panel(parent=None):
+    """截图面板在 screenshot.py 里；延迟导入断循环（screenshot 从 dialogs_recorder
+    拿遮罩底座，而 dialogs_recorder 又依赖本模块的 BasePanel）"""
+    from gui.screenshot import ScreenshotPanel
+    return ScreenshotPanel(parent)
+
+
+def _build_clipboard_panel(parent=None):
+    """剪贴板历史面板在 clipboard_hist.py 里；同样延迟导入断循环
+    （clipboard_hist 与 screenshot 互引：面板“双击图片”走 PinWindow）"""
+    from gui.clipboard_hist import ClipboardPanel
+    return ClipboardPanel(parent)
+
+
+def _build_uninstaller_panel(parent=None):
+    """软件卸载清理面板在 dialogs_uninstaller 里；同样延迟导入断循环。
+    非 Windows 直接给占位提示，不拖进 winreg/ctypes 那套平台专属代码。"""
+    from video_text_tools import software_manager as sm
+    if not sm.supported():
+        return _dep_missing_panel("「软件卸载清理」只在 Windows 上可用。")
+    from gui.dialogs_uninstaller import UninstallerPanel
+    return UninstallerPanel(parent)
+
+
 PANEL_FACTORIES = {
     "视频水印": _safe_factory(WatermarkPanel),
     "批量改名": _safe_factory(RenamePanel),
@@ -1276,4 +1338,7 @@ PANEL_FACTORIES = {
     "语音识别": _safe_factory(_build_asr_panel),
     "爆款拆解": _safe_factory(_build_breakdown_panel),
     "一键发布": _safe_factory(_build_publish_panel),
+    "截图": _safe_factory(_build_screenshot_panel),
+    "剪贴板历史": _safe_factory(_build_clipboard_panel),
+    "软件卸载清理": _safe_factory(_build_uninstaller_panel),
 }

@@ -228,9 +228,14 @@ class ToolDialog(QDialog):
         apply_rounded(self, title=f"🧰 {name}")
 
 
+#: 「文件搜索」卡的 factory 哨兵：ToolCard 只拿它当“可用”标记看（见 ToolsPage 里的注释），
+#: 真正要点开什么由 ToolsPage.open_tool 按名字路由到唤出面板，所以不需要真面板构造函数。
+_SEARCH_CARD = True
+
+
 class ToolsPage(QWidget):
-    #: 特殊卡片名：“本地文件搜索”不在 TOOLS 登记表，点击走唤出面板的搜索（不新建面板）
-    SEARCH_TOOL = "本地文件搜索"
+    #: 特殊卡片名：“文件搜索”不在 TOOLS 登记表，点击走唤出面板的搜索（不新建面板）
+    SEARCH_TOOL = "文件搜索"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -255,13 +260,13 @@ class ToolsPage(QWidget):
             card = ToolCard(name, icon, desc, factory, self._open)
             card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             self._cards.append(card)
-        # “本地文件搜索”卡：复用主窗唤出面板的搜索能力（不新建面板），归工具中心随其显隐
+        # “文件搜索”卡：复用主窗唤出面板的搜索能力（不新建面板），归工具中心随其显隐。
+        # factory 递哨兵真值而不是 None：ToolCard 只拿它判“这张卡能不能用”（底部状态行、
+        # 悬停描边、右键菜单都看它），从不 call。以前递 None 再在外部补 factory=True，
+        # 状态行却已在 __init__ 里按 None 定成了“🚧 规划中”——卡片能点开却写着规划中。
         search_card = ToolCard(self.SEARCH_TOOL, "🔍",
-                               "全盘搜索本地文件：即输即搜，回车打开或定位", None,
-                               self._open)
-        search_card.factory = True            # 让它可点（open_tool 里按名路由到搜索）
-        search_card.setProperty("canopen", "1")
-        search_card.setCursor(Qt.CursorShape.PointingHandCursor)
+                               "全盘搜索本地文件：即输即搜，回车打开或定位",
+                               _SEARCH_CARD, self._open)
         search_card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._cards.insert(0, search_card)
         area.setWidget(holder)
@@ -301,7 +306,7 @@ class ToolsPage(QWidget):
         from core import modules
         if not modules.page_visible(4):     # 工具中心关掉：任何路径都不弹工具（防热键绕过）
             return
-        if name == self.SEARCH_TOOL:        # 本地文件搜索：直接弹唤出面板，不开工具窗
+        if name == self.SEARCH_TOOL:        # 文件搜索：直接弹唤出面板，不开工具窗
             fn = getattr(self.window(), "_summon_launcher", None)
             if callable(fn):
                 fn()

@@ -22,7 +22,7 @@ QImage 的解码/构造是允许的（QPixmap 才是 GUI 线程专属），所�
 import os
 import threading
 
-from PySide6.QtCore import Qt, QThread, QObject, QSize, Signal
+from PySide6.QtCore import Qt, QEvent, QThread, QObject, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene, QGraphicsView,
                                QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
@@ -34,7 +34,7 @@ _SYNC_PREVIEW = False
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv", ".wmv", ".mpg"}
-DOC_EXTS = {".docx", ".xlsx", ".pptx", ".pdf"}
+DOC_EXTS = {".docx", ".xlsx", ".xls", ".pptx", ".pdf"}
 HTML_EXTS = {".html", ".htm"}
 TEXT_EXTS = {
     ".txt", ".md", ".log", ".rst", ".json", ".xml", ".csv", ".tsv",
@@ -46,6 +46,8 @@ TEXT_EXTS = {
 MONO_EXTS = TEXT_EXTS - {".txt", ".md", ".log", ".csv", ".tsv"}
 #: 文本预览截断：再大也只读这么多字符（预览"大致内容"，不是全文查看器）
 _TEXT_CAP = 256 * 1024
+#: 预览专用正文大小上限（远大于索引层的 20MB）：见 read_doc_text 说明。
+_PREVIEW_DOC_MAX = 200 * 1024 * 1024
 #: PDF 首页渲染上限（长边像素）：预览给清晰一点，网格缩略图够看清即可。
 #: 超上限就等比缩，既看得清又不至于把一本大开本手册撑成几十 MB 位图。
 _PDF_PREVIEW_MAX = 1600
@@ -58,6 +60,12 @@ _MODE_LABELS = {
     "html": (("render", "渲染"), ("source", "源码")),
 }
 _MODE_DEFAULT = {"md": "render", "html": "render"}
+#: 渲染页样式：MD/HTML 用深色，docx 富文本用白底黑字（更像 Word）
+_RENDER_DARK_QSS = ("QTextBrowser { background:rgba(255,255,255,0.04); border:none;"
+                    " border-radius:8px; color:#E8EAED; }")
+#: Word/Excel 富文本：白底黑字 + 左右留白（不撑到边就不像“放大过头”），字号略小于默认
+_RENDER_DOC_QSS = ("QTextBrowser { background:#FFFFFF; border:none;"
+                   " border-radius:8px; color:#1F2329; padding:14px 32px; font-size:12px; }")
 
 
 def _ext(path):
@@ -119,10 +127,15 @@ def read_text(path, cap=_TEXT_CAP):
 
 
 def read_doc_text(path):
-    """Office/PDF 正文：走索引层现成抽取器（懒导入，抽不到返回 ""）。"""
+    """Office 正文：走索引层现成抽取器（懒导入，抽不到返回 ""）。
+
+    这里显式放宽大小上限（_PREVIEW_DOC_MAX）：索引层的 20MB 是给"几万个文件批量抽"
+    兜底用的，而预览是用户点名看这一个文件。docx/pptx 的正文在 zip 里的 document.xml，
+    体积几乎不随内嵌图片增长——一个几十 MB 的图文 docx，正文可能才几十 KB，卡在整包
+    大小上判"太大无法预览"纯属误伤（图文 docx 与较大的 xlsx 都是栽在这）。"""
     try:
         from core import fileindex
-        return fileindex.extract_text(path) or ""
+        return fileindex.extract_text(path, max_bytes=_PREVIEW_DOC_MAX) or ""
     except Exception:
         return ""
 
@@ -174,26 +187,52 @@ def render_doc_thumb(text, w=220, h=280):
     return img
 
 
-def _pdf_first_page_image(path, max_px=_PDF_PREVIEW_MAX):
-    """用 PyMuPDF（fitz）把 PDF 首页渲染成 QImage。没装/读不出给 null。
-
-    为什么需要它：扫描/纯图片的 PDF 走 pypdf 抽文字是空的，预览只能显示
-    “无可读正文”——那是能力缺失不是 bug。只有把页渲染成位图才看得见内容。
-    fitz 是重依赖，没装就优雅降级回文字抽取（跟爆款拆解可选依赖一个套路）。
-    延迟导入：面板常驻也不背 PyMuPDF 的成本。"""
+def _fitz():
+    """拿 PyMuPDF 模块（新版正规名 pymupdf，旧版只有 fitz）；没装返回 None。
+    fitz 是重依赖，没装就优雅降级回文字抽取（跟爆款拆解可选依赖一个套路）。"""
     try:
-        import pymupdf as fitz                    # PyMuPDF 新版正规名
+        import pymupdf
+        return pymupdf
     except Exception:
         try:
-            import fitz                           # 旧版只有 fitz 这个名字
+            import fitz
+            return fitz
         except Exception:
-            return QImage()
+            return None
+
+
+def _pdf_page_count(path):
+    """PDF 总页数（渲染器不可用/读不出返回 0）。"""
+    fitz = _fitz()
+    if fitz is None:
+        return 0
     try:
         doc = fitz.open(str(path))
         try:
-            if doc.page_count <= 0:
+            return int(doc.page_count)
+        finally:
+            doc.close()
+    except Exception:
+        return 0
+
+
+def _pdf_page_image(path, idx=0, max_px=_PDF_PREVIEW_MAX):
+    """用 PyMuPDF（fitz）把 PDF 第 idx 页渲染成 QImage。没装/读不出给 null。
+
+    为什么需要它：扫描/纯图片的 PDF 走 pypdf 抽文字是空的，预览只能显示
+    “无可读正文”——那是能力缺失不是 bug。只有把页渲染成位图才看得见内容。
+    逐页只渲染当前一页（不是整本铺开），几百页手册点开也只算一页，翻页才现算。"""
+    fitz = _fitz()
+    if fitz is None:
+        return QImage()
+    try:
+        doc = fitz.open(str(path))
+        try:
+            n = doc.page_count
+            if n <= 0:
                 return QImage()
-            page = doc[0]
+            idx = max(0, min(int(idx), n - 1))
+            page = doc[idx]
             rect = page.rect
             base = max(float(rect.width or 1), float(rect.height or 1))
             zoom = max(min(max_px / base, 4.0) if base else 1.0, 0.1)
@@ -206,13 +245,196 @@ def _pdf_first_page_image(path, max_px=_PDF_PREVIEW_MAX):
         return QImage()
 
 
+def _pdf_first_page_image(path, max_px=_PDF_PREVIEW_MAX):
+    """首页渲染（网格缩略图用）。"""
+    return _pdf_page_image(path, 0, max_px)
+
+
+def _docx_html(path):
+    """docx → (html, 图片临时目录)：用 mammoth 转语义 HTML（标题/段落/加粗/列表/
+    表格保留），内嵌图片落到临时目录，上层 QTextBrowser 靠 searchPaths 解析相对
+    <img src>。无库/异常返回 None，调用方回退纯文本抽取。
+
+    后台线程调用：只读 zip / 写临时文件 / 算哈希，不碰 QPainter。"""
+    try:
+        import mammoth
+    except Exception:
+        return None
+    import tempfile
+    import hashlib
+    out_dir = tempfile.mkdtemp(prefix="ql_docx_")
+
+    def _store(image):
+        try:
+            with image.open() as f:
+                data = f.read()
+            if not data:
+                return {}
+            ct = (getattr(image, "content_type", "") or "").split("/", 1)
+            ext = "." + ct[1].split("+", 1)[0].split(";", 1)[0] if len(ct) > 1 else ".png"
+            fn = hashlib.md5(data).hexdigest()[:16] + ext
+            with open(os.path.join(out_dir, fn), "wb") as w:
+                w.write(data)
+            return {"src": fn}
+        except Exception:
+            return {}
+
+    try:
+        with open(str(path), "rb") as f:
+            result = mammoth.convert_to_html(
+                f, convert_image=mammoth.images.img_element(_store))
+        html = result.value or ""
+        return (html, out_dir) if html.strip() else None
+    except Exception:
+        return None
+
+
+def _xls_text(path):
+    """老式二进制 .xls（Excel 97-2003）抽正文：openpyxl 只读 .xlsx，.xls 得靠 xlrd。
+
+    xlrd 2.0 反而只支持 .xls（-drop 了 xlsx），正好对上。逐 sheet 拼“表名 + 行（制表符分隔），
+    整数去掉多余的 .0”。每个 sheet 只取前几行、总字符截断（预览看大概，不是全量）。"""
+    try:
+        import xlrd
+    except Exception:
+        return ""
+    try:
+        book = xlrd.open_workbook(str(path))
+    except Exception:
+        return ""
+    out = []
+    total = 0
+    for sh in book.sheets():
+        out.append("【%s】" % sh.name)
+        total += len(out[-1])
+        for r in range(min(sh.nrows, 500)):
+            vals = []
+            for c in range(sh.ncols):
+                try:
+                    v = sh.cell_value(r, c)
+                except Exception:
+                    v = ""
+                if isinstance(v, float) and v.is_integer():
+                    v = int(v)
+                vals.append(str(v))
+            line = "\t".join(vals).rstrip()
+            if line:
+                out.append(line)
+                total += len(line)
+                if total > _TEXT_CAP:
+                    break
+        if total > _TEXT_CAP:
+            break
+    return "\n".join(out)
+
+
+def _html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+#: 表格预览只取前几张表 / 每表前若干行列：兼顾速度与内存（大表读全量会卡）
+_SHEET_MAX_SHEETS = 3
+_SHEET_MAX_ROWS = 200
+_SHEET_MAX_COLS = 26
+
+
+def _rows_to_html(title, rows):
+    """行列表 → 一段带网格的 HTML 表（首行作表头）。border+border-collapse
+    是 Qt 富文本引擎认得的写法，能画出格线；无有效列返回 ""。"""
+    body = []
+    ncol = 0
+    for i, row in enumerate(rows):
+        vals = ["" if v is None else str(v) for v in row]
+        ncol = max(ncol, len(vals))
+        tag = "th" if i == 0 else "td"
+        tds = "".join("<%s>%s</%s>" % (tag, _html_escape(v), tag) for v in vals)
+        body.append("<tr>%s</tr>" % tds)
+    if not ncol:
+        return ""
+    return ("<h3>%s</h3><table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" "
+            "style=\"border-collapse:collapse\">%s</table>"
+            % (_html_escape(title), "".join(body)))
+
+
+def _sheet_html_xlsx(path):
+    """.xlsx 流式读取（read_only）——比旧的全量抽取快很多，只取前几张表/若平行列。"""
+    from openpyxl import load_workbook
+    wb = load_workbook(str(path), read_only=True, data_only=True)
+    out = []
+    try:
+        for ws in wb.worksheets[:_SHEET_MAX_SHEETS]:
+            rows = []
+            for r, row in enumerate(ws.iter_rows(values_only=True)):
+                rows.append(list(row[:_SHEET_MAX_COLS]))
+                if r >= _SHEET_MAX_ROWS:
+                    break
+            if not rows:
+                out.append("<h3>%s</h3><p>（空表）</p>" % _html_escape(ws.title))
+                continue
+            out.append(_rows_to_html(ws.title, rows))
+    finally:
+        wb.close()
+    return "".join(out)
+
+
+def _sheet_html_xls(path):
+    """.xls（Excel 97-2003）走 xlrd，同样只取前几张表/若干行列。"""
+    import xlrd
+    book = xlrd.open_workbook(str(path))
+    out = []
+    for sh in book.sheets()[:_SHEET_MAX_SHEETS]:
+        rows = []
+        for r in range(min(sh.nrows, _SHEET_MAX_ROWS + 1)):
+            vals = []
+            for c in range(min(sh.ncols, _SHEET_MAX_COLS)):
+                try:
+                    v = sh.cell_value(r, c)
+                except Exception:
+                    v = ""
+                if isinstance(v, float) and v.is_integer():
+                    v = int(v)
+                vals.append(str(v))
+            rows.append(vals)
+        if not rows:
+            out.append("<h3>%s</h3><p>（空表）</p>" % _html_escape(sh.name))
+            continue
+        out.append(_rows_to_html(sh.name, rows))
+    return "".join(out)
+
+
+def _sheet_html(path):
+    """表格类预览：把 .xlsx/.xls 渲染成 HTML 表格（带网格），走 richtext 页显示。
+    没装依赖/读不出返回 ""（上层退回纯文本）。"""
+    try:
+        if _ext(path) == ".xls":
+            return _sheet_html_xls(path)
+        return _sheet_html_xlsx(path)
+    except Exception:
+        return ""
+
+
 def _doc_preview(path):
-    """文档预览分派：PDF 先试渲染首页（扫描/图片 PDF 就靠这个），渲染不出才
-    退回抽文字；其余 Office 一律走文字。返回 ("image", QImage) / ("text", str)。"""
+    """文档预览分派：PDF 交回页数（由 PreviewPane 逐页渲染、可翻页）；渲染器
+    缺失才退回抽首页/抽文字；docx 优先 mammoth 转 HTML（带图带版式）；其余
+    Office 一律走文字。返回 ("pdf", 页数) / ("image", QImage) / ("text", str)。"""
     if _ext(path) == ".pdf":
+        n = _pdf_page_count(path)
+        if n > 0:
+            return "pdf", n
         img = _pdf_first_page_image(path, _PDF_PREVIEW_MAX)
         if not img.isNull():
             return "image", img
+    if _ext(path) == ".docx":
+        r = _docx_html(path)
+        if r is not None:
+            return "richtext", {"html": r[0], "base": r[1]}
+    if _ext(path) in (".xlsx", ".xls"):
+        html = _sheet_html(path)              # 表格→带网格 HTML（快、有单元格样子）
+        if html.strip():
+            return "richtext", {"html": html, "base": ""}
+        if _ext(path) == ".xls":              # 解不出表格再退回纯文本
+            return "text", _xls_text(path)
     return "text", read_doc_text(path)
 
 
@@ -380,6 +602,7 @@ class ZoomImageView(QGraphicsView):
     自带 ScrollHandDrag 平移 + 变换缩放，放大时关掉平滑插值才不致糊。"""
 
     clicked_open = Signal()
+    wheel_page = Signal(int)               # PDF：不按 Ctrl 的滚轮→交上层翻上/下一页
 
     _MIN, _MAX = 0.05, 12.0
 
@@ -397,19 +620,25 @@ class ZoomImageView(QGraphicsView):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._zoom = 1.0
         self._user_zoomed = False           # 用户手动缩过就没随窗口重算“适应”
+        self.page_via_wheel = False          # True（PDF）：普通滚轮＝翻页，非平移
         self._press = None
         self._dragged = False
 
     # ---------- 对外 ----------
-    def show_image(self, img):
+    def show_image(self, img, fit=True):
         pm = img if isinstance(img, QPixmap) else QPixmap.fromImage(img)
         self._item.setPixmap(pm)
         if pm.isNull():
             self._scene.setSceneRect(QGraphicsScene().sceneRect())
             return
         self._scene.setSceneRect(0, 0, pm.width(), pm.height())
-        self._user_zoomed = False
-        self._fit()
+        if fit:
+            self._user_zoomed = False
+            self._fit()
+        else:
+            # PDF 默认 100%（原大），高过一屏就靠拖动/滚轮翻页看，不再缩成“适应”
+            self._user_zoomed = True
+            self._apply(1.0, by_user=False)
 
     def zoom_in(self):
         self._apply(self._zoom * 1.25)
@@ -449,7 +678,11 @@ class ZoomImageView(QGraphicsView):
             self._apply(self._zoom * (1.25 if e.angleDelta().y() > 0 else 0.8))
             e.accept()
             return
-        super().wheelEvent(e)               # 不按住 Ctrl：滚动平移
+        if self.page_via_wheel:              # PDF：不按 Ctrl 的滚轮＝上/下一页
+            self.wheel_page.emit(-1 if e.angleDelta().y() > 0 else 1)
+            e.accept()
+            return
+        super().wheelEvent(e)               # 普通图片：不按住 Ctrl 时滚动平移
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -481,6 +714,7 @@ class PreviewPane(QWidget):
     P3 会再挂 HTML 与脑图页，这里先把地基与异步回程做稳。"""
 
     _loaded = Signal(str, str, object)          # (token, kind, payload)
+    _pdf_ready = Signal(str, int, object)       # (token, 页下标, QImage)
     openRequested = Signal(str)                 # 单击预览图→打开当前文件（携路径）
 
     #: 堆栈页下标（前三个固定；render 也常驻；html/脑图 懒构造后动态追加）
@@ -496,6 +730,17 @@ class PreviewPane(QWidget):
         self._pv_path, self._pv_mtime = "", None
         self._pv_kind, self._pv_data, self._pv_mode = "none", None, None
         self._mode_btns = {}
+        self._pdf_total, self._pdf_idx = 0, 0    # PDF 页数与当前页（逐页渲染）
+        # 防滚轮翻页闪烁：当前是否已有一页图在显（有就不切“正在渲染”占位，
+        # 旧页一直显到新页算好直接换上）；_pdf_pending + 定时器把快速滚轮的
+        # 多格合成一次跳转，只渲染最终目标页，不再每格起一个线程刷白。
+        self._pdf_has_img = False
+        self._pdf_pending = None
+        self._pdf_nav = QTimer(self)
+        self._pdf_nav.setSingleShot(True)
+        self._pdf_nav.setInterval(60)
+        self._pdf_nav.timeout.connect(self._flush_pdf_nav)
+        self._rt_base = ""                       # docx 图片临时目录（换项时清）
         self._page_html = None                  # QWebEngineView：首次预览 HTML 才造
         self._mm = None                         # MindMapView：首次预览 MD 脑图才造
         self.setMinimumWidth(260)
@@ -512,9 +757,9 @@ class PreviewPane(QWidget):
         head.addWidget(self.lbl_title, 1)
         # 图片缩放条：仅图片/PDF 时亮（− 适应 +），平时隐藏
         self._zoom_btns = []
-        for glyph, tip, fn in (("−", "缩小", lambda: self.page_image.zoom_out()),
-                               ("适应", "适应窗口", lambda: self.page_image.reset_fit()),
-                               ("+", "放大", lambda: self.page_image.zoom_in())):
+        for glyph, tip, fn in (("−", "缩小", self._zoom_out),
+                               ("适应", "适应窗口", self._zoom_reset),
+                               ("+", "放大", self._zoom_in)):
             b = QToolButton(self)
             b.setText(glyph)
             b.setToolTip(tip)
@@ -536,6 +781,37 @@ class PreviewPane(QWidget):
         self._mode_bar.setLayout(self._bar)
         self._mode_bar.setVisible(False)
         lay.addWidget(self._mode_bar)
+        # PDF 翻页条：仅多页 PDF 时出现（◀ 上一页 / 第 X 共 N 页 / 下一页 ▶）。
+        # 单页 PDF 不挡道（没得可翻），但仍走逐页渲染同一张页。
+        self._pdf_bar_lay = QHBoxLayout()
+        self._pdf_bar_lay.setSpacing(6)
+        self._pdf_bar_lay.setContentsMargins(0, 0, 0, 0)
+        _pdf_btn_qss = (
+            "QToolButton { color:#C9CED6; background:transparent;"
+            " border:1px solid rgba(255,255,255,0.14); border-radius:5px;"
+            " padding:1px 10px; font-size:12px; }"
+            " QToolButton:hover { background:rgba(255,255,255,0.10); }"
+            " QToolButton:disabled { color:#5A6068; }")
+        self._pdf_prev = QToolButton(self)
+        self._pdf_prev.setText("◀ 上一页")
+        self._pdf_next = QToolButton(self)
+        self._pdf_next.setText("下一页 ▶")
+        for b in (self._pdf_prev, self._pdf_next):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(_pdf_btn_qss)
+        self._pdf_lbl = QLabel("")
+        self._pdf_lbl.setStyleSheet(
+            "color:#C9CED6; font-size:12px; background:transparent;")
+        self._pdf_prev.clicked.connect(lambda: self._pdf_goto(-1))
+        self._pdf_next.clicked.connect(lambda: self._pdf_goto(1))
+        self._pdf_bar_lay.addWidget(self._pdf_prev)
+        self._pdf_bar_lay.addWidget(self._pdf_lbl)
+        self._pdf_bar_lay.addWidget(self._pdf_next)
+        self._pdf_bar_lay.addStretch(1)
+        self._pdf_bar = QWidget(self)
+        self._pdf_bar.setLayout(self._pdf_bar_lay)
+        self._pdf_bar.setVisible(False)
+        lay.addWidget(self._pdf_bar)
         self.lbl_sub = QLabel("")
         self.lbl_sub.setStyleSheet(
             "color:#9AA4B0; font-size:11px; background:transparent;")
@@ -583,12 +859,28 @@ class PreviewPane(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self._loaded.connect(self._on_loaded)
+        self._pdf_ready.connect(self._on_pdf_ready)
+        self.page_image.wheel_page.connect(self._pdf_goto)   # PDF 滚轮翻页
+        # 富文本（Word/Excel）页 Ctrl+滚轮缩放：装到 QTextBrowser 的视口上（滚轮事件走这儿）
+        self._rt_zoom = 0
+        self.page_render.viewport().installEventFilter(self)
 
     # ---------- 对外 ----------
+    def _clear_rt(self):
+        """释放上一个 docx 预览落地的图片临时目录（不看就不留，避免临时区堆积）。"""
+        if self._rt_base:
+            import shutil
+            shutil.rmtree(self._rt_base, ignore_errors=True)
+            self._rt_base = ""
+
     def show_item(self, item):
         """传入当前选中的结果项 dict（None/工具/空 → 复位占位）。"""
         item = item or {}
         path = str(item.get("path") or "")
+        self._clear_rt()
+        self._pdf_nav.stop()                    # 换项：取消未刷的翻页，旧 PDF 的中间态不留
+        self._pdf_pending = None
+        self._reset_rt_zoom()                   # 换项：富文本缩放回基准，别把上个文件的倍率带到新的
         if not path:
             self._seq += 1
             self._token = ""
@@ -597,6 +889,9 @@ class PreviewPane(QWidget):
             self.lbl_sub.setText("")
             self._show_toolbar(())
             self._set_zoom_bar(False)
+            self._pdf_bar.setVisible(False)
+            self._pdf_total, self._pdf_idx = 0, 0
+            self.page_image.page_via_wheel = False
             self.stack.setCurrentIndex(self._PAGE_NONE)
             self.page_none.setText("选中一个文件或文档结果，这里就预览它")
             return
@@ -622,6 +917,12 @@ class PreviewPane(QWidget):
         import threading
         threading.Thread(target=work, daemon=True, name="launcher-preview").start()
 
+    def set_header_title(self, visible):
+        """QuickLook 浮层顶部已有自己的文件名条，这里关掉 pane 自带的标题，
+        免得上下两处都显示文件名（重复）。副标题（目录·大小·时间）与
+        缩放/翻页/模式控件均不受影响。唤出面板不调它，仍照常显示标题。"""
+        self.lbl_title.setVisible(bool(visible))
+
     def _subtitle(self, item):
         parts = [str(item.get("dir") or "")]
         try:
@@ -641,6 +942,9 @@ class PreviewPane(QWidget):
         if token != self._token:                 # 慢回包盖快选中：丢
             return
         self._pv_kind, self._pv_data = kind, payload
+        if kind == "pdf":
+            self._pdf_total, self._pdf_idx = int(payload or 0), 0
+            self._pdf_has_img = False           # 新文档：首页仍给一次“正在渲染”占位
         specs = _MODE_LABELS.get(kind, ())
         self._show_toolbar(specs)
         mode = _MODE_DEFAULT.get(kind) or (specs[0][0] if specs else None)
@@ -652,7 +956,29 @@ class PreviewPane(QWidget):
     def _render_mode(self, mode):
         """按当前类型 + 模式把缓存数据铺到对应页；模式切换不重新读盘。"""
         kind, data = self._pv_kind, self._pv_data
-        self._set_zoom_bar(kind == "image")
+        self._set_zoom_bar(kind in ("image", "pdf", "richtext"))
+        # PDF：普通滚轮＝翻页（图片保持平移）；其余一律关掉翻页通道
+        self.page_image.page_via_wheel = (kind == "pdf")
+        self._pdf_bar.setVisible(False)          # 只有 PDF 分支会再把它打开
+        # 渲染页默认回到深色（docx 分支会自己改成白底黑字）
+        self.page_render.setStyleSheet(_RENDER_DARK_QSS)
+        if kind == "pdf":
+            self._pdf_bar.setVisible(self._pdf_total > 1)
+            self._show_pdf_page(self._pdf_idx)
+            return
+        if kind == "richtext":
+            payload = data or {}
+            html = str(payload.get("html") or "")
+            base = str(payload.get("base") or "")
+            if not html.strip():                 # 转不出 HTML → 退回纯文本抽取
+                self._show_text(read_doc_text(self._pv_path))
+                return
+            self._rt_base = base
+            self.page_render.setSearchPaths([base] if base else [])
+            self.page_render.setStyleSheet(_RENDER_DOC_QSS)   # Word 文档：白底黑字
+            self.page_render.setHtml(html)
+            self.stack.setCurrentIndex(self._PAGE_RENDER)
+            return
         if kind == "image":
             img = data if isinstance(data, QImage) else QImage()
             if img.isNull():
@@ -674,7 +1000,10 @@ class PreviewPane(QWidget):
                 view = self._ensure_mindmap()
                 if view is not None:
                     from gui.launcher_mindmap import parse_md_tree
-                    view.show_tree(parse_md_tree(text, self.lbl_title.text()))
+                    name = self.lbl_title.text()
+                    # 文档名一并传下去：脑图自己不知道在预览哪个文件，导出时
+                    # 提不了个像样的文件名（show_tree 里顺手把展开层级收到一级）
+                    view.show_tree(parse_md_tree(text, name), name)
                     self.stack.setCurrentIndex(self.stack.indexOf(view))
                     return
                 self.page_render.setMarkdown(text)     # 造不出脑图退回渲染
@@ -701,11 +1030,80 @@ class PreviewPane(QWidget):
     def _show_text(self, data):
         text = str(data or "")
         if not text.strip():
-            self._show_none("📄 无可读正文（可能是扫描件或超出大小上限）")
+            # 真正的空文件（0 字节）单独提示“空文件”，不能和“抽不出正文”混为
+            # 一谈——前者是文件确实没内容，后者是能打开但读不出（扫描/加密）。
+            try:
+                empty = os.path.isfile(self._pv_path) \
+                    and os.path.getsize(self._pv_path) == 0
+            except OSError:
+                empty = False
+            self._show_none("📄 空文件（0 字节）" if empty
+                            else "📄 无可读正文（扫描件 / 加密 / 暂未支持的格式）")
             return
         self.page_text.setPlainText(text)
         self._apply_text_font()
         self.stack.setCurrentIndex(self._PAGE_TEXT)
+
+    # ---------- PDF 逐页渲染 ----------
+    def _show_pdf_page(self, idx):
+        """渲染并展示第 idx 页（后台线程解码，token+页号双重守卫）。"""
+        if self._pdf_total <= 0:
+            self._show_none("📄 无法读取该 PDF")
+            return
+        idx = max(0, min(int(idx), self._pdf_total - 1))
+        self._pdf_idx = idx
+        self._pdf_lbl.setText("第 %d / %d 页" % (idx + 1, self._pdf_total))
+        self._pdf_prev.setEnabled(idx > 0)
+        self._pdf_next.setEnabled(idx < self._pdf_total - 1)
+        path, token = self._pv_path, self._token
+        if _SYNC_PREVIEW:
+            self._on_pdf_ready(token, idx,
+                               _pdf_page_image(path, idx, _PDF_PREVIEW_MAX))
+            return
+        # 只在“手里还没图”（首屏）时显一下占位；翻页时旧页留着，等新页算好直接换，
+        # 不再回切占位页——这就是快速滚轮时“刷白/闪烁”的根源。
+        if not self._pdf_has_img:
+            self.page_none.setText("🔍 正在渲染第 %d 页…" % (idx + 1))
+            self.stack.setCurrentIndex(self._PAGE_NONE)
+
+        def work():
+            img = _pdf_page_image(path, idx, _PDF_PREVIEW_MAX)
+            self._pdf_ready.emit(token, idx, img)
+        import threading
+        threading.Thread(target=work, daemon=True, name="launcher-pdf").start()
+
+    def _pdf_goto(self, delta):
+        """滚轮/按钮翻页：不立即渲染，只累加目标页并重起防抖计时。
+        快速滚一格只起一次渲染（合成到最终页），中间页不再逐页刷白。"""
+        if self._pv_kind != "pdf" or self._pdf_total <= 0:
+            return
+        base = self._pdf_idx if self._pdf_pending is None else self._pdf_pending
+        target = max(0, min(base + delta, self._pdf_total - 1))
+        self._pdf_pending = target
+        self._pdf_lbl.setText("第 %d / %d 页" % (target + 1, self._pdf_total))
+        self._pdf_prev.setEnabled(target > 0)
+        self._pdf_next.setEnabled(target < self._pdf_total - 1)
+        self._pdf_nav.start()
+
+    def _flush_pdf_nav(self):
+        """防抖到期：只渲染最后停下的那一页。"""
+        idx = self._pdf_pending
+        self._pdf_pending = None
+        if idx is None or self._pv_kind != "pdf":
+            return
+        if idx != self._pdf_idx:
+            self._show_pdf_page(idx)
+
+    def _on_pdf_ready(self, token, idx, img):
+        """翻页回程：慢回包不能盖掉当前页（token 变了或页号不是正在看的都丢）。"""
+        if token != self._token or self._pv_kind != "pdf" or idx != self._pdf_idx:
+            return
+        if not isinstance(img, QImage) or img.isNull():
+            if not self._pdf_has_img:          # 首屏就失败才显错；翻页失败旧页还在，不刷白
+                self._show_none("📄 第 %d 页渲染失败" % (idx + 1))
+            return
+        self._show_image(img, fit=False)
+        self._pdf_has_img = True
 
     # ---------- 模式工具条 ----------
     def _show_toolbar(self, specs):
@@ -775,10 +1173,56 @@ class PreviewPane(QWidget):
         self.page_none.setText(msg)
         self.stack.setCurrentIndex(self._PAGE_NONE)
 
-    def _show_image(self, img):
-        """交给 ZoomImageView：按可视区 90% 适应，缩放/平移它自己管。"""
-        self.page_image.show_image(img)
+    def _show_image(self, img, fit=True):
+        """交给 ZoomImageView：图片按适应（fit=True），PDF 页按 100%（fit=False）。
+        缩放/平移/滚轮行为由 ZoomImageView 自己管。"""
+        self.page_image.show_image(img, fit=fit)
         self.stack.setCurrentIndex(self._PAGE_IMAGE)
+
+    # ---------- 缩放派发：图片/PDF 走 ZoomImageView，富文本走 QTextBrowser ----------
+    def _on_render_page(self):
+        return self.stack.currentIndex() == self._PAGE_RENDER
+
+    def _zoom_in(self):
+        if self._on_render_page():
+            self.page_render.zoomIn(1)
+            self._rt_zoom += 1
+        else:
+            self.page_image.zoom_in()
+
+    def _zoom_out(self):
+        if self._on_render_page():
+            self.page_render.zoomOut(1)
+            self._rt_zoom -= 1
+        else:
+            self.page_image.zoom_out()
+
+    def _zoom_reset(self):
+        if self._on_render_page():
+            self._reset_rt_zoom()
+        else:
+            self.page_image.reset_fit()
+
+    def _reset_rt_zoom(self):
+        """把 QTextBrowser 累计的缩放步数退回去（zoomIn/zoomOut 对称可逆）。"""
+        if self._rt_zoom > 0:
+            self.page_render.zoomOut(self._rt_zoom)
+        elif self._rt_zoom < 0:
+            self.page_render.zoomIn(-self._rt_zoom)
+        self._rt_zoom = 0
+
+    def eventFilter(self, obj, event):
+        """富文本页 Ctrl+滚轮缩放（普通滚轮仍交 QTextBrowser 正常滚动）。"""
+        if obj is self.page_render.viewport() \
+                and event.type() == QEvent.Type.Wheel \
+                and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            if event.angleDelta().y() > 0:
+                self._zoom_in()
+            else:
+                self._zoom_out()
+            event.accept()
+            return True
+        return super().eventFilter(obj, event)
 
     def _apply_text_font(self):
         # 代码类走等宽字体，普通文本用默认比例字体

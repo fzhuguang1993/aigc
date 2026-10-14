@@ -1,21 +1,22 @@
 """
-tests/test_launcher_preview.py —— 唤出面板右侧预览窗（分派 / 异步回程 / 空格折叠）
+tests/test_launcher_preview.py —— 唤出面板右侧预览窗（分派 / 异步回程 / 空格折叠与放大）
 
 这块全是"按类型给内容、给不出就明确说无法预览"的分支，还有跨线程回包的序号守卫，
 所以逐类钉死：图片解码、纯文本读文件（含 GBK 兜底）、代码归文本、未知类型给 none；
-PreviewPane 同步路径下切项、旧回包不能盖新选中；面板空格折叠预览并落盘偏好。
+PreviewPane 同步路径下切项、旧回包不能盖新选中；面板空格折叠预览并落盘偏好，
+鼠标停在预览区时空格改切预览贴边（常规/占右半屏/占左半屏）——贴边只长大预览那一栏。
 """
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 早于任何 PySide6 导入
 
 import pytest
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent
 from PySide6.QtWidgets import QApplication
 
 from gui import launcher_preview as lp
-from gui.dialogs_launcher import LauncherDialog
+from gui.dialogs_launcher import LauncherDialog, _LEFT_MIN_W, _PREVIEW_HALF_RATIO
 from store import app_state
 
 
@@ -30,6 +31,18 @@ def _sync(monkeypatch, tmp_path):
     """每例一份临时偏好 + 预览走同步：离屏等不到后台线程回包。"""
     monkeypatch.setattr(app_state, "STATE_FILE", tmp_path / "ui.json")
     monkeypatch.setattr(lp, "_SYNC_PREVIEW", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_active_window_leak(qapp):
+    """收完尾把活动窗口清掉：离屏平台 close() 只 hide、不补 WindowDeactivate，
+    显示过的面板会挂在 QApplication.activeWindow() 上漏给后面的测试文件
+    （test_hotkey_wiring 那套前台判定会被它带歪）。"""
+    yield
+    w = QApplication.activeWindow()
+    if w is not None:
+        w.hide()
+        qapp.processEvents()
 
 
 # ---------------- 分派与读取（纯函数） ----------------
@@ -421,19 +434,198 @@ def test_img_worker_restarts_after_shutdown(qapp):
 
 # ---------------- 面板：空格折叠预览 ----------------
 
+def _space(d):
+    d.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space,
+                              Qt.KeyboardModifier.NoModifier))
+
+
 def test_space_toggles_preview_and_persists(qapp, monkeypatch):
+    """鼠标不在预览区：空格仍旧是折叠/展开预览窗（老语义不被放大抢走）。"""
+    d = LauncherDialog(lambda name: None, None)
+    monkeypatch.setattr(d, "_load_tools", lambda: [])
+    monkeypatch.setattr(d, "_over_preview", lambda: False)     # 鼠标停在结果列表上
+    d.show()
+    try:
+        assert not d._preview.isHidden()                  # 默认展开
+        _space(d)
+        assert d._preview.isHidden()
+        assert app_state.get("launcher_preview_open") is False
+        _space(d)
+        assert not d._preview.isHidden()
+        assert app_state.get("launcher_preview_open") is True
+    finally:
+        d.close()
+
+
+# ---------------- 面板：空格把预览贴成半屏 ----------------
+
+#: 贴边允许的像素误差：分栏把手与四舍五入会吃掉几 px，但绝吃不掉半个屏幕
+_SNAP_TOL = 24
+
+
+def _big_screen(monkeypatch, d, w=1920, h=1080):
+    """钉死放大算术：离屏那块屏只有 800 宽，连窗口常规尺寸都装不下，
+    注入一块正常大小的屏才能验“预览恰好吃掉一半屏、左列不动、外边界贴屏幕”。"""
+    monkeypatch.setattr(d, "_screen_geo", lambda: QRect(0, 0, w, h))
+    return w
+
+
+def test_space_over_preview_snaps_to_half_screen(qapp, monkeypatch):
+    """鼠标停在预览区：空格走 常规→占右半屏→占左半屏→常规，尺寸和 Win+方向键一致。
+
+    用户点名要的就是“预览框变成屏幕那一半”（Aero Snap 那个效果）：
+    预览宽 = 可用屏宽的一半、外边界对齐屏幕、高度铺满；
+    **左列不跟着变宽**（那会看上去像全屏，是他明确不要的），
+    所以整窗比半屏宽一点，多出来那一截伸到另一半屏上。"""
+    d = LauncherDialog(lambda name: None, None)
+    monkeypatch.setattr(d, "_load_tools", lambda: [])
+    monkeypatch.setattr(d, "_over_preview", lambda: True)
+    wide = _big_screen(monkeypatch, d)
+    half = int(wide * _PREVIEW_HALF_RATIO)
+    d.show()
+    try:
+        m = d.layout().contentsMargins()
+        w0, h0 = d.width(), d.height()
+        l0, p0 = d._split.sizes()
+        _space(d)
+        assert d._preview_mode == "right"
+        assert d._split.indexOf(d._preview) == 1          # 预览留在右栏
+        l1, p1 = d._split.sizes()
+        assert abs(p1 - half) <= _SNAP_TOL, "预览要正好吃掉右半屏那一格"
+        assert l1 <= l0 + 2, "左列不该跟着变宽"
+        assert abs(d.x() + d.width() - (wide + m.right())) <= 2, "右边缘要贴到屏幕右边"
+        assert w0 < d.width() <= wide, "整窗变宽但不能超出屏"
+        assert d.height() >= 1080, "竖直也铺满：贴边分的那一半本来就是整高"
+        assert not d._preview.isHidden()
+        assert app_state.get("launcher_preview_mode") == "right"
+        _space(d)
+        assert d._preview_mode == "left"
+        assert d._split.indexOf(d._preview) == 0          # 预览换到左边
+        sizes = d._split.sizes()
+        assert abs(sizes[0] - half) <= _SNAP_TOL, "换边照样半屏"
+        assert sizes[1] <= l0 + 2, "换边也不该把左列撑大"
+        assert abs(d.x() + m.left()) <= 2, "预览在左就钉屏幕左边缘"
+        assert app_state.get("launcher_preview_mode") == "left"
+        _space(d)
+        assert d._preview_mode == "normal"
+        assert d._split.indexOf(d._preview) == 1
+        assert (d.width(), d.height()) == (w0, h0)         # 原样还回放大前
+        assert app_state.get("launcher_preview_mode") == "normal"
+    finally:
+        d.close()
+
+
+def test_narrow_screen_never_pushes_the_window_off_screen(qapp, monkeypatch):
+    """屏窄到装不下“半屏 + 常规左列”时：先压左列，压到底还不够就缩预览，
+    总之整窗不能超出屏幕（超出去就是把预览推出了用户的视线）。"""
+    d = LauncherDialog(lambda name: None, None)
+    monkeypatch.setattr(d, "_load_tools", lambda: [])
+    narrow = _big_screen(monkeypatch, d, w=900, h=700)
+    app_state.set_value("launcher_split", [820, 60])      # 一个故意夸张的常规左列
+    d.show()
+    try:
+        d._set_preview_mode("right")
+        assert d.width() <= narrow, "整窗不许超出可用屏宽"
+        assert d.x() + d.width() <= narrow + d.layout().contentsMargins().right() + 2
+        left_w, prev_w = d._split.sizes()
+        assert left_w >= _LEFT_MIN_W - 2, "左列最多压到它的下限，不能抽成 0"
+        assert prev_w >= left_w, "装不下时优先保预览：半屏才是用户点名的那个贴边效果"
+    finally:
+        d.close()
+
+
+def test_tip_row_does_not_pin_the_left_column(qapp, monkeypatch):
+    """底部快捷键提示行不许决定左列的最小宽度。
+
+    放大预览时“左列不动”全靠左列真能被压窄。曾经这一行是 5 对提示 + 两个按钮的
+    横排，把左列 minimumSizeHint 顶到 846（常规窗口才 1120 宽），Qt 压不下去一个
+    压不下去的列，setSizes 直接整体作废。窄下来该藏的是装饰提示，
+    「钉住 / 索引」两个入口必须留着。"""
     d = LauncherDialog(lambda name: None, None)
     monkeypatch.setattr(d, "_load_tools", lambda: [])
     d.show()
     try:
-        assert not d._preview.isHidden()                  # 默认展开
-        d.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space,
-                                  Qt.KeyboardModifier.NoModifier))
-        assert d._preview.isHidden()
-        assert app_state.get("launcher_preview_open") is False
-        d.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space,
-                                  Qt.KeyboardModifier.NoModifier))
-        assert not d._preview.isHidden()
-        assert app_state.get("launcher_preview_open") is True
+        assert d._left.minimumSizeHint().width() <= _LEFT_MIN_W + 80, \
+            "提示行不该把左列顶出一个压不下去的下限"
+        d._split.setSizes([_LEFT_MIN_W, int(d._split.width()) - _LEFT_MIN_W])
+        QApplication.processEvents()
+        assert d._left.width() <= _LEFT_MIN_W + 40, "左列要真能被压窄"
+        assert d.btn_pin.isVisible() and d.btn_index.isVisible()
+        assert any(not kb.isVisible() for kb, _ in d._tip_pairs), \
+            "装不下时要藏提示，不是挤掉按钮"
+    finally:
+        d.close()
+
+
+def test_normal_left_width_falls_back_to_the_preference(qapp, monkeypatch):
+    """放大态的左列宽度从“进放大前那一次分栏”拿；没记录时退回偏好里的左栏值。
+
+    这一条单独钉：拿不到旧宽度就等同于回到“整窗全屏”，正是用户不要的那个。"""
+    d = LauncherDialog(lambda name: None, None)
+    monkeypatch.setattr(d, "_load_tools", lambda: [])
+    try:
+        app_state.set_value("launcher_split", [420, 300])
+        d._normal_geo = None
+        assert d._normal_left_width() == 420
+        d._normal_geo = (760, 520, [500, 260])
+        assert d._normal_left_width() == 500
+    finally:
+        d.close()
+
+
+def test_enlarge_mode_does_not_pollute_size_pref(qapp, monkeypatch):
+    """放大时收起面板不能把“为了撑大预览而摆出来的宽度”当成用户日常尺寸存进偏好，
+    否则退出放大就再也回不到他原来那个大小了。"""
+    d = LauncherDialog(lambda name: None, None)
+    _big_screen(monkeypatch, d)
+    monkeypatch.setattr(d, "_over_preview", lambda: True)
+    d.show()
+    try:
+        d._set_preview_mode("normal")
+        d.resize(1000, 600)
+        app_state.set_value("launcher_size", [1000, 600])
+        d._set_preview_mode("right")
+        assert d.width() != 1000                          # 已是放大态宽度
+        d.hide()
+        assert app_state.get("launcher_size") == [1000, 600]
+    finally:
+        d.close()
+
+
+def test_enlarge_mode_restored_on_summon(qapp, monkeypatch):
+    """上次留在半屏贴边态：重新召唤面板时直接还回那一半（不回到居中常规双栏）。
+
+    summon 会抢前台、起轮询，测里只关心几何：把“取前台”那一段换掉。"""
+    monkeypatch.setattr("gui.dialogs_launcher.raise_to_front", lambda w: None)
+    d = LauncherDialog(lambda name: None, None)
+    wide = _big_screen(monkeypatch, d)
+    try:
+        d._set_preview_mode("left")
+        assert app_state.get("launcher_preview_mode") == "left"
+        d.hide()
+        d.summon()
+        assert d._preview_mode == "left"
+        assert d._split.indexOf(d._preview) == 0
+        sizes = d._split.sizes()
+        assert abs(sizes[0] - int(wide * _PREVIEW_HALF_RATIO)) <= _SNAP_TOL, \
+            "预览在左那一侧，重开还得是半屏宽"
+    finally:
+        d.close()
+
+
+def test_over_preview_follows_mouse(qapp):
+    """悬停判定用几何位置算，不信 underMouse()：Qt 只给最里层控件置位，父级拿到的
+    恒是 False（离屏平台上连 QCursor 都设不动），拿它判“在预览区”＝开关永不生效。"""
+    from PySide6.QtCore import QPoint
+    d = LauncherDialog(lambda name: None, None)
+    d.show()
+    try:
+        d._preview.setVisible(True)
+        d._preview_open = True
+        c = d._preview.rect().center()
+        assert d._preview_contains(d._preview.mapToGlobal(c)) is True
+        assert d._preview_contains(d._preview.mapToGlobal(c + QPoint(10000, 0))) is False
+        d._preview.setVisible(False)          # 折叠了就不算悬停
+        assert d._over_preview() is False
     finally:
         d.close()

@@ -53,13 +53,19 @@ def _fmt_n(v):
 
 
 class _DriveRow(QWidget):
-    """一行一个盘：勾选框（是否纳入索引） + 最近更新时间 / 文件数 + 立即重扫此盘。"""
+    """一行一个盘：勾选框（是否纳入索引）+ 最近更新时间 / 文件数 + 立即重扫此盘。
 
-    def __init__(self, path, checked, on_reindex, on_toggle, parent=None):
+    行上有两个按钮是分开的：“重扫此盘”只动文件名索引（快），“索引此盘文档”只动
+    正文（慢、吃 CPU）。以前只有前者，而后台那一档又刻意跳过正文，所以“按盘扫文档”
+    在全程没有一个入口。"""
+
+    def __init__(self, path, checked, on_reindex, on_toggle, on_reindex_docs=None,
+                 parent=None):
         super().__init__(parent)
         self.path = str(path)
         self._on_reindex = on_reindex
         self._on_toggle = on_toggle
+        self._on_reindex_docs = on_reindex_docs
         h = QHBoxLayout(self)
         h.setContentsMargins(2, 3, 2, 3)
         h.setSpacing(10)
@@ -78,6 +84,12 @@ class _DriveRow(QWidget):
         self.btn.setToolTip("只重新扫描这个磁盘的文件名索引（后台异步，不卡界面）")
         self.btn.clicked.connect(lambda _c=False: self._reindex())
         h.addWidget(self.btn)
+        self.btn_docs = QPushButton("📖 索引此盘文档")
+        self.btn_docs.setObjectName("GhostBtn")
+        self.btn_docs.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_docs.setToolTip("只抽这个磁盘里 Word/Excel/PPT/PDF 的正文（后台异步，不卡界面）")
+        self.btn_docs.clicked.connect(lambda _c=False: self._reindex_docs())
+        h.addWidget(self.btn_docs)
 
     def _toggled(self):
         cb = self._on_toggle
@@ -86,6 +98,11 @@ class _DriveRow(QWidget):
 
     def _reindex(self):
         cb = self._on_reindex
+        if callable(cb):
+            cb([self.path])
+
+    def _reindex_docs(self):
+        cb = self._on_reindex_docs
         if callable(cb):
             cb([self.path])
 
@@ -99,6 +116,7 @@ class _DriveRow(QWidget):
 
     def set_reindex_enabled(self, on):
         self.btn.setEnabled(bool(on))
+        self.btn_docs.setEnabled(bool(on) and fileindex.doc_enabled())
 
 
 class IndexSettingsDialog(QDialog):
@@ -159,6 +177,13 @@ class IndexSettingsDialog(QDialog):
         self.btn_reindex.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reindex.clicked.connect(self._reindex_selected)
         ar.addWidget(self.btn_reindex)
+        self.btn_docs = QPushButton("📖 索引所选盘文档")
+        self.btn_docs.setObjectName("GhostBtn")
+        self.btn_docs.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_docs.setToolTip("只抽所选磁盘里文档的正文（后台异步）：文档多、CPU 重，"
+                                 "跑着有点慢是正常的")
+        self.btn_docs.clicked.connect(self._docs_selected)
+        ar.addWidget(self.btn_docs)
         self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet(tokenize(
             "color:#8F959E; font-size:12px; background:transparent;"))
@@ -197,7 +222,8 @@ class IndexSettingsDialog(QDialog):
     def _build_rows(self):
         sel = self._selected()
         for p in self._all_drives():
-            row = _DriveRow(p, p in sel, self._reindex_roots, self._on_toggle)
+            row = _DriveRow(p, p in sel, self._reindex_roots, self._on_toggle,
+                            self._reindex_docs)
             self._rows[p] = row
             self._rows_lay.insertWidget(self._rows_lay.count() - 1, row)
 
@@ -215,6 +241,7 @@ class IndexSettingsDialog(QDialog):
             row.setEnabled(on)
             row.set_reindex_enabled(on)
         self.btn_reindex.setEnabled(on)
+        self.btn_docs.setEnabled(on and fileindex.doc_enabled())
 
     def _collect_checked(self):
         return [p for p, row in self._rows.items() if row.ck.isChecked()]
@@ -237,9 +264,29 @@ class IndexSettingsDialog(QDialog):
         self._refresh_status()
         return ok
 
+    def _reindex_docs(self, roots):
+        """异步发起“只抽这几个盘的文档正文”：同样不阻塞界面。
+
+        正文索引有自己的开关（doc_enabled），关着的时候后台那一档会直接跳过，
+        所以这里先拦住：否则用户点了只会等到一句“后台正在扫描…”然后什也不会变。"""
+        if not fileindex.doc_enabled():
+            self.lbl_status.setText("请先在设置页开启「文档正文索引」")
+            return False
+        from workers import file_watcher
+        ok = file_watcher.reindex_docs(roots)
+        self.lbl_status.setText(
+            "已提交文档正文索引，后台进行中…" if ok else "请先启用本地文件搜索")
+        self._refresh_status()
+        return ok
+
     def _reindex_selected(self):
         roots = self._collect_checked() or fileindex.local_drives()
         self._reindex_roots(roots)
+
+    def _docs_selected(self):
+        """底部那一下“索引所选盘文档”：按同一份勾选范围抽正文。"""
+        roots = self._collect_checked() or fileindex.local_drives()
+        self._reindex_docs(roots)
 
     def _refresh_status(self):
         st = {r["root"]: r for r in fileindex.root_status()}

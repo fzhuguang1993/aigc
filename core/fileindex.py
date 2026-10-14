@@ -248,6 +248,22 @@ def search_roots():
     return custom_roots() or local_drives()
 
 
+def _inside(path, root):
+    """path 在不在 root 这个范围里（前缀比较按路径段切，不认半截名字）。
+
+    不能直接用 str.startswith：拿 "D:\\文档" 比 "D:\\文档中心" 会把后者也算进去，
+    于是“只清这个盘的残留”清到了隔壁盘同名前缀的目录。盘符根（"D:\\"）那种带尾
+    分隔符的写法靠 rstrip + os.sep 也能正上。"""
+    p = os.path.normcase(str(path or ""))
+    r = os.path.normcase(str(root or ""))
+    if not p or not r:
+        return False
+    base = r.rstrip("\\/")
+    if not base:                        # 根到只剩个分隔符：不当范围用，宁可不算命中
+        return False
+    return p == base or p.startswith(base + os.sep)
+
+
 # ==================== 切词与匹配 ====================
 def normalize(text):
     """剥空白 + 转小写：写入与查询必须走同一个函数，口径差一点就搜不到"""
@@ -900,16 +916,24 @@ def extract_text(path, max_bytes=None):
 
 
 # ==================== 文档索引 ====================
-def index_docs(roots=None, stop=None, on_progress=None, force=False, pace=0.2):
+def index_docs(roots=None, stop=None, on_progress=None, force=False, pace=0.2,
+               scope_full=None):
     """给文档抽正文建全文索引；只重抽 (mtime,size) 变了或没抽过的。
 
     pace（每 50 个 sleep 一次）不是洁癖：一次抽几千个文档会把 CPU 吃满，
-    用户正在剪视频时后台这么跑就会被当成"软件抢性能"。测试里传 0 关掉。"""
+    用户正在剪视频时后台这么跑就会被当成"软件抢性能"。测试里传 0 关掉。
+
+    roots 传子集（“只抽 D 盘的文档”）时，收尾只清这些盘里的死链，不动别的盘的
+    索引行；要不要按“全盘口径”清理交给 scope_full（默认自己判，见
+    _covers_doc_scope）。以前没有这一档：按盘抽一次就把其他盘的正文索引全清了。"""
     t0 = time.perf_counter()
     conn = connect()
     roots = [str(r) for r in (roots or doc_roots())]
+    if scope_full is None:
+        scope_full = _covers_doc_scope(roots)
     done = skipped = 0
     batch = []
+    cut = False
 
     def flush(rows):
         if not rows:
@@ -936,11 +960,13 @@ def index_docs(roots=None, stop=None, on_progress=None, force=False, pace=0.2):
 
     for root in roots:
         if stop is not None and stop.is_set():
+            cut = True
             break
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
             dirnames[:] = [x for x in dirnames if not excluded(x)]
             for fn in filenames:
                 if stop is not None and stop.is_set():
+                    cut = True
                     break
                 if not _doc_worth(fn):
                     skipped += 1
@@ -968,9 +994,15 @@ def index_docs(roots=None, stop=None, on_progress=None, force=False, pace=0.2):
                         on_progress(done, full)
                     if pace > 0:
                         time.sleep(pace)
-    flush(batch)
-    _prune_docs(conn, roots)
-    _set_meta(conn, "last_docs", int(time.time()))
+            if cut:
+                break                   # 以前只跳出文件名循环：os.walk 会继续往底下走，
+    flush(batch)                        # “中断后收手”根本收不住，退出时白跑一大截
+    if not cut:                         # 半程不清残留：还没走到的目录不等于被删了
+        _prune_docs(conn, roots, full=scope_full)
+    # 时间戳只在“真跑完”的时候往前推：半程就退出还记成“刚抽过”，下一轮启动的
+    # 快速检查就会信这个数，六小时都不再抽正文——那批文档一直是搜不到的状态。
+    if not cut:
+        _set_meta(conn, "last_docs", int(time.time()))
     _set_meta(conn, "last_docs_done", done)
     conn.commit()
     return {"indexed": done, "skipped": skipped,
@@ -985,17 +1017,42 @@ def _doc_worth(fn):
     return ext in DOC_EXTS
 
 
-def _prune_docs(conn, roots):
-    """文档已经不在了（或移出了文档目录）就删索引行，不然会搜到死链"""
-    keep = tuple(str(r) for r in roots)
+def _prune_docs(conn, roots, full=True):
+    """文档已经不在了（或移出了文档目录）就删索引行，不然会搜到死链。
+
+    full=False 是“只扫了部分盘”那一档：只清 keep 范围内的死链，**不碰范围外**。
+    旧写法是 `not path.startswith(keep) or not isfile(path)`，只要 roots 是个子集，
+    就会把其他盘的文档行全删——“针对某个盘做文档扫描”一按就把整盘正文索引清空，
+    这就是那个功能坏掉的根源（另一坏在 workers.file_watcher.run_once：定向重扫时
+    永远跳过正文，两个坏凑在一起就是“按盘扫文档要么没反应、要么把别的盘删了”）。"""
+    keep = [str(r) for r in (roots or []) if str(r).strip()]
     if not keep:
-        return
-    stale = [r["id"] for r in conn.execute(
-        "SELECT id,path FROM docs_meta").fetchall()
-        if not r["path"].startswith(keep) or not os.path.isfile(r["path"])]
+        return 0
+    stale = []
+    for r in conn.execute("SELECT id,path FROM docs_meta").fetchall():
+        p = str(r["path"] or "")
+        inside = any(_inside(p, k) for k in keep)
+        if inside:
+            if not os.path.isfile(p):
+                stale.append(r["id"])
+        elif full:                      # 只有全盘口径才清“移出了文档目录”的那批
+            stale.append(r["id"])
     for rid in stale:
         conn.execute("DELETE FROM docs_fts WHERE rowid=?", (rid,))
         conn.execute("DELETE FROM docs_meta WHERE id=?", (rid,))
+    return len(stale)
+
+
+def _covers_doc_scope(scope):
+    """这次抽的根是否把配置里的文档目录全覆盖住了：只有全覆盖才允许清“范围外”的残留。
+    没配文档目录（want 空）时按覆盖处理——那条清理本来就没东西可清。"""
+    want = [str(r) for r in doc_roots()]
+    if not want:
+        return True
+    got = [str(r) for r in (scope or []) if str(r).strip()]
+    if not got:
+        return False
+    return all(any(_inside(w, g) for g in got) for w in want)
 
 
 # ==================== 查询 ====================
@@ -1140,6 +1197,40 @@ def root_status():
                     "files": int(r["files"] or 0), "dirs": int(r["dirs"] or 0),
                     "indexed": last > 0})
     return out
+
+
+# ==================== 快速检查（启动首轮的地基） ====================
+#: 一个盘多久没被扫过才算“到期”：启动首轮只补到期的盘，不再无条件全盘重扫
+DUE_SEC = 10 * 60
+#: 正文多久没抽才算“到期”：抽正文比走目录名贵几个数量级，不该每次开机都来一遍
+DOCS_DUE_SEC = 6 * 3600
+
+
+def last_docs_scan():
+    """上次抽完正文的墙上时间（没抽过 = 0）：只读 meta 一条主键，不碰大表。"""
+    return _meta_get(connect(), "last_docs") or 0
+
+
+def docs_due(max_age=DOCS_DUE_SEC):
+    """正文抽取这一轮该不该跑：离上次够久了才跑。
+
+    旧行为是启动第一拍就无脑 index_docs：每个文档都要 os.stat + 比 mtime，
+    几千篇摊在机械盘上是几十秒纯 IO，而正文其实一天也变不了几篇。"""
+    return time.time() - last_docs_scan() >= max_age
+
+
+def due_roots(max_age=DUE_SEC, roots=None):
+    """候选根里“够久没扫”的那几个：启动快速检查只扫这些盘。
+
+    roots 表里没记录的盘（新加的盘、整库重建后）也算到期——它确实一点都没索引。
+    只读 roots 表那几行，绝不扫盘：这条会被启动路径调到，主线程一刻都不能等。"""
+    want = [str(r) for r in (search_roots() if roots is None else roots) if str(r).strip()]
+    if not want:
+        return []
+    now = time.time()
+    last = {os.path.normcase(str(r["root"])): int(r["last_scan"] or 0)
+            for r in root_status()}
+    return [r for r in want if now - last.get(os.path.normcase(str(r)), 0) >= max_age]
 
 
 def rebuild():

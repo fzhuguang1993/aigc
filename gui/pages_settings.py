@@ -30,11 +30,14 @@ from core import license as lic
 from core import naming
 from core import tags as tag_lib
 from core import block_categories
+from core import video_categories
 from core import fileindex
+from core import shell_integration
 from gui.header import page_header
 from gui.dialogs_naming import NamingEditor
 from gui.dialogs_tags import TagEditor
 from gui.dialogs_blocks import BlockCategoryEditor
+from gui.dialogs_video_categories import VideoCategoryEditor
 from gui.maintainer import Gate, app_has_unlocked
 from gui.mouse_gesture import (GESTURE_COMMANDS, COMMAND_LABELS,
                               gesture_display, shape_distance, SHAPE_MAX_DIST)
@@ -42,10 +45,19 @@ from gui.tools_registry import (TOOLS, set_tool_shortcut, tool_shortcuts,
                                 launcher_shortcut, set_launcher_shortcut,
                                 home_shortcut, set_home_shortcut,
                                 recorder_shortcut, set_recorder_shortcut,
+                                screenshot_shortcut, set_screenshot_shortcut,
+                                clipboard_shortcut, set_clipboard_shortcut,
+                                launcher_resize_shortcut,
+                                set_launcher_resize_shortcut,
                                 global_hotkey_enabled, set_global_hotkey_enabled,
+                                quicklook_enabled, set_quicklook_enabled,
                                 LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN,
-                                HOME_LABEL, LAUNCHER_LABEL, RECORDER_LABEL)
+                                SCREENSHOT_TOKEN, CLIPBOARD_TOKEN, RESIZE_TOKEN,
+                                HOME_LABEL, LAUNCHER_LABEL, RECORDER_LABEL,
+                                SCREENSHOT_LABEL, CLIPBOARD_LABEL, RESIZE_LABEL)
 from gui import global_hotkey
+from gui.clipboard_view import (default_view as clipboard_default_view,
+                                set_default_view)
 from gui import tray
 from gui.tool_panels import API_MAINTAINER_CODE, MAINTAINER_SHORTCUT, PANEL_FACTORIES
 from gui.widgets import VideoPlayerDialog
@@ -231,6 +243,8 @@ class SettingsPage(QWidget):
         pr.addWidget(b_pv_reset)
         pr.addStretch(1)
         cv.addLayout(pr)
+        # 全屏控制栏的位置不再给选项：以前有下方/左侧/右侧/自动四档，实测贴在
+        # 左右边时进度条落在屏幕中部，不符合使用习惯；现在固定在屏幕底部居中。
         lay.addWidget(card)
 
         # ---------- 工具快捷键：一键呼出工具中心窗口（存 ui_state，保存即生效） ----------
@@ -275,6 +289,13 @@ class SettingsPage(QWidget):
         self.ck_min_tray.setChecked(bool(app_state.get(tray.MINIMIZE_TO_TRAY_KEY, False)))
         self.ck_global = QCheckBox("工具快捷键全局生效（焦点在其它软件里也认）")
         self.ck_global.setChecked(global_hotkey_enabled())
+        self.ck_quicklook = QCheckBox("空格预览（QuickLook）：在资源管理器/桌面选中文件按空格弹预览浮层")
+        self.ck_quicklook.setChecked(quicklook_enabled())
+        self.ck_quicklook.setToolTip(
+            "开着时，只要本软件在跑（哪怕藏在托盘），在资源管理器或桌面上选中一个文件按空格，\n"
+            "就弹出一个只有预览的浮层（再按空格/Esc 关，↑↓ 切换相邻文件）。\n"
+            "支持图片/视频/PDF/Office/txt/md/html。\n"
+            "裸空格只在“焦点真的在文件列表”时接管，地址栏/搜索框里打字一律不受影响。")
         self.ck_auto = QCheckBox("开机自动启动（启动后直接待在托盘）")
         self.ck_auto.setChecked(tray.read_autostart())
         for ck, key in ((self.ck_close_tray, tray.CLOSE_TO_TRAY_KEY),
@@ -282,7 +303,20 @@ class SettingsPage(QWidget):
             ck.toggled.connect(lambda on, k=key: self._tray_pref(k, on))
         self.ck_global.toggled.connect(set_global_hotkey_enabled)
         self.ck_global.toggled.connect(lambda _=False: self._refresh_hotkey_status())
+        self.ck_quicklook.toggled.connect(set_quicklook_enabled)
         self.ck_auto.toggled.connect(self._toggle_autostart)
+        # 资源管理器右键「入库到素材库/成品库」：只在 Windows 上给视频扩展名挂菜单项，
+        # 勾上写 HKCU 注册表、取消即删；非 Windows 不显示这一项（开发态不挡界面）。
+        self.ck_shell_import = None
+        if shell_integration.supported():
+            self.ck_shell_import = QCheckBox("资源管理器右键：把视频入库到素材库 / 成品库")
+            self.ck_shell_import.setToolTip(
+                "勾选后，在桌面或文件夹里右键一个视频文件，会出现\n"
+                "「🎬 入库到素材库」「📦 入库到成品库」两项，点一下即把它收进对应库。\n"
+                "只给当前用户注册（HKCU），取消勾选即从右键菜单移除，不留残留。\n"
+                "现阶段只认视频（mp4/mov/avi/mkv/webm）。")
+            self.ck_shell_import.setChecked(shell_integration.is_registered())
+            self.ck_shell_import.toggled.connect(self._toggle_shell_menu)
         if tray.tray_supported():
             # 三个开关都靠托盘当入口：托盘不可用（被精简掉了、换了三方任务栏）
             # 就把它们灰掉，而不是让用户设了一堆其实不生效的选项
@@ -294,7 +328,10 @@ class SettingsPage(QWidget):
                 ck.setToolTip("本机没找到系统托盘，收进托盘不可用")
                 cv.addWidget(ck)
         cv.addWidget(self.ck_global)
+        cv.addWidget(self.ck_quicklook)
         cv.addWidget(self.ck_auto)
+        if self.ck_shell_import is not None:
+            cv.addWidget(self.ck_shell_import)
 
         lr = QHBoxLayout()
         lr.setSpacing(10)
@@ -343,6 +380,73 @@ class SettingsPage(QWidget):
         rr.addStretch(1)
         cv.addLayout(rr)
         self.rec_key.editingFinished.connect(self._save_recorder_key)
+
+        # 截图：全局一键抓图（默认 Ctrl+Alt+A，与主窗口 apply_screenshot_shortcut 同源）
+        shr = QHBoxLayout()
+        shr.setSpacing(10)
+        self.shot_key = QKeySequenceEdit(QKeySequence(screenshot_shortcut()))
+        self.shot_key.setFixedWidth(220)
+        b_sk_clear = QPushButton("清空")
+        b_sk_clear.setObjectName("GhostBtn")
+        b_sk_clear.setToolTip("不配这条：截图只靠工具面板里的按钮")
+        b_sk_clear.clicked.connect(self._clear_screenshot_key)
+        shr.addWidget(_form_label(SCREENSHOT_LABEL))
+        shr.addWidget(self.shot_key)
+        shr.addWidget(b_sk_clear)
+        shr.addWidget(QLabel("焦点在其它软件里也能一键区域截图"))
+        shr.addStretch(1)
+        cv.addLayout(shr)
+        self.shot_key.editingFinished.connect(self._save_screenshot_key)
+
+        # 剪贴板快贴：全局呼出 Ditto 式悬浮快贴窗（默认 Ctrl+`，与主窗口 apply_clipboard_shortcut 同源）
+        ckr = QHBoxLayout()
+        ckr.setSpacing(10)
+        self.clip_key = QKeySequenceEdit(QKeySequence(clipboard_shortcut()))
+        self.clip_key.setFixedWidth(220)
+        b_ck_clear = QPushButton("清空")
+        b_ck_clear.setObjectName("GhostBtn")
+        b_ck_clear.setToolTip("不配这条：只能在创作工具里打开剪贴板历史面板")
+        b_ck_clear.clicked.connect(self._clear_clipboard_key)
+        ckr.addWidget(_form_label(CLIPBOARD_LABEL))
+        ckr.addWidget(self.clip_key)
+        ckr.addWidget(b_ck_clear)
+        ckr.addWidget(QLabel("焦点在其它软件里也能一键呼出快贴，回车即粘回原处"))
+        ckr.addStretch(1)
+        cv.addLayout(ckr)
+        self.clip_key.editingFinished.connect(self._save_clipboard_key)
+
+        # 切换搜索窗口大小：全局一键把唤出面板在 常规↔放大半屏 之间来回（默认 Ctrl+Alt+E）
+        rzr = QHBoxLayout()
+        rzr.setSpacing(10)
+        self.resize_key = QKeySequenceEdit(QKeySequence(launcher_resize_shortcut()))
+        self.resize_key.setFixedWidth(220)
+        b_rz_clear = QPushButton("清空")
+        b_rz_clear.setObjectName("GhostBtn")
+        b_rz_clear.setToolTip("不配这条：搜索面板大小只能在面板内用鼠标拖拽分栏把手调")
+        b_rz_clear.clicked.connect(self._clear_resize_key)
+        rzr.addWidget(_form_label(RESIZE_LABEL))
+        rzr.addWidget(self.resize_key)
+        rzr.addWidget(b_rz_clear)
+        rzr.addWidget(QLabel("搜索面板开着时一键回小/放大（全局可用）"))
+        rzr.addStretch(1)
+        cv.addLayout(rzr)
+        self.resize_key.editingFinished.connect(self._save_resize_key)
+
+        # 剪贴板默认视图：打开面板/快贴窗时先显示文字还是图片（面板内临时切换不写回这里）
+        cvr = QHBoxLayout()
+        cvr.setSpacing(10)
+        self.combo_clip_view = QComboBox()
+        self.combo_clip_view.addItems(["文字优先", "图片优先", "全部"])
+        _cv = clipboard_default_view()
+        self.combo_clip_view.setCurrentIndex(
+            max(0, ("text", "image", "all").index(_cv)))
+        self.combo_clip_view.setFixedWidth(220)
+        cvr.addWidget(_form_label("剪贴板默认显示"))
+        cvr.addWidget(self.combo_clip_view)
+        cvr.addWidget(QLabel("呼出快贴窗/剪贴板面板时默认展示哪一栏"))
+        cvr.addStretch(1)
+        cv.addLayout(cvr)
+        self.combo_clip_view.currentIndexChanged.connect(self._save_clipboard_view)
 
         self.lbl_hotkey = QLabel()
         self.lbl_hotkey.setWordWrap(True)
@@ -612,6 +716,12 @@ class SettingsPage(QWidget):
         self.sec_blocks = _ExpandSection("素材类别", self.editor_blocks, icon="🎬")
         cv.addWidget(self.sec_blocks)
         self._refresh_blocks()
+
+        self.editor_video_cats = VideoCategoryEditor()
+        self.editor_video_cats.saved.connect(self._on_video_cats_saved)
+        self.sec_video_cats = _ExpandSection("视频类别", self.editor_video_cats, icon="🎬")
+        cv.addWidget(self.sec_video_cats)
+        self._refresh_video_cats()
         lay.addWidget(card)
 
         # ---------- 输出目录：默认隐藏，Alt+W（Mac ⌘+W）口令解锁后才出现（不暴露入口） ----------
@@ -1120,6 +1230,18 @@ class SettingsPage(QWidget):
             page.rebuild_filters()
             page._reload()
 
+    # ---------- 视频类别（成品库侧栏维度：同样展开编辑栏内保存即生效） ----------
+    def _refresh_video_cats(self):
+        self.sec_video_cats.set_summary("、".join(video_categories.load()))
+
+    def _on_video_cats_saved(self):
+        self._refresh_video_cats()
+        self.sec_video_cats.collapse()
+        w = self.window()
+        page = getattr(w, "page_output_lib", None)       # 成品库侧栏「视频类别」树同步新词库
+        if page is not None and hasattr(page, "_reload"):
+            page._reload()
+
     # ---------- 视频预览框大小（存 ui_state，与播放器共享同一个键） ----------
     def _load_preview_scale(self):
         try:
@@ -1181,7 +1303,10 @@ class SettingsPage(QWidget):
         """热键表里的 token 翻成人话：工具名直接用，两个保留位是内部标识"""
         return {LAUNCHER_TOKEN: LAUNCHER_LABEL,
                 HOME_TOKEN: HOME_LABEL,
-                RECORDER_TOKEN: RECORDER_LABEL}.get(token, str(token))
+                RECORDER_TOKEN: RECORDER_LABEL,
+                SCREENSHOT_TOKEN: SCREENSHOT_LABEL,
+                CLIPBOARD_TOKEN: CLIPBOARD_LABEL,
+                RESIZE_TOKEN: RESIZE_LABEL}.get(token, str(token))
 
     def _refresh_hotkey_status(self):
         """如实回报系统热键注册结果。
@@ -1198,6 +1323,12 @@ class SettingsPage(QWidget):
             seqs.append(home_shortcut())
         if recorder_shortcut():
             seqs.append(recorder_shortcut())
+        if screenshot_shortcut():
+            seqs.append(screenshot_shortcut())
+        if clipboard_shortcut():
+            seqs.append(clipboard_shortcut())
+        if launcher_resize_shortcut():
+            seqs.append(launcher_resize_shortcut())
         if not hk.available():
             self._set_hotkey_text("#FF8D19", "⚠ 本机不支持系统级热键（仅 Windows）："
                                              "快捷键只在软件窗口内生效")
@@ -1241,6 +1372,28 @@ class SettingsPage(QWidget):
         self.ck_auto.setChecked(not checked)
         self.ck_auto.blockSignals(False)
         QMessageBox.warning(self, "开机自启", msg or "写入注册表失败")
+
+    def _toggle_shell_menu(self, checked):
+        """右键入库菜单写/删 HKCU 注册表：部分扩展名可能被安全软件拦下，
+        只要有一条没成就如实回退勾选并说明，不能假装全装好让用户右键找不到。"""
+        n, errors = (shell_integration.register() if checked
+                     else shell_integration.unregister())
+        verb = "注册" if checked else "移除"
+        if not errors:
+            QMessageBox.information(
+                self, "右键入库",
+                f"✓ 已{verb} {n} 条右键菜单项。\n"
+                + ("现在右键视频文件即可看到入库选项（资源管理器会即时刷新）。"
+                   if checked else "右键菜单里的入库选项已移除。"))
+            return
+        # 有失败：回退勾选态，把原始错误带回界面
+        if self.ck_shell_import is not None:
+            self.ck_shell_import.blockSignals(True)
+            self.ck_shell_import.setChecked(not checked)
+            self.ck_shell_import.blockSignals(False)
+        QMessageBox.warning(
+            self, "右键入库",
+            f"部分{verb}失败（成功 {n} 条）：\n" + "\n".join(errors[:5]))
 
     def _key_seq_or_hint(self, ed):
         """取输入框里的键位；只按了半截（比如手里只剩修饰键）就当没按完：返回 None。
@@ -1295,6 +1448,46 @@ class SettingsPage(QWidget):
     def _clear_recorder_key(self):
         self.rec_key.clear()
         self._save_recorder_key()
+
+    def _save_screenshot_key(self):
+        """截图键：落盘 + 主窗口立即重注册（同 recorder 口径：半截组合不落盘）。"""
+        seq = self._key_seq_or_hint(self.shot_key)
+        if seq is None:
+            return
+        set_screenshot_shortcut(seq)
+        self._refresh_hotkey_status()
+
+    def _clear_screenshot_key(self):
+        self.shot_key.clear()
+        self._save_screenshot_key()
+
+    def _save_clipboard_key(self):
+        """剪贴板快贴键：落盘 + 主窗口立即重注册（同 screenshot 口径：半截组合不落盘）。"""
+        seq = self._key_seq_or_hint(self.clip_key)
+        if seq is None:
+            return
+        set_clipboard_shortcut(seq)
+        self._refresh_hotkey_status()
+
+    def _clear_clipboard_key(self):
+        self.clip_key.clear()
+        self._save_clipboard_key()
+
+    def _save_resize_key(self):
+        """切换窗口大小键：落盘 + 主窗口立即重注册（同 clipboard 口径：半截组合不落盘）。"""
+        seq = self._key_seq_or_hint(self.resize_key)
+        if seq is None:
+            return
+        set_launcher_resize_shortcut(seq)
+        self._refresh_hotkey_status()
+
+    def _clear_resize_key(self):
+        self.resize_key.clear()
+        self._save_resize_key()
+
+    def _save_clipboard_view(self):
+        """剪贴板默认视图：文字/图片/全部，写偏好即时生效（下次呼出即照此显示）。"""
+        set_default_view(("text", "image", "all")[max(0, self.combo_clip_view.currentIndex())])
 
     # ---------- 鼠标手势：录制 / 绑定 / 解绑 ----------
     def _engine(self):

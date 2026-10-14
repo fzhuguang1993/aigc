@@ -215,13 +215,21 @@ class BreakdownTasksPage(QWidget):
     def _relayout(self):
         w = self._area.viewport().width()
         cols = max(1, (w - 8 + GRID_GAP) // (CARD_W + GRID_GAP))
-        if cols != self._cols:
-            self._cols = cols
+        prev = self._cols
+        self._cols = cols
         while self._grid.count():
             self._grid.takeAt(0)
         for i, card in enumerate(self._cards):
             self._grid.addWidget(card, i // cols, i % cols,
                                  Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        # 尾巴上留一列“吃余量”的空列：不然 QGridLayout 会把多出来的宽度平摊给
+        # 已经用到的每一列：只有 2 张卡就是 2 列，每列各分到半个屏幕，卡片被顶得
+        # 老远（用户报的“隔得太开”，卡片铺满一行时看不出来，所以只在条目少时抽风）。
+        # 余量全给这一列空列，卡片就按 CARD_W 紧挨着靠左排。 stretch 会留在旧下标上，
+        # 所以先把上一轮可能标过的那一段全回 0（列数变小时旧余量列会在右边挖坑）。
+        for c in range(max(prev, cols) + 1):
+            self._grid.setColumnStretch(c, 0)
+        self._grid.setColumnStretch(cols, 1)
         self._grid.setRowStretch(self._grid.rowCount(), 1)
 
     def resizeEvent(self, e):

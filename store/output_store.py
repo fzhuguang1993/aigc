@@ -226,6 +226,9 @@ def iter_outputs(root=None):
     out_meta, marks = _meta_maps()
     binds = binds_map()
     displays = display_map()
+    transcripts = transcript_map()
+    vo_marked = voiceover_marked_map()
+    categories = category_map()
     trash = _norm(trash_root())
     rows = []
     for p in _videos_under(base):
@@ -237,6 +240,7 @@ def iter_outputs(root=None):
         mark = marks.get(key) or (task_mark_from_name(output_mark, p))
         bound = binds.get(key) or ""
         product = bound or meta.get("product", "")
+        tr = transcripts.get(key)
         try:
             st = p.stat()
             mtime = datetime.fromtimestamp(st.st_mtime)
@@ -255,6 +259,16 @@ def iter_outputs(root=None):
             "size": st.st_size if st else 0,
             "created_at": mtime.strftime("%Y-%m-%d %H:%M") if mtime else "",
             "_ts": mtime.timestamp() if mtime else 0,
+            # 口播转写（增量后台 Whisper）：transcribed=库里是否有行（判待识别）；
+            # has_speech=有文本才置 1（驱动 🎙 徽标）；transcript=逐字稿正文（查看用）。
+            "transcribed": tr is not None,
+            "has_speech": 1 if (tr and tr.get("has_speech")
+                                and (tr.get("text") or "").strip()) else 0,
+            "transcript": (tr or {}).get("text", ""),
+            # 口播素材标记（output_voiceover）：只有标了的路径才允许后台跑 ASR。
+            "voiceover_marked": bool(vo_marked.get(key)),
+            # 视频类别（output_categories，手动赋值）：驱动成品库侧栏「视频类别」维度。
+            "category": categories.get(key, ""),
         })
     rows.sort(key=lambda d: d["_ts"], reverse=True)
     return rows
@@ -324,6 +338,9 @@ def _migrate_all_paths(old, new):
     保证元数据始终跟着那条文件走，不会一挪就变孤儿。"""
     migrate_bind(old, new)
     migrate_display(old, new)
+    migrate_transcript(old, new)
+    migrate_voiceover_mark(old, new)
+    migrate_category(old, new)
     from store import task_store
     task_store.move_file_mark(old, new)
     task_store.replace_output_path(old, new)
@@ -435,6 +452,9 @@ def purge(paths):
         key = _norm(raw)
         db.execute("DELETE FROM output_trash WHERE path=?", (key,))
         db.execute("DELETE FROM output_display WHERE path=?", (key,))
+        db.execute("DELETE FROM output_transcripts WHERE path=?", (key,))
+        db.execute("DELETE FROM output_voiceover WHERE path=?", (key,))
+        db.execute("DELETE FROM output_categories WHERE path=?", (key,))
         unbind(raw)
         try:
             task_store.set_file_mark(raw, "")
@@ -497,3 +517,165 @@ def default_display(row):
         return d
     name = row.get("name") or ""
     return Path(name).stem if name else ""
+
+
+# ---------------- 口播逐字稿（增量后台 Whisper） ----------------
+
+def transcript_map():
+    """全部已转写行：归一化路径 → {text, has_speech, model}（供卡片徽标与查看）。"""
+    from store import db
+    out = {}
+    for r in db.query("SELECT path, text, has_speech, model FROM output_transcripts"):
+        out[_norm(r["path"])] = {
+            "text": r["text"] or "",
+            "has_speech": int(r["has_speech"] or 0),
+            "model": r["model"] or "",
+        }
+    return out
+
+
+def get_transcript(path):
+    """取单条逐字稿行（{text, has_speech, model}）；未转写过返回 None。"""
+    from store import db
+    key = _norm(path)
+    rows = db.query("SELECT text, has_speech, model FROM output_transcripts WHERE path=?",
+                    (key,))
+    if not rows:
+        return None
+    r = rows[0]
+    return {"text": r["text"] or "", "has_speech": int(r["has_speech"] or 0),
+            "model": r["model"] or ""}
+
+
+def set_transcript(path, text, has_speech, model=""):
+    """写/覆盖一条逐字稿（path 存归一化绝对路径，与绑定/标记同口径）。"""
+    from store import db
+    db.execute(
+        "INSERT OR REPLACE INTO output_transcripts(path, text, has_speech, model, updated_at) "
+        "VALUES(?,?,?,?,?)",
+        (_norm(path), str(text or ""), 1 if has_speech else 0, str(model or ""), _now()))
+    return True
+
+
+def migrate_transcript(old, new):
+    """文件改名/移动/进回收站：逐字稿跟着路径迁（与 migrate_display 同口径，不跟就丢）。"""
+    from store import db
+    o, n = _norm(old), _norm(new)
+    if not o or o == n:
+        return
+    rows = db.query("SELECT text, has_speech, model FROM output_transcripts WHERE path=?", (o,))
+    if not rows:
+        return
+    db.execute("DELETE FROM output_transcripts WHERE path=?", (o,))
+    for r in rows:
+        db.execute(
+            "INSERT OR REPLACE INTO output_transcripts(path, text, has_speech, model, updated_at) "
+            "VALUES(?,?,?,?,?)",
+            (n, r["text"], r["has_speech"], r["model"], _now()))
+
+
+# ---------------- 口播素材标记（ASR 门控） ----------------
+
+def voiceover_marked_map():
+    """已标记为口播素材的路径集合：归一化路径 → True（output_voiceover 表）。"""
+    from store import db
+    out = {}
+    for r in db.query("SELECT path FROM output_voiceover"):
+        out[_norm(r["path"])] = True
+    return out
+
+
+def voiceover_marked(path):
+    """这条路径是否被标记为口播素材。"""
+    from store import db
+    return bool(db.query("SELECT 1 FROM output_voiceover WHERE path=?",
+                         (_norm(path),)))
+
+
+def mark_voiceover(paths):
+    """批量标记为口播素材（INSERT OR IGNORE，标记先于转写存在）。返回条数。"""
+    from store import db
+    n = 0
+    for raw in [str(x) for x in (paths or []) if str(x or "").strip()]:
+        db.execute("INSERT OR IGNORE INTO output_voiceover(path, updated_at) VALUES(?,?)",
+                   (_norm(raw), _now()))
+        n += 1
+    return n
+
+
+def unmark_voiceover(paths):
+    """取消口播素材标记（只删标记行，不动已转写的逐字稿）。返回条数。"""
+    from store import db
+    n = 0
+    for raw in [str(x) for x in (paths or []) if str(x or "").strip()]:
+        db.execute("DELETE FROM output_voiceover WHERE path=?", (_norm(raw),))
+        n += 1
+    return n
+
+
+def migrate_voiceover_mark(old, new):
+    """文件改名/移动/进回收站：口播标记跟着路径迁（不跟就丢标记）。"""
+    from store import db
+    o, n = _norm(old), _norm(new)
+    if not o or o == n:
+        return
+    rows = db.query("SELECT path FROM output_voiceover WHERE path=?", (o,))
+    if not rows:
+        return
+    db.execute("DELETE FROM output_voiceover WHERE path=?", (o,))
+    db.execute("INSERT OR REPLACE INTO output_voiceover(path, updated_at) VALUES(?,?)",
+               (n, _now()))
+
+
+def clear_transcript(path):
+    """删除一条逐字稿行（清除口播稿；不动口播标记）。"""
+    from store import db
+    db.execute("DELETE FROM output_transcripts WHERE path=?", (_norm(path),))
+    return True
+
+
+# ---------------- 视频类别（成品库侧栏） ----------------
+
+def category_map():
+    """已赋视频类别的路径：归一化路径 → 类别名（output_categories 表，空串不入表）。"""
+    from store import db
+    out = {}
+    for r in db.query("SELECT path, category FROM output_categories"):
+        c = (r["category"] or "").strip()
+        if c:
+            out[_norm(r["path"])] = c
+    return out
+
+
+def get_category(path):
+    """取一条成品的视频类别（无则空串）。"""
+    return category_map().get(_norm(path), "")
+
+
+def set_category(path, category):
+    """给一条成品设视频类别（按路径手动存）；category 为空＝清除分类。"""
+    from store import db
+    key = _norm(path)
+    c = str(category or "").strip()
+    if not c:
+        db.execute("DELETE FROM output_categories WHERE path=?", (key,))
+        return True
+    db.execute("INSERT OR REPLACE INTO output_categories(path, category, updated_at) "
+               "VALUES(?,?,?)", (key, c, _now()))
+    return True
+
+
+def migrate_category(old, new):
+    """文件改名/移动/进回收站：视频类别跟着路径迁（与 migrate_display 同口径）。"""
+    from store import db
+    o, n = _norm(old), _norm(new)
+    if not o or o == n:
+        return
+    rows = db.query("SELECT category FROM output_categories WHERE path=?", (o,))
+    if not rows:
+        return
+    db.execute("DELETE FROM output_categories WHERE path=?", (o,))
+    for r in rows:
+        db.execute(
+            "INSERT OR REPLACE INTO output_categories(path, category, updated_at) VALUES(?,?,?)",
+            (n, r["category"], _now()))

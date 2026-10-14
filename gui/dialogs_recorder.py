@@ -26,8 +26,9 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (Qt, QRect, QSize, QTimer, QEvent, Signal, QThread,
-                            QPropertyAnimation, QFileInfo)
-from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap)
+                            QPropertyAnimation, QFileInfo, QUrl, QMimeData)
+from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QPainter,
+                           QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QDialog, QWidget, QComboBox,
                                QButtonGroup, QHBoxLayout, QVBoxLayout, QLabel,
                                QLineEdit, QPushButton, QMessageBox, QFileDialog,
@@ -47,7 +48,7 @@ from video_text_tools.screen_recorder import (
     IS_WINDOWS, ERR_NOT_WINDOWS, Recorder, build_record_command,
     list_windows, list_audio_devices, is_mix_device, has_wasapi_loopback,
     rect_to_physical, screen_physical, virtual_desktop, get_window_rect,
-    restore_window, probe_audio_level)
+    restore_window, probe_audio_level, convert_mp4_to_gif)
 from gui.theme import tokenize
 from gui.kit import KitButton
 
@@ -1207,6 +1208,26 @@ class LevelProbe(QThread):
 # ====================================================================
 # 录制面板
 # ====================================================================
+class _GifConvertWorker(QThread):
+    """把录好的区域 mp4 转 GIF 的后台线程（不冻 UI）。
+
+    只跑 convert_mp4_to_gif（纯子进程），不碰任何 Qt 对象；结果靠 done 信号回
+    主线程。转换失败时 ok=False，调用方保留原 mp4 让用户至少拿到东西。"""
+
+    done = Signal(bool, str, str)     # (成功, GIF 路径, 错误尾部)
+
+    def __init__(self, ffmpeg, src, dst, fps=15, max_width=480, parent=None):
+        super().__init__(parent)
+        self._ffmpeg, self._src, self._dst = ffmpeg, src, dst
+        self._fps, self._max_width = fps, max_width
+
+    def run(self):
+        ok, err = convert_mp4_to_gif(self._ffmpeg, self._src, self._dst,
+                                     fps=self._fps, max_width=self._max_width)
+        self.done.emit(ok, self._dst if ok else "", err)
+
+
+
 class RecordingPanel(BasePanel):
     """工具中心「屏幕录制」面板。
 
@@ -1224,6 +1245,8 @@ class RecordingPanel(BasePanel):
             return
 
         self._rec = None            # Recorder 实例（录制中非 None）
+        self._gif = False           # 本次录制结束要不要转 GIF（截图「🎞 GIF」联动置真）
+        self._gif_worker = None     # GIF 转换后台线程（持引用防 GC）
         self._bar = None            # RecBar
         self._glow = None           # TargetGlow（录制目标指示框）
         self._poll = QTimer(self)   # 进程存活轮询
@@ -1350,20 +1373,31 @@ class RecordingPanel(BasePanel):
         # ---- 画面坞（帧率 / 码率）----
         pic, v2 = _card("画面", "🎞", tint="#6C5CE7", tint_bg="#EDE9FE", tip=(
             "<b>画面</b><br>"
+            "· 分辨率：选「源屏(所见即所得)」按屏幕原生分辨率录，不降采样、最清晰；"
+            "选 1080p/2K/4K 会按上限缩，也可手输 宽x高（如 2560x1440）。<br>"
             "· 帧率 / 码率越高越清晰，文件也越大。<br>"
-            "· 帧率常用 30，码率 8M 够一般录屏；录高清动态画面可上调。"))
+            "· 2K 屏建议：源屏 + 16M 起；无独显（软编）选高分辨率可能掉帧。"))
         self.cb_fps = QComboBox()
-        self.cb_fps.addItems(["10", "15", "24", "30"])
+        self.cb_fps.addItems(["10", "15", "24", "30", "60"])
         self.cb_fps.setCurrentText("30")
         self.cb_fps.setFixedWidth(80)
         self.cb_br = QComboBox()
         self.cb_br.setEditable(True)
-        self.cb_br.addItems(["2M", "4M", "8M", "16M"])
-        self.cb_br.setCurrentText("8M")
+        self.cb_br.addItems(["4M", "8M", "16M", "24M", "32M"])
+        self.cb_br.setCurrentText("16M")
         self.cb_br.setFixedWidth(90)
+        # 分辨率：默认「源屏」=所见即所得不缩放；可切档或手输 宽x高
+        self.cb_res = QComboBox()
+        self.cb_res.setEditable(True)
+        for _lbl, _d in (("源屏(所见即所得)", "source"), ("720p", "720p"),
+                         ("1080p", "1080p"), ("2K 1440p", "1440p"), ("4K", "4K")):
+            self.cb_res.addItem(_lbl, _d)
+        self.cb_res.setCurrentIndex(0)
+        self.cb_res.setFixedWidth(150)
         fr = _row(_tip("帧率"), self.cb_fps, _tip("视频码率"), self.cb_br)
         fr.addStretch(1)
         v2.addLayout(fr)
+        v2.addLayout(_row(_tip("分辨率"), self.cb_res))
         lcv.addWidget(pic)
 
         # ---- 声音坞（混音器式：声道 + 源切换 + 各路设备/检测）----
@@ -1886,11 +1920,15 @@ class RecordingPanel(BasePanel):
             return None
         name = datetime.now().strftime("录屏_%Y%m%d_%H%M%S.mp4")
         out_path = os.path.join(out_dir, name)
+        # 分辨率：选中项的 data（source/1080p/1440p/4K）；手输非列表项时
+        # currentData 为空，退回文本（宽x高）
+        resolution = self.cb_res.currentData() or self.cb_res.currentText().strip()
         plans = build_record_command(
             ffmpeg, ("window" if idx == 2 else ("region" if idx == 1 else "fullscreen")),
             out_path, fps=self.cb_fps.currentText(), bitrate=self.cb_br.currentText(),
             physical=physical, title=title, audio=self._audio_specs(),
-            channel_mode=self.cb_chan.currentData() or "center")
+            channel_mode=self.cb_chan.currentData() or "center",
+            resolution=resolution)
         return plans
 
     def is_recording(self):
@@ -1903,6 +1941,35 @@ class RecordingPanel(BasePanel):
             self._stop_rec()
         else:
             self._start_rec()
+
+    def start_region_record(self, rect, sys_on=False, mic_on=False, gif=False):
+        """供截图工具栏「录屏」/「🎞 GIF」联动调用：把 rect（全局逻辑矩形）设为录制区域，
+        按需勾上内录/麦克风，然后直接走正常开录。复用面板既有的模式切换/
+        呼吸框/录制状态机，不另搭一套（避免与面板主按钮行为分叉）。
+
+        gif=True：录完不交 MP4、而是把这块区域 mp4 转成 GIF 并复制进剪贴板（表情包），
+        GIF 不需要声音，故强制不内录/麦克风。"""
+        if self._rec is not None or rect is None or rect.isEmpty():
+            return                       # 已在录 / 选区无效：不打断现有录制
+        self._gif = bool(gif)
+        # 切到「框选区域」模式（程序化 setChecked 不触发 idClicked，手动补 _mode_changed）
+        btns = self._mode_group.buttons()
+        if len(btns) > 1:
+            btns[1].setChecked(True)
+        self._mode_changed(1)
+        self._region = rect
+        self.lbl_region.setText(
+            f"已选 {rect.width()}×{rect.height()} @ ({rect.x()}, {rect.y()})")
+        self._get_glow().show_rect(rect)
+        self._update_stage()
+        # 声音：buttonToggled 会自动联动「不录音」互斥，直接置勾即可（无设备则跳过）
+        # GIF 不要声音（也不建旁路 WAV），sys/mic 一律不勾
+        if not self._gif:
+            if sys_on and self.chip_a_sys.isEnabled():
+                self.chip_a_sys.setChecked(True)
+            if mic_on and self.chip_a_mic.isEnabled():
+                self.chip_a_mic.setChecked(True)
+        self._start_rec()
 
     def _start_rec(self):
         if self._rec is not None:
@@ -2002,6 +2069,12 @@ class RecordingPanel(BasePanel):
         if err:
             self._append_log(f"❌ {err}")
             QMessageBox.warning(self, "录制异常", err)
+            self._gif = False
+            return
+        # GIF 模式：不交 MP4、不入库、不跑字幕，改走「转 GIF → 复制进剪贴板」。
+        if self._gif:
+            self._gif = False
+            self._finish_gif(secs)
             return
         size = os.path.getsize(self._out_path) if os.path.isfile(self._out_path) else 0
         self._append_log(f"🎉 录制完成：{self._out_path}（{_fmt_secs(secs)}，"
@@ -2014,6 +2087,69 @@ class RecordingPanel(BasePanel):
         # 勾选了“录完顺带生成字幕”：对刚产出的 mp4 走字幕模块（旁路 WAV 自动拾取）
         if self.ck_subtitle.isChecked():
             self._maybe_subtitle()
+
+    # ----------------------------------------------------------------
+    # 区域录屏→GIF（截图「🎞 GIF」联动：偷/录表情包）
+    # ----------------------------------------------------------------
+    def _finish_gif(self, secs):
+        """区域录完后的 GIF 收尾：开后台线程把 self._out_path 的 mp4 转 GIF。
+
+        GIF 不需要字幕/入库，转成后把临时 mp4 删掉（只删我们刚生的那一个），
+        产物只剩 GIF。15fps / 最长边 480 是体积地板（表情包图轻）。"""
+        src = self._out_path
+        if not src or not os.path.isfile(src):
+            self._append_log("⚠ 找不到录制成品，无法转 GIF")
+            return
+        ffmpeg = _ffmpeg_usable()
+        if not ffmpeg:
+            self._append_log("❌ 缺 ffmpeg，无法转 GIF")
+            QMessageBox.warning(self, "缺少 ffmpeg", "转 GIF 需要 ffmpeg.exe（与录屏同一依赖）。")
+            return
+        dst = os.path.splitext(src)[0] + ".gif"
+        self._append_log("🎞 正在转 GIF…")
+        self._gif_src = src
+        self._gif_worker = _GifConvertWorker(ffmpeg, src, dst)
+        self._gif_worker.done.connect(self._on_gif_done)
+        self._gif_worker.start()
+
+    def _on_gif_done(self, ok, gif_path, err):
+        """GIF 转换回主线程：成就复制+定位，失败就退回保留 mp4。
+
+        成功：删临时 mp4（旁路 WAV 已由 Recorder 处理）→ GIF 以“文件”形式进
+        剪贴板（微信/QQ 直接粘贴即发表情包）→ 弹目录。失败：把 mp4 交回用户。"""
+        src = getattr(self, "_gif_src", "")
+        self._gif_worker = None
+        if not ok:
+            self._append_log(f"❌ 转 GIF 失败：{err or '未知错误'}（已保留原视频）")
+            QMessageBox.warning(self, "转 GIF 失败",
+                                f"未能把录制转成 GIF：{err or '未知错误'}\n\n已保留原视频。")
+            if src and os.path.isfile(src):
+                reveal_in_folder(src)
+            return
+        size = os.path.getsize(gif_path) if os.path.isfile(gif_path) else 0
+        # 删掉只作为中转的 mp4（仅删我们刚生的那一个），产物只留 GIF
+        if src and os.path.isfile(src):
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+        self._copy_gif_to_clipboard(gif_path)
+        self._append_log(f"🎉 GIF 完成：{gif_path}（{size / 1024:.0f} KB）已复制，可直接粘贴到聊天")
+        reveal_in_folder(gif_path)
+        if getattr(self, "library", None) is not None:
+            self.library.reload()
+
+    def _copy_gif_to_clipboard(self, path):
+        """把 GIF 以“文件”形式放进系统剪贴板（等同资探里 Ctrl+C 一个文件）。
+
+        微信/QQ/钉钉粘文件会直接当表情包发送；而不像单帧 image 那样丢动画。
+        失败静默（不影响已落盘的 GIF）。"""
+        try:
+            md = QMimeData()
+            md.setUrls([QUrl.fromLocalFile(path)])
+            QApplication.clipboard().setMimeData(md)
+        except Exception:
+            pass
 
     # ----------------------------------------------------------------
     # 录屏字幕（复用 gui/dialogs_subtitle：选项框 + 后台 run_subtitle）

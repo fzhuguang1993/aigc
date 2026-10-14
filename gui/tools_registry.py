@@ -33,6 +33,9 @@ TOOLS = [
     ("语音识别", "🎙", "选视频→Whisper 转口播逐字稿，导出 TXT/SRT 字幕、DeepSeek 纠错、可烧录", "语音识别"),
     ("爆款拆解", "🔥", "粘贴爆款链接：拆分镜/口播，产出画面/文案/复刻 3 类提示词与整体分析", "爆款拆解"),
     ("一键发布", "🚀", "选成品视频与平台账号，一键分发到抖音/快手/小红书/视频号", "一键发布"),
+    ("截图", "✂️", "区域/全屏/窗口截图：框线·箭头·直线·画笔·文字·马赛克标注（字号/颜色/粗细可调），可钉住悬浮/复制/保存", "截图"),
+    ("剪贴板历史", "📋", "后台自动记录复制过的文字与图片，分类回看、一键复制回剪贴板", "剪贴板历史"),
+    ("软件卸载清理", "🧹", "检测已装软件，卸载并清理注册表/文件残留（逐条确认，可恢复）", "软件卸载清理"),
     ("素材瘦身", "🗜", "把参考图批量压缩到接口要求的大小，避免上传失败", None),
     ("文案查重", "🔍", "提示词相似度检查，防止一批任务生成的视频互相雷同", None),
 ]
@@ -65,8 +68,33 @@ RECORDER_TOKEN = "__recorder__"
 RECORDER_DEFAULT = "Ctrl+Alt+R"
 RECORDER_LABEL = "录屏开/停"
 
+# ---------- 截图（全局一键抓图：默认 Ctrl+Alt+A，直接进区域框选） ----------
+SCREENSHOT_KEY = "screenshot_hotkey"
+SCREENSHOT_TOKEN = "__screenshot__"
+SCREENSHOT_DEFAULT = "Ctrl+Alt+A"
+SCREENSHOT_LABEL = "截图"
+
+# ---------- 剪贴板快贴（全局呼出 Ditto 式悬浮窗：默认 Ctrl+` 反引号） ----------
+CLIPBOARD_KEY = "clipboard_hotkey"
+CLIPBOARD_TOKEN = "__clipboard__"
+CLIPBOARD_DEFAULT = "Ctrl+`"
+CLIPBOARD_LABEL = "剪贴板快贴"
+
+# ---------- 唤出面板「切换窗口大小」（搜索面板在 常规↔放大半屏 之间来回） ----------
+#: 默认 Ctrl+Alt+E（E=Esize/Expand）：与唤出(Ctrl+Alt+Space)/录屏(R)/截图(A) 不撞车
+RESIZE_KEY = "launcher_resize_hotkey"
+RESIZE_TOKEN = "__launcher_resize__"
+RESIZE_DEFAULT = "Ctrl+Alt+E"
+RESIZE_LABEL = "切换搜索窗口大小"
+
+# ---------- QuickLook 式空格预览（全局：在资源管理器/桌面选中文件按空格弹预览浮层） ----------
+#: 默认开：用户点名要“软件开着就能空格预览”。裸空格只在“前台是文件列表”时截，
+#: 地址栏/搜索框那种打字场景一律放行（见 gui/quicklook.py 的前台判定）。
+QUICKLOOK_KEY = "quicklook_enabled"
+
 #: 参与热键表的保留 token：主窗口清理陈旧键位时要绕过它们
-RESERVED_TOKENS = frozenset({LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN})
+RESERVED_TOKENS = frozenset({LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN,
+                             SCREENSHOT_TOKEN, CLIPBOARD_TOKEN, RESIZE_TOKEN})
 
 
 def load_pinned():
@@ -100,6 +128,22 @@ def set_global_hotkey_enabled(on):
         w.apply_tool_shortcuts()          # 开关一拨，立即重注册/释放系统热键
 
 
+def quicklook_enabled():
+    """全局 QuickLook 是否接管空格（默认开）。"""
+    return bool(app_state.get(QUICKLOOK_KEY, True))
+
+
+def set_quicklook_enabled(on):
+    """写盘 + 立即挂/摘全局键盘钩子（无需重启）。懒 import quicklook：
+    它拽着预览引擎与 Qt 控件，不该在数据层模块顶层就拖进来。"""
+    app_state.set_value(QUICKLOOK_KEY, bool(on))
+    try:
+        from gui import quicklook
+        quicklook.manager.start() if on else quicklook.manager.stop()
+    except Exception:
+        pass
+
+
 def launcher_shortcut():
     return str(app_state.get(LAUNCHER_KEY, LAUNCHER_DEFAULT) or "")
 
@@ -125,6 +169,46 @@ def set_recorder_shortcut(seq):
     return seq
 
 
+def screenshot_shortcut():
+    return str(app_state.get(SCREENSHOT_KEY, SCREENSHOT_DEFAULT) or "")
+
+
+def set_screenshot_shortcut(seq):
+    """截图全局键：写盘 + 主窗口立即重注册（同 recorder 口径）。"""
+    seq = (seq or "").strip()
+    _free_others(seq, SCREENSHOT_KEY)
+    app_state.set_value(SCREENSHOT_KEY, seq)
+    _reapply()
+    return seq
+
+
+def clipboard_shortcut():
+    return str(app_state.get(CLIPBOARD_KEY, CLIPBOARD_DEFAULT) or "")
+
+
+def set_clipboard_shortcut(seq):
+    """剪贴板快贴全局键：写盘 + 主窗口立即重注册（同 screenshot 口径）。"""
+    seq = (seq or "").strip()
+    _free_others(seq, CLIPBOARD_KEY)
+    app_state.set_value(CLIPBOARD_KEY, seq)
+    _reapply()
+    return seq
+
+
+def launcher_resize_shortcut():
+    """唤出面板「切换窗口大小」全局键（默认 Ctrl+Alt+E）。"""
+    return str(app_state.get(RESIZE_KEY, RESIZE_DEFAULT) or "")
+
+
+def set_launcher_resize_shortcut(seq):
+    """切换窗口大小键：写盘 + 主窗口立即重注册（同 clipboard 口径）。"""
+    seq = (seq or "").strip()
+    _free_others(seq, RESIZE_KEY)
+    app_state.set_value(RESIZE_KEY, seq)
+    _reapply()
+    return seq
+
+
 def home_shortcut():
     return str(app_state.get(HOME_KEY, HOME_DEFAULT) or "")
 
@@ -146,12 +230,14 @@ def _free_others(seq, keep):
     却是唤出面板”，而界面上一堆 ✓ 看着全都对。"""
     if not seq:
         return
-    for key in (LAUNCHER_KEY, HOME_KEY, RECORDER_KEY):
+    for key in (LAUNCHER_KEY, HOME_KEY, RECORDER_KEY, SCREENSHOT_KEY,
+                CLIPBOARD_KEY, RESIZE_KEY):
         if key == keep:
             continue
         if str(app_state.get(key) or "") == seq:
             app_state.set_value(key, "")
-    if keep in (LAUNCHER_KEY, HOME_KEY, RECORDER_KEY):
+    if keep in (LAUNCHER_KEY, HOME_KEY, RECORDER_KEY, SCREENSHOT_KEY,
+                CLIPBOARD_KEY, RESIZE_KEY):
         scs = tool_shortcuts()
         gone = [k for k, v in scs.items() if v == seq]
         if gone:
@@ -169,7 +255,9 @@ def _reapply():
     if w is None:
         return
     for m in ("apply_tool_shortcuts", "apply_launcher_shortcut",
-              "apply_home_shortcut", "apply_recorder_shortcut"):
+              "apply_home_shortcut", "apply_recorder_shortcut",
+              "apply_screenshot_shortcut", "apply_clipboard_shortcut",
+              "apply_launcher_resize_shortcut"):
         fn = getattr(w, m, None)
         if fn is not None:
             fn()

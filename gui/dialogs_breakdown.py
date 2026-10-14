@@ -107,7 +107,14 @@ class BreakdownPanel(BasePanel):
         self.dsb_fps.setValue(_bd["fps"])
         self.dsb_fps.setSuffix(" fps")
         self.dsb_fps.setToolTip("模型内部抽帧频率：越高越细致但 token 越贵；短视频拆解推荐 0.3~1.0")
-        self.ed_out = QLineEdit(str(Path.home() / "Downloads" / "爆款拆解"))
+        # 原片默认存到「成品库/爆款拆解原片」：成品库按目录递归扫描（scan_root=output_root），
+        # 视频落进该根下即自动进成品库，无需额外索引；pipeline 有 out_dir 时保留视频只清 _frames。
+        try:
+            from store import output_store
+            _bd_default = str(Path(output_store.output_root()) / "爆款拆解原片")
+        except Exception:
+            _bd_default = str(Path.home() / "Downloads" / "爆款拆解")
+        self.ed_out = QLineEdit(_bd_default)
         b_pick = QPushButton("浏览…")
         b_pick.setObjectName("GhostBtn")
         b_pick.clicked.connect(self._pick_out)

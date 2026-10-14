@@ -224,7 +224,7 @@ def test_build_mux_single_audio_and_empty():
 
 
 def test_build_command_uses_nvenc_when_probe_succeeds():
-    """探测到 NVENC 可用 → 编码器分支切到 h264_nvenc p1/ll（不吃 CPU）"""
+    """探测到 NVENC 可用 → 编码器切到 h264_nvenc p5/hq（画质优先，不吃 CPU）"""
     from video_text_tools.screen_recorder import _HW_ENC_CACHE
     # 直接塞缓存，绕过实际 subprocess 探测（测试环境无 ffmpeg）
     _HW_ENC_CACHE["ffmpeg.exe"] = "h264_nvenc"
@@ -232,11 +232,32 @@ def test_build_command_uses_nvenc_when_probe_succeeds():
         plans = build_record_command("ffmpeg.exe", "fullscreen", "a.mp4",
                                      fps=30, bitrate="4M")
         s = _seg(plans[0][0])
-        assert "-c:v h264_nvenc -preset p1 -tune ll -b:v 4M" in s
+        assert "-c:v h264_nvenc -preset p5 -tune hq -b:v 4M" in s
         assert "-pix_fmt nv12" in s
         assert "libx264" not in s and "zerolatency" not in s
+        # 硬编保留到 ≤1440p（2K 屏不降采样），而非软编的 1080p 限幅
+        assert "min(2560,iw)" in s and "min(1440,ih)" in s
     finally:
         _HW_ENC_CACHE.pop("ffmpeg.exe", None)
+
+
+def test_resolution_source_means_no_downscale():
+    """resolution='source'/源屏 → 只取偶不缩放（所见即所得），不受软硬编上限约束"""
+    for r in ("source", "源屏", "原生"):
+        s = _seg(build_record_command("f", "fullscreen", "a.mp4", resolution=r)[0][0])
+        assert "scale=trunc(iw/2)*2:trunc(ih/2)*2" in s
+        assert "min(1920,iw)" not in s and "min(2560,iw)" not in s
+
+
+def test_resolution_preset_and_custom_cap():
+    """预设档按上限缩；自定义 宽x高 亦可；认不出的值退回自动口径"""
+    s = _seg(build_record_command("f", "fullscreen", "a.mp4", resolution="1080p")[0][0])
+    assert "min(1920,iw)" in s and "min(1080,ih)" in s
+    s = _seg(build_record_command("f", "fullscreen", "a.mp4", resolution="2560x1440")[0][0])
+    assert "min(2560,iw)" in s and "min(1440,ih)" in s
+    # 非法值 → 退回自动（无 source 滤镜、也不是自定义上限）
+    s = _seg(build_record_command("f", "fullscreen", "a.mp4", resolution="乱填")[0][0])
+    assert "scale=" in s and "trunc(iw/2)*2" not in s
 
 
 def test_build_command_falls_back_to_libx264_when_probe_says_no():
@@ -248,6 +269,8 @@ def test_build_command_falls_back_to_libx264_when_probe_says_no():
         s = _seg(plans[0][0])
         assert "-c:v libx264 -preset veryfast -tune zerolatency" in s
         assert "h264_nvenc" not in s
+        # 软编走 1080p 限幅（保流畅），不放到 1440p
+        assert "min(1920,iw)" in s and "min(2560,iw)" not in s
     finally:
         _HW_ENC_CACHE.pop("ffmpeg.exe", None)
 

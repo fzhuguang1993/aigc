@@ -95,6 +95,17 @@ def get(clip_id):
     return rows[0] if rows else None
 
 
+def find_by_path(path):
+    """按归一化绝对路径查现有索引行（下载原片入库去重用，防重跑堆脏行）。"""
+    want = _norm(path)
+    if not want:
+        return None
+    for r in db.query("SELECT id, path FROM material_clips"):
+        if _norm(r["path"]) == want:
+            return r
+    return None
+
+
 def distinct_types():
     """已入库的全部板块类型（去重、非空），供筛选下拉。"""
     rows = db.query("SELECT DISTINCT block_type FROM material_clips "
@@ -130,6 +141,54 @@ def set_products(clip_ids, product):
         if cur is None:
             continue
         db.execute("UPDATE material_clips SET product=? WHERE id=?", (name, int(cid)))
+        n += 1
+    return n
+
+
+def set_block_types(clip_ids, block_type):
+    """批量设置素材片段的板块类型（material_clips.block_type 列）。
+
+    block_type 传空 = 清空（变未分类）。返回受影响行数。"""
+    bt = str(block_type or "").strip()
+    n = 0
+    for cid in (clip_ids or []):
+        if get(cid) is None:
+            continue
+        db.execute("UPDATE material_clips SET block_type=? WHERE id=?", (bt, int(cid)))
+        n += 1
+    return n
+
+
+def set_voiceover(clip_ids, flag=True):
+    """批量设置/取消「口播素材」标记（material_clips.is_voiceover 列）。
+
+    flag=True 标记，False 取消。只有标了的片段才会被后台 ASR 转写出口播逐字稿
+    （ASR 有时把环境音误识别成口播，故门控）。返回受影响行数。"""
+    val = 1 if flag else 0
+    n = 0
+    for cid in (clip_ids or []):
+        if get(cid) is None:
+            continue
+        db.execute("UPDATE material_clips SET is_voiceover=? WHERE id=?", (val, int(cid)))
+        n += 1
+    return n
+
+
+def set_clip_transcript(clip_id, text, has_speech, model=""):
+    """写一条素材片段的逐字稿（转写完成）：置 transcript、记 has_speech、transcribed=1。"""
+    db.execute("UPDATE material_clips SET transcript=?, has_speech=?, transcribed=1 "
+               "WHERE id=?",
+               (str(text or ""), 1 if has_speech else 0, int(clip_id)))
+
+
+def clear_clip_transcript(clip_ids):
+    """清除逐字稿（保留口播标记，只清文字与转写状态）。返回受影响行数。"""
+    n = 0
+    for cid in (clip_ids or []):
+        if get(cid) is None:
+            continue
+        db.execute("UPDATE material_clips SET transcript='', has_speech=0, transcribed=0 "
+                   "WHERE id=?", (int(cid),))
         n += 1
     return n
 

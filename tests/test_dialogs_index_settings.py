@@ -95,3 +95,37 @@ def test_reindex_reports_when_feature_disabled(monkeypatch, fake_drives):
     ok = dlg._reindex_roots(["C:\\"])
     assert ok is False
     assert "启用" in dlg.lbl_status.text()
+
+
+def test_docs_reindex_has_an_entry_per_drive_and_for_selection(monkeypatch,
+                                                                fake_drives):
+    """“按盘抽文档”以前全程没有入口：行上与底部各一个钮，点了都只该
+    把请求塞进定向队列，不在界面上抽。"""
+    calls = []
+    monkeypatch.setattr(file_watcher, "reindex_docs",
+                        lambda roots=None: calls.append(("docs", list(roots or []))) or True)
+    monkeypatch.setattr(file_watcher, "reindex_roots",
+                        lambda roots: calls.append(("scan", list(roots))) or True)
+    dlg = IndexSettingsDialog()
+    assert dlg._rows["C:\\"].btn_docs.isEnabled()
+    dlg._rows["C:\\"].btn_docs.click()
+    dlg.btn_docs.click()                          # 底部：按同一份勾选范围（默认全选）
+    assert calls[0] == ("docs", ["C:\\"])
+    assert calls[1] == ("docs", ["C:\\", "D:\\"])
+    dlg._rows["D:\\"].btn.click()                    # “重扫此盘”仍旧只走文件名那一档
+    assert ("scan", ["D:\\"]) in calls
+
+
+def test_docs_reindex_is_blocked_when_body_index_is_off(monkeypatch, fake_drives):
+    """正文索引开关关着时点它等于点了个寂寞（后台那一档会直接跳过）：
+    先拦住并说清楚去哪儿开，比“已提交，后台进行中…”后面什么也没发生好。"""
+    hit = []
+    monkeypatch.setattr(file_watcher, "reindex_docs",
+                        lambda roots=None: hit.append(1) or True)
+    monkeypatch.setattr(fileindex, "doc_enabled", lambda: False)
+    dlg = IndexSettingsDialog()
+    assert not dlg.btn_docs.isEnabled()                  # 底部按钮灰掉
+    assert not dlg._rows["C:\\"].btn_docs.isEnabled()     # 行上也是
+    assert dlg._reindex_docs(["C:\\"]) is False
+    assert hit == []
+    assert "文档正文索引" in dlg.lbl_status.text()

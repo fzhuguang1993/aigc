@@ -49,7 +49,9 @@ from gui.launcher_preview import DocCard, PreviewPane, img_worker
 from store import app_state
 
 #: 双栏面板尺寸：默认可观大且可自由拉伸（旧的固定 560x420 把结果框压成一条）
-_DFT_W, _DFT_H = 1120, 680
+#: 高度从 680 下调到 560：笔记本（如 1366x768）上 680 会把面板顶出屏幕下沿，
+#: 看着就是“太靠下、太高”；560 仍远高于下限 520，双栏够用。
+_DFT_W, _DFT_H = 1120, 560
 _MIN_W, _MIN_H = 820, 520
 #: 左列名义宽度：还没排版时 _FlowHost 问不到自身宽度，用它兜底换行
 _LEFT_W = 520
@@ -63,6 +65,8 @@ _VIEWS = ("list", "medium", "large")
 _ICON = {"medium": (64, 132), "large": (120, 170)}
 #: 判定“同一行”的 y 容差：FlowLayout 里同一行 y 相同，留点余量防四舍五入
 _ROW_GAP = 8
+#: 底部快捷键提示行的字间距（_fit_tip 算“还能放下几对提示”时要用同一个值）
+_TIP_GAP = 8
 #: 本地文件/文档内容各取多少行：面板已加高且交给滚动条浏览，可以多给一些，
 #: 真要找特定的文件会继续打字缩小范围
 _MAX_FILE_ROWS = 60
@@ -86,6 +90,23 @@ _HAIRLINE = "rgba(255, 255, 255, 0.10)"
 #: 搜索框里接管的四个方向键：(键, 横向步进, 纵向步进)
 _STEP_KEYS = ((Qt.Key.Key_Left, -1, 0), (Qt.Key.Key_Right, 1, 0),
               (Qt.Key.Key_Up, 0, -1), (Qt.Key.Key_Down, 0, 1))
+
+#: 预览的三态，鼠标停在预览区按空格就是在这三者里循环：
+#: normal＝常规双栏；right/left＝预览贴到屏幕的那一半，和 Win+→ / Win+← 抢半屏一个效果
+#: （用户点名要的就是这个贴边半屏，不是“整窗铺满屏再对半切”——那会把左列也撑到
+#: 半屏宽，看上去就是全屏，他明确不要）。
+#: 贴边只钉预览那一栏：左列保持用户原来那个宽度，所以整窗会比半屏宽一点，
+#: 多出来的一截伸到另一半屏上——预览的内外边界都对齐屏幕，这才叫“吸过去”。
+_PREVIEW_MODES = ("normal", "right", "left")
+#: 放大态预览区占可用屏宽的比例：0.5 就是系统贴边（Aero Snap）分的那一半
+_PREVIEW_HALF_RATIO = 0.5
+#: 屏不够宽时允许从左列借走的最低宽度：再窄文件名就没法看了
+_LEFT_MIN_W = 360
+#: 预览的硬下限：半屏算出来比这还窄（超窄屏/竖屏）时用它，防“收成一条缝”
+_PREVIEW_FLOOR_W = 420
+#: 搜索历史存几条、存哪个偏好键（记录口径：真去用了某个结果、或带着关键词关了面板）
+_HISTORY_MAX = 20
+_HISTORY_KEY = "launcher_history"
 
 #: 入口卡外观。走 objectName 选择器，避免被应用级样式表里的 QPushButton/QLabel 盖掉；
 #: 选中态用动态属性 cur，改属性后要 repolish 才会重新取值（Qt 样式表不监听属性变化）。
@@ -146,6 +167,36 @@ def locate(rows, index):
 def key_display(seq):
     """键位串照原样展示，只把 Qt 的 Meta 换回用户说的 Win"""
     return str(seq or "").replace("Meta+", "Win+")
+
+
+def push_history(items, text, limit=_HISTORY_MAX):
+    """把关键词记进历史：最新在前、同词只留一条、总数封顶。
+    返回新列表，不改传入的那份（偏好层拿到的可能是同一个引用，就地改会骗人）。"""
+    q = str(text or "").strip()
+    out = [str(x).strip() for x in (items or []) if str(x or "").strip()]
+    if not q:
+        return out
+    out = [q] + [x for x in out if x != q]
+    return out[:max(int(limit), 1)]
+
+
+def remove_history(items, text):
+    """从历史里剔掉某一条（单删）；传空就是原样返回。"""
+    q = str(text or "").strip()
+    return [str(x).strip() for x in (items or [])
+            if str(x or "").strip() and str(x).strip() != q]
+
+
+def load_history():
+    """读搜索历史偏好：不是列表（旧版本存过串/根本没存）一律当没历史。"""
+    raw = app_state.get(_HISTORY_KEY)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(x).strip() for x in raw if str(x or "").strip()]
+
+
+def save_history(items):
+    app_state.set_value(_HISTORY_KEY, list(items or []))
 
 
 def _repolish(widget):
@@ -512,6 +563,205 @@ class _FlowHost(QWidget):
         return QSize(w, max(self.flow.heightForWidth(w), 80))
 
 
+#: 历史条目的外观：与文件行同一套“选中靠主色描边”，但多一个 ✕ 单删
+_HIS_QSS = """
+QWidget#LHis { background:rgba(20, 24, 30, 0.98);
+               border:1px solid rgba(255, 255, 255, 0.14); border-radius:10px; }
+QFrame#LHisRow { background:transparent; border:1px solid transparent; border-radius:6px; }
+QFrame#LHisRow:hover { background:rgba(255, 255, 255, 0.08); }
+QFrame#LHisRow[cur="1"] { border-color:#3370FF; background:rgba(51, 112, 255, 0.18); }
+QToolButton#LHisBtn { color:#9AA4B0; background:transparent; border:none;
+               border-radius:5px; padding:1px 7px; font-size:12px; }
+QToolButton#LHisBtn:hover { background:rgba(255, 255, 255, 0.10); color:#E8EAED; }
+QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; border:none; }
+"""
+
+_HIS_ROW_H = 28                    # 一行历史高（与 ✕ 按钮的点击区域同源）
+_HIS_MAX_SHOW = 8                  # 超出走滚动条：面板总共就这么高
+
+
+class _HistoryRow(QFrame):
+    """历史里的一条：左边关键词、右边 ✕（只删这一条）。单击这一行＝用这个词。"""
+
+    picked = Signal(str)
+    deleted = Signal(str)
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.text = str(text or "")
+        self.setObjectName("LHisRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFixedHeight(_HIS_ROW_H)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(8, 1, 4, 1)
+        h.setSpacing(4)
+        lb = QLabel("🕘 %s" % _cut(self.text, 42))
+        lb.setStyleSheet(tokenize(
+            "color:%s; font-size:13px; background:transparent;" % _TEXT))
+        lb.setToolTip(self.text)
+        h.addWidget(lb, 1)
+        btn = QToolButton(self)
+        btn.setText("✕")
+        btn.setObjectName("LHisBtn")
+        btn.setToolTip("删除这条历史")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn.clicked.connect(lambda _=False: self.deleted.emit(self.text))
+        h.addWidget(btn)
+
+    def set_current(self, on):
+        self.setProperty("cur", "1" if on else "")
+        _repolish(self)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.picked.emit(self.text)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+
+class _HistoryPanel(QWidget):
+    """点击搜索框时展开的搜索历史层。
+
+    做成面板内部的子控件（而不是顶层 Popup）是有原因的：这个窗口本身就是
+    FramelessWindowHint | Tool | StaysOnTop，再弹一个顶层小窗会把激活抢过去，
+    LauncherDialog.changeEvent 收到“失焦”就把整块面板收起来——一点历史就“整个面板
+    消失”，比不做这个功能还糟。贴在输入框底下当一个浮层，既不影响激活状态，
+    也不把背面的结果列表删掉（它只是被盖住）。
+
+    交互：单击一行＝用这个词重新搜；行尾 ✕＝单删；顶上「清空」＝批量删；
+    ↑↓ 选、Enter 用、Delete 删当前这条、Esc 收。"""
+
+    picked = Signal(str)
+    deleted = Signal(str)
+    clear_requested = Signal()
+    close_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("LHis")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(tokenize(_HIS_QSS))
+        self._rows = []
+        self._cur = -1
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 6, 8, 8)
+        v.setSpacing(4)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        title = QLabel("🗂 搜索历史")
+        title.setStyleSheet(tokenize(
+            "color:%s; font-size:12px; font-weight:600; background:transparent;" % _WEAK))
+        head.addWidget(title)
+        head.addStretch(1)
+        self.btn_clear = QToolButton(self)
+        self.btn_clear.setText("🗑 清空")
+        self.btn_clear.setObjectName("LHisBtn")
+        self.btn_clear.setToolTip("批量删除：清空全部搜索历史")
+        self.btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear.clicked.connect(self.clear_requested)
+        head.addWidget(self.btn_clear)
+        btn_x = QToolButton(self)
+        btn_x.setText("✕")
+        btn_x.setObjectName("LHisBtn")
+        btn_x.setToolTip("收起历史（Esc）")
+        btn_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_x.clicked.connect(self.close_requested)
+        head.addWidget(btn_x)
+        v.addLayout(head)
+        self._list_host = QWidget(self)
+        self._list_lay = QVBoxLayout(self._list_host)
+        self._list_lay.setContentsMargins(0, 0, 0, 0)
+        self._list_lay.setSpacing(1)
+        self._area = QScrollArea(self)
+        self._area.setFrameShape(QFrame.Shape.NoFrame)
+        self._area.setWidgetResizable(True)
+        self._area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._area.setStyleSheet(tokenize(
+            "QScrollArea { background:transparent; border:none; }"
+            "QScrollArea > QWidget > QWidget { background:transparent; }"))
+        self._area.setWidget(self._list_host)
+        v.addWidget(self._area, 1)
+        self.setVisible(False)
+
+    # ---------- 内容 ----------
+    def rebuild(self, items):
+        """按 items 重画条目（先拆干净，_rows 与行控件必须一一对应）。"""
+        for w in self._rows:
+            w.setParent(None)
+            w.deleteLater()
+        self._rows = []
+        for text in items or []:
+            row = _HistoryRow(text, self._list_host)
+            row.picked.connect(self.picked)
+            row.deleted.connect(self._on_row_deleted)
+            self._list_lay.addWidget(row)
+            self._rows.append(row)
+        self._cur = 0 if self._rows else -1
+        self._paint_cur()
+        return len(self._rows)
+
+    def count(self):
+        return len(self._rows)
+
+    def natural_height(self):
+        """该面板自己要多高：条目没满 _HIS_MAX_SHOW 行就不占多余空间。"""
+        n = min(len(self._rows), _HIS_MAX_SHOW)
+        return 42 + n * (_HIS_ROW_H + 1)
+
+    # ---------- 选中 ----------
+    def current_text(self):
+        if 0 <= self._cur < len(self._rows):
+            return self._rows[self._cur].text
+        return ""
+
+    def step(self, delta):
+        if not self._rows:
+            return False
+        self._cur = max(0, min(len(self._rows) - 1, self._cur + delta))
+        self._paint_cur()
+        return True
+
+    def set_current_text(self, text):
+        """把选中对齐到某条（测试与“回到第一条”用）。"""
+        for i, w in enumerate(self._rows):
+            if w.text == str(text or ""):
+                self._cur = i
+                self._paint_cur()
+                return True
+        return False
+
+    def _paint_cur(self):
+        for i, w in enumerate(self._rows):
+            w.set_current(i == self._cur)
+
+    def pick_current(self):
+        """Enter：把选中的那条交回面板去填进输入框。"""
+        text = self.current_text()
+        if text:
+            self.picked.emit(text)
+            return True
+        return False
+
+    def delete_current(self):
+        """Delete：删当前这条（不靠鼠标也能清）。"""
+        text = self.current_text()
+        if text:
+            self._on_row_deleted(text)
+            return True
+        return False
+
+    def _on_row_deleted(self, text):
+        self.deleted.emit(str(text or ""))
+
+    def visible_rows(self):
+        """当前条目文本（按排列顺序）：测试与“删完重建”用。"""
+        return [w.text for w in self._rows]
+
+
 class LauncherDialog(QDialog):
     """工具 + 本地文件 + 文档内容的唤出面板。on_open(name) 由主窗口传入
     （与卡片点击共用 open_tool）；文件/文档两个段直接走 utils.desktop_utils。"""
@@ -631,10 +881,15 @@ class LauncherDialog(QDialog):
         self._area_viewport = area.viewport()
         self._area_viewport.installEventFilter(self)
 
+        # 底部快捷键提示行：装饰的东西，左列窄下来就按优先级从右边收起（见 _fit_tip）。
+        # 它绝不能参与决定左列的最小宽度：5 对提示 + 2 个按钮的横排会把左列的
+        # minimumSizeHint 顶到 800+，“放大预览时左列不动”就根本做不到。
         tip = QHBoxLayout()
-        tip.setSpacing(8)
+        tip.setContentsMargins(0, 0, 0, 0)
+        tip.setSpacing(_TIP_GAP)
+        self._tip_pairs = []
         for k, v in (("Enter", "打开"), ("Ctrl+Enter", "开目录"),
-                     ("↑↓←→", "选择"), ("Esc", "关闭")):
+                     ("↑↓←→", "选择"), ("空格", "预览浮层"), ("Esc", "关闭")):
             kb = QLabel(k)
             kb.setStyleSheet(tokenize(
                 "color:#8AB4FF; font-size:12px; font-weight:600;"
@@ -645,7 +900,20 @@ class LauncherDialog(QDialog):
                 "color:%s; font-size:12px; background:transparent;" % _WEAK))
             tip.addWidget(kb)
             tip.addWidget(tb, 0, Qt.AlignmentFlag.AlignVCenter)
+            self._tip_pairs.append((kb, tb))
         tip.addStretch(1)
+        # 🔍 切换大小：面板上直接给一颗可见按钮（用户反馈“按快捷键出来的界面
+        # 看不到切换入口”）——点它在 常规↔放大半屏 之间来回，与全局快捷键同一动作。
+        self.btn_size = QToolButton()
+        self.btn_size.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_size.setToolTip("切换搜索窗口大小：常规 ↔ 放大到半屏（同 Ctrl+Alt+E）")
+        self.btn_size.setStyleSheet(tokenize(
+            "QToolButton { color:%s; background:transparent; border:none;"
+            " border-radius:5px; padding:2px 8px; font-size:12px; }"
+            " QToolButton:hover { background:rgba(255, 255, 255, 0.10); }" % _WEAK))
+        self.btn_size.clicked.connect(self.toggle_size)
+        tip.addWidget(self.btn_size)
+        self._refresh_size_btn()
         # 钉住📌：给不想每次按键呼出的人——钉上后面板失焦也不收，直到自己 Esc/关掉。
         self.btn_pin = QToolButton()
         self.btn_pin.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -672,7 +940,25 @@ class LauncherDialog(QDialog):
             " QToolButton:hover { background:rgba(255, 255, 255, 0.10); }" % _WEAK))
         self.btn_index.clicked.connect(self._open_index_settings)
         tip.addWidget(self.btn_index)
-        lay.addLayout(tip)
+        # 外层宿主给横向 Ignored 策略：布局算最小尺寸时会跳过它的 minimumSizeHint，
+        # 提示行从此不再决定左列能多窄
+        self._tip_host = QWidget()
+        self._tip_host.setLayout(tip)
+        self._tip_host.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                     QSizePolicy.Policy.Preferred)
+        lay.addWidget(self._tip_host)
+        # 左列一变宽（拖分栏 / 放大切换）就重算一次提示行
+        self._left.installEventFilter(self)
+
+        # 搜索历史层：贴在输入框底下的浮层（不进布局，靠 setGeometry 摆），
+        # 点一下输入框就展开：看上次搜了什么、一键重用、单删/清空。当 _left 的
+        # 子控件而不是另开弹层的原因见 _HistoryPanel 的说明（别把失焦收起带崩）。
+        self._history = _HistoryPanel(self._left)
+        self._history_open = False
+        self._history.picked.connect(self._on_history_pick)
+        self._history.deleted.connect(self._on_history_delete)
+        self._history.clear_requested.connect(self._on_history_clear)
+        self._history.close_requested.connect(self._hide_history)
 
         # 右侧预览窗：随选中项实时预览（文本/图片/视频/文档；其余“无法预览”）
         self._preview = PreviewPane(self)
@@ -727,6 +1013,17 @@ class LauncherDialog(QDialog):
         self._preview_open = bool(app_state.get("launcher_preview_open", True))
         if not self._preview_open:
             self._preview.setVisible(False)
+        # 半屏预览模式也沿用上次；半屏里预览必须亮着，顺手把折叠位掰回来
+        mode = str(app_state.get("launcher_preview_mode") or "normal")
+        self._preview_mode = mode if mode in _PREVIEW_MODES else "normal"
+        self._refresh_size_btn()          # 沿用上次模式时，🔍 按钮文字也要跟上（__init__ 里它先于此处建好）
+        #: 进半屏前的整窗尺寸与分栏：退出半屏原样还，别让程序摆的几何冒充用户习惯
+        self._normal_geo = None
+        if self._preview_mode != "normal":
+            self._preview_open = True
+            self._preview.setVisible(True)
+        self._preview.setToolTip(
+            "选中一个文件/文档按空格：弹出 QuickLook 预览浮层（只看预览框，再按空格/Esc 关）")
         apply_rounded(self, resizable=True, corner_grip=True,
                       show_min=False, show_max=False, add_titlebar=False,
                       card_bg=_PANEL_BG, border=_PANEL_BORDER)
@@ -742,10 +1039,16 @@ class LauncherDialog(QDialog):
         out.sort(key=lambda t: 0 if t[0] in pinned else 1)
         return out
 
-    def _refill(self, text=""):
-        """按过滤结果重排入口卡：先拆干净再建，卡片与 _chips 下标必须一一对应"""
+    def _refill(self, text="", rescan=True):
+        """按过滤结果重排入口卡：先拆干净再建，卡片与 _chips 下标必须一一对应。
+
+        rescan=False 是“重开面板还上次的画面”那条路径用的：只重排卡片、不另起
+        一次查询，直接拿上一次那批结果就地重建（用户点名不要重新搜）。顺带也不
+        动预览：不然预览会在“拆行 → 贴回”中间闪一下占位文案。"""
         if not self._items:
             self._items = self._load_tools()
+        if rescan:
+            self._hide_history()            # 打字就把历史层收起来：盖着结果区没法看
         for c in self._chips:
             self.flow.removeWidget(c)
             c.setParent(None)
@@ -762,13 +1065,19 @@ class LauncherDialog(QDialog):
         for _s, name, icon, desc in scored:
             chip = _Chip(name, icon, desc, keys.get(name) or "")
             chip.clicked.connect(self._on_chip)
-            chip.entered.connect(self._on_enter)
             self.flow.addWidget(chip)
             self._chips.append(chip)
         self._clear_rows()
-        self._set_cur(0 if self._chips else -1)
+        self._set_cur(0 if self._chips else -1, preview=rescan)
         self.host.updateGeometry()          # 行数变了，让外层重新问一次高度
         self._debounce.stop()               # 上一个词的等待作废，从头再计 120ms
+        if not rescan:
+            if self._last is not None:
+                self._apply_results(self._seq, *self._last)   # 不查库，用上一次那批
+            else:
+                self._refresh_status()
+            self._fit_height()
+            return
         if str(text or "").strip():
             self._debounce.start()
         else:
@@ -987,9 +1296,10 @@ class LauncherDialog(QDialog):
 
     def _add_row(self, lay, store, row):
         lay.addWidget(row)
-        row.clicked.connect(self._on_row)            # 单击：选中
+        row.clicked.connect(self._on_row)            # 单击：选中 + 跟上预览
         row.doubleClicked.connect(self._on_row_open)  # 双击：打开
-        row.entered.connect(self._on_row_enter)
+        # 故意**不**接 entered：鼠标划过一行就把预览换掉，用户想从选中行移手去
+        # 预览区，路上扫过另一行就被换了（用户点名的“鼠标太灵活”）
         row.menu_requested.connect(self._on_row_menu)
         store.append(row)
         return row
@@ -1023,33 +1333,29 @@ class LauncherDialog(QDialog):
     def _on_chip(self, chip):
         self._activate(chip)
 
-    def _on_enter(self, chip):
-        rows = self._rows()
-        idx = rows.index(chip) if chip in rows else -1
-        if idx >= 0:
-            self._set_cur(idx, scroll=False)
-
     def _on_row(self, row):
         """单击：选中这行（并跟上预览），不打开。打开交给双击/回车。"""
-        self._on_row_enter(row)
+        rows = self._rows()
+        if row in rows:
+            self._set_cur(rows.index(row), scroll=False)
 
     def _on_row_open(self, row):
         """双击：真打开。"""
         self._activate(row)
 
-    def _on_row_enter(self, row):
-        rows = self._rows()
-        if row in rows:
-            self._set_cur(rows.index(row), scroll=False)
+    def _set_cur(self, index, scroll=True, preview=True):
+        """把“当前行”拨到 index。
 
-    def _set_cur(self, index, scroll=True):
+        preview=False 只改选中框不动预览：重排卡片那类“不是用户主动选的”
+        路径上用（预览不能因为一次 refill 就被复位掉）。"""
         self._cur = index
         rows = self._rows()
         for i, w in enumerate(rows):
             w.set_current(i == index)
         if scroll and 0 <= index < len(rows):
             self._area.ensureWidgetVisible(rows[index], 0, 8)
-        self._sync_preview(rows, index)
+        if preview:
+            self._sync_preview(rows, index)
 
     def _sync_preview(self, rows, index):
         """选中项是文件/文档 → 预览它；工具/越界 → 复位占位。"""
@@ -1080,10 +1386,213 @@ class LauncherDialog(QDialog):
         self._preview.setVisible(self._preview_open)
         app_state.set_value("launcher_preview_open", self._preview_open)
         if self._preview_open:
-            self._split.setSizes([520, 600])
+            self._split.setSizes([self._normal_left_width(),
+                                  max(self.width() - self._normal_left_width(), 600)])
             self._sync_preview(self._rows(), self._cur)
         else:
             self._split.setSizes([self.width(), 0])
+        self._fit_height()
+
+    # ---------- 放大预览 ----------
+    def _order_split(self, preview_index):
+        """把预览栏挪到指定栏位（0=预览在左，1=预览在右），拉伸权重跟着走。
+
+        只挪 QSplitter 里的位置、不重建控件：预览栈里可能已经挂着 QWebEngineView
+        与脑图视图，换父级重建既贵又容易留下孤儿。"""
+        if self._split.indexOf(self._preview) != preview_index:
+            self._split.insertWidget(preview_index, self._preview)
+        self._split.setStretchFactor(self._split.indexOf(self._left), 0)
+        self._split.setStretchFactor(self._split.indexOf(self._preview), 1)
+
+    def _preview_contains(self, global_pos):
+        """全局坐标 global_pos 是否落在预览区里（含它的子控件）。"""
+        return self._preview.rect().contains(self._preview.mapFromGlobal(global_pos))
+
+    def _over_preview(self):
+        """鼠标是否停在预览区里（算上它的子控件）。
+
+        不信 underMouse()：Qt 只把 WA_UnderMouse 置在最里层那一个控件上，
+        父级拿到的恒是 False（QWidgetPrivate::setUnderMouse：置位只动一个，
+        清位才向上扫）——拿它判“悬停在预览区”基本永远不成立。"""
+        from PySide6.QtGui import QCursor
+        if not self._preview_open or not self._preview.isVisible():
+            return False
+        return self._preview_contains(QCursor.pos())
+
+    def _on_space(self):
+        """空格统一交给 QuickLook：当前选中的是文件/文档结果→弹纯预览浮层（只显预览框）；
+        已开着就关掉（再按一次收起来）。工具项/没选中→不弹（QuickLook 无物可预览）。
+
+        不再走旧的“折叠/循环贴边半屏”：那跟搜索列表同屏，不是用户要的“只看预览框”。
+        watch=False：面板里弹层会抢焦点、面板又因失焦收起，前台归属乱，不起看门狗免得误关。"""
+        from gui import quicklook
+        if quicklook.manager.is_open():
+            quicklook.manager.close()
+            return
+        rows = self._rows()
+        w = rows[self._cur] if 0 <= self._cur < len(rows) else None
+        path = str(getattr(w, "path", "") or "")
+        if path and quicklook.is_previewable(path):
+            quicklook.manager.peek(path, watch=False)
+
+    def toggle_size(self):
+        """切换搜索窗口大小（全局热键与面板上的 🔍 按钮共用这一入口）：
+        放大态（占半屏）一键回常规尺寸；常规下放大到右半屏。
+
+        与三态循环 _cycle_preview_mode 区分：那是「要在左/右半屏间挑一边」，
+        这里是用户点名的「太大↔要小」直接来回——卡在半屏放大态时按一下即回小。"""
+        self._set_preview_mode("normal" if self._preview_mode != "normal" else "right")
+
+    def _refresh_size_btn(self):
+        """🔍 按钮文字跟着当前模式走：常规时提示“放大”，已在放大态时提示“还原”，
+        让用户一眼看出这颗按钮现在能把他带去哪个状态。"""
+        b = getattr(self, "btn_size", None)
+        if b is None:
+            return
+        if getattr(self, "_preview_mode", "normal") == "normal":
+            b.setText("🔍 放大")
+            b.setToolTip("切换搜索窗口大小：放大到半屏（同 Ctrl+Alt+E）")
+        else:
+            b.setText("🗗 还原")
+            b.setToolTip("切换搜索窗口大小：回到常规尺寸（同 Ctrl+Alt+E）")
+
+    def _cycle_preview_mode(self):
+        """三态一圈，随时能按回原样。"""
+        i = _PREVIEW_MODES.index(self._preview_mode)
+        self._set_preview_mode(_PREVIEW_MODES[(i + 1) % len(_PREVIEW_MODES)])
+
+    def _set_preview_mode(self, mode):
+        """切模式并落偏好，几何交给 _apply_preview_mode。"""
+        if mode not in _PREVIEW_MODES:
+            mode = "normal"
+        if mode != "normal" and self._preview_mode == "normal":
+            # 进放大态前先把整窗尺寸与分栏拍下来，退出时原样还（左列宽度也从这里取）
+            self._normal_geo = (self.width(), self.height(), list(self._split.sizes()))
+        self._preview_mode = mode
+        app_state.set_value("launcher_preview_mode", mode)
+        self._refresh_size_btn()
+        self._apply_preview_mode()
+
+    def _fit_tip(self):
+        """底部提示行按左列当前宽度收起：装不下就从最不重要的那对开始藏。
+
+        为什么不直接让它溢出：这一行是 5 对提示 + 右边的「钉住 / 索引」两个功能
+        按钮，整排宽 800+。左列被分栏压窄时，两个按钮会被挤出可视区（用户反而
+        找不到入口），所以从装饰提示开始收，按钮永远留着。
+        """
+        host = getattr(self, "_tip_host", None)
+        if host is None or getattr(self, "_fitting_tip", False):
+            return
+        avail = int(host.width()) or int(self._left.width())
+        if avail <= 0:
+            return                                  # 还没真摆出来，尺寸都是 0
+        tail = 0
+        for b in (self.btn_size, self.btn_pin, self.btn_index):
+            tail += b.sizeHint().width() + (_TIP_GAP if tail else 0)
+        self._fitting_tip = True
+        try:
+            used, room = 0, True
+            for kb, tb in self._tip_pairs:
+                w = kb.sizeHint().width() + _TIP_GAP + tb.sizeHint().width()
+                if room and used + w + _TIP_GAP + tail > avail:
+                    room = False                    # 后面的只会更窄，整排藏到尾巴上
+                kb.setVisible(room)
+                tb.setVisible(room)
+                if room:
+                    used += w
+        finally:
+            self._fitting_tip = False
+
+    def _screen_geo(self):
+        """放大预览时参照的屏。单独开一个口子：离屏测试那块屏只有 800 宽，
+        装不下窗口常规尺寸，注入一块“正常大小的屏”才能把放大算术钉死。"""
+        from PySide6.QtWidgets import QApplication
+        scr = QApplication.primaryScreen()
+        return scr.availableGeometry() if scr is not None else None
+
+    def _normal_left_width(self):
+        """放大预览时左列该留多宽：优先用“进放大态前那次分栏”的记录，
+        没有就退回持久偏好里的左栏值，再没有就用左列当前实际宽度兜底。
+        “左列别跟着变宽”全靠这一步，拿不到旧宽度就等同于回到全屏感。"""
+        if isinstance(self._normal_geo, (list, tuple)) and len(self._normal_geo) == 3:
+            sizes = self._normal_geo[2] or []
+            if len(sizes) == 2 and int(sizes[0] or 0) > 0:
+                return int(sizes[0])
+        sp = app_state.get("launcher_split")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2 and int(sp[0] or 0) > 0:
+            return int(sp[0])
+        w = int(self._left.width() or 0)
+        return w if w > 0 else _LEFT_W
+
+    def _apply_preview_mode(self):
+        """把当前模式落到窗口几何上（summon 时会照偏好重放一次）。
+
+        放大态走的就是系统那套贴边（Aero Snap）：预览那一栏宽 = 可用屏宽的一半，
+        高度铺满可用屏，预览靠右就把窗口右边缘钉在屏幕右侧（靠左镜像）——
+        和 Win+→ / Win+← 抢半屏一个效果。**左列不跟着变宽**：它保持用户常规时的
+        宽度，所以整窗会比半屏宽一点，多出来那一截伸到另一半屏上（把左列也撑到
+        半屏宽就成了用户明确不要的那个“全屏感”）。
+        为什么不能“左边不动、只往右长”：那样预览的右边界会溢出屏幕，看着就不像
+        吸到边上去了——贴边的意思就是外边界对齐屏幕。
+
+        屏真装不下（超窄屏）时先往回压左列，压到物理下限还不够再缩预览；
+        半屏优先，那是用户点名要的贴边效果。
+
+        算宽度时把“边距 + 分栏把手”实测出来（整窗宽 减 分栏宽）而不是拍一个数：
+        少了这一项，setSizes 的总和会比子控件真拿到的宽度大，Qt 就把多出来的全贴
+        回左列、把预览压到最小——“放大预览”会直接失效（离屏实测过）。
+        同理“能从左列借多少”得问左列自己的 minimumSizeHint：拿常量 _LEFT_MIN_W
+        当底价去压一个压不下去的列，setSizes 会整体作废（预览反而回到最小宽）。
+        """
+        mode = self._preview_mode
+        self._order_split(0 if mode == "left" else 1)
+        if mode == "normal":
+            if self._normal_geo is None:
+                self._center_on_screen()        # 没进过放大：尺寸归 __init__/summon 管
+                return
+            w, h, sizes = self._normal_geo
+            self._normal_geo = None
+            self.resize(max(int(w), _MIN_W), max(int(h), _MIN_H))
+            self._center_on_screen()
+            self._split.setSizes([int(sizes[0]), int(sizes[1])])
+            self._fit_height()
+            return
+        self._preview_open = True
+        self._preview.setVisible(True)
+        app_state.set_value("launcher_preview_open", True)
+        geo = self._screen_geo()
+        if geo is None:
+            return
+        m = self.layout().contentsMargins()
+        # 实测优先，量不到（面板还没真显过、分栏宽为 0）就退回“边距 + 把手”的算法：
+        # frame 算错会直接把整窗撑到一个离谱的宽度上
+        frame = int(self.width()) - int(self._split.width())
+        if self._split.width() <= 0 or frame < 0 or frame > 240:
+            frame = m.left() + m.right() + int(self._split.handleWidth())
+        # 左列的物理下限：常量说的不算，Qt 压不下去就是压不下去
+        min_left = max(int(self._left.minimumSizeHint().width()), _LEFT_MIN_W)
+        # 预览要的就是半屏：可用屏宽的一半，算出来比 _PREVIEW_FLOOR_W 还窄才用下限
+        prev_w = max(int(int(geo.width()) * _PREVIEW_HALF_RATIO), _PREVIEW_FLOOR_W)
+        # 左列拿它常规时的宽度；整窗要越过屏幕另一侧了，先往回压左列
+        left_w = max(min(self._normal_left_width(),
+                         int(geo.width()) - frame - prev_w), min_left)
+        # 压到物理下限还是装不下（超窄屏）：只能回头缩预览，不能把窗口推出屏幕
+        if left_w + prev_w + frame > int(geo.width()):
+            prev_w = max(int(geo.width()) - frame - left_w, _PREVIEW_FLOOR_W)
+        w = left_w + prev_w + frame
+        # 竖直也铺满可用屏：贴边分的那一半本来就是整高，预览才能多装几行
+        h = max(int(geo.height()) + m.top() + m.bottom(), _MIN_H)
+        self.resize(w, h)
+        if mode == "left":
+            x = int(geo.x()) - m.left()          # 预览在左：钉屏幕左边缘
+        else:
+            x = int(geo.x()) + int(geo.width()) + m.right() - w   # 钉右边缘
+        self.move(x, int(geo.y()) - m.top())
+        # setSizes 按栏位给值，不是按控件：预览换到左边时它才是第一栏，
+        # 还按“[左列, 预览]”递就是把放大后的宽度递给了左列（实测会反过来把左列撑大）
+        sizes = [prev_w, left_w] if self._split.indexOf(self._preview) == 0 \
+            else [left_w, prev_w]
+        self._split.setSizes(sizes)
         self._fit_height()
 
     def _toggle_focus(self):
@@ -1132,7 +1641,11 @@ class LauncherDialog(QDialog):
 
     def _activate(self, w, ctrl=False):
         """回车/点击的统一派发：工具→唤出面板；文件与文档→打开它；
-        Ctrl+Enter→打开所在目录。工具没有“所在目录”这个概念，所以 ctrl 等同回车。"""
+        Ctrl+Enter→打开所在目录。工具没有“所在目录”这个概念，所以 ctrl 等同回车。
+
+        真去用了一个结果，就把当前关键词记进搜索历史（只输不点开的不记，
+        否则历史里会堆满“视/视频/视频剪”这种敲到一半的碎片）。"""
+        self._remember()
         if getattr(w, "kind", "tool") == "tool":
             self._open(getattr(w, "name", ""))
             return
@@ -1182,28 +1695,130 @@ class LauncherDialog(QDialog):
         elif chosen is act_file:
             copy_paths_to_clipboard([path])
 
+    def _history_key(self, e):
+        """历史层开着时的按键分派：↑↓ 选、Enter 用、Delete 删当前、Esc 收。
+        返回是否已消化（没开层就一律 False，照旧走结果列表的导航）。"""
+        if not self.history_shown():
+            return False
+        k = e.key()
+        if k == Qt.Key.Key_Down:
+            return self._history.step(1)
+        if k == Qt.Key.Key_Up:
+            return self._history.step(-1)
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            return self._history.pick_current()
+        if k == Qt.Key.Key_Delete:
+            text = self._history.current_text()
+            if text:
+                self._on_history_delete(text)
+                return True
+            return False
+        if k == Qt.Key.Key_Escape:
+            self._hide_history()
+            return True
+        return False
+
+    def resizeEvent(self, e):
+        """整窗被拉大/拉宽时，历史浮层跟着重贴一次（不然它就停在旧尺寸上）。"""
+        super().resizeEvent(e)
+        if self.history_shown():
+            self._place_history()
+
+    # ---------- 搜索历史 ----------
+    def _show_history(self):
+        """点开输入框：把历史展在输入框底下。没历史就不占地方（也不报错）。"""
+        items = load_history()
+        if not items:
+            self._hide_history()
+            return False
+        self._history.rebuild(items)
+        self._place_history()
+        self._history.setVisible(True)
+        self._history.raise_()
+        self._history_open = True
+        return True
+
+    def _place_history(self):
+        """浮层贴在输入框底下：edit 的直接父级就是 _left，它的 geometry 可以直接用。"""
+        g = self.edit.geometry()
+        top = int(g.bottom()) + 4
+        avail = max(int(self._left.height()) - top - 8, 80)
+        h = min(self._history.natural_height(), avail)
+        self._history.setGeometry(int(g.x()), top,
+                                  max(int(g.width()), 300), h)
+
+    def _hide_history(self):
+        self._history.setVisible(False)
+        self._history_open = False
+
+    def history_shown(self):
+        """历史层是否开着（父窗未显时 isVisible 恒 False，拿它判会骗人）。"""
+        return bool(self._history_open)
+
+    def _on_history_pick(self, text):
+        """点一条历史：填回输入框并按这个词重查（不是只填字不查）。"""
+        text = str(text or "")
+        self._hide_history()
+        if not text:
+            return
+        if str(self.edit.text() or "") != text:
+            self.edit.setText(text)         # textChanged → _refill → 节流发查询
+            return
+        self._refill(text)                  # 同一个词：不走信号，直接重排重查
+
+    def _on_history_delete(self, text):
+        """单删一条：剔掉后重画（剩 0 条就自动收起）。"""
+        save_history(remove_history(load_history(), text))
+        if not self._show_history():
+            self._hide_history()
+
+    def _on_history_clear(self):
+        """批量删：清空全部历史。"""
+        save_history([])
+        self._hide_history()
+
+    def _remember(self, text=None):
+        """把这次用的关键词记进历史（去重、封顶）。空串不记。"""
+        q = str(self.edit.text() or "") if text is None else str(text or "")
+        q = q.strip()
+        if not q:
+            return False
+        cur = load_history()
+        items = push_history(cur, q)
+        if items != cur:
+            save_history(items)
+        return True
+
     # ---------- 显隐 ----------
     def summon(self):
-        """弹出并居中偏上（全局热键与托盘菜单共用这一入口）"""
+        """弹出并居中偏上（全局热键与托盘菜单共用这一入口）。
+
+        重开面板保留上次的画面（用户点名）：关键词原样留在框里、结果直接拿
+        上一次那批重建，不再重新查一遍库——“刚搜的东西一关面板就没了”比慢更难受。"""
         if self.isVisible() and self.isActiveWindow() and not self._pinned:
             self.hide()                     # 再按一次键＝收起（钉住时不收，只当刷新）
             return
         self._items = self._load_tools()
-        self.edit.blockSignals(True)        # clear() 会触发 textChanged，别白排一次
-        self.edit.clear()
-        self.edit.blockSignals(False)
+        q = str(self.edit.text() or "").strip()
+        keep = bool(q) and self._last is not None      # 上次搜过且有结果：还给他
         self._debounce.stop()               # 上一次残留的待发布查询不能漏进新面板
+        if not keep:
+            self.edit.blockSignals(True)    # clear() 会触发 textChanged，别白排一次
+            self.edit.clear()
+            self.edit.blockSignals(False)
         self._show_view(app_state.get("launcher_view_default")
                         or app_state.get("launcher_view") or "list")
-        self._refill("")                    # 空查询会调 _refresh_status 摆出索引状态
+        self._refill(q if keep else "", rescan=not keep)
         self._poll.start()                  # 面板可见期间实时刷新"建立中"进度
-        self._center_on_screen()
+        if self._preview_mode == "normal":
+            self._center_on_screen()        # 放大预览时整窗几何归 _apply_preview_mode 摆
         self.show()
         # show() 只是把排版请求排进队列，不手动 activate 就问不到列表可视高，
         # _fit_height 会退回“量不出、什么都不做”——实测面板就死停在 420 高，
         # 三排卡下面拖一大块空板（用户说的“丑”里就有一条）
         self.layout().activate()
         self._fit_height()
+        self._apply_preview_mode()          # 上次贴在半屏就还回半屏（含换边）
         self.raise_()
         self.activateWindow()
         # activateWindow() 走的是 SetForegroundWindow，会被 Windows 前台锁拒掉；
@@ -1218,13 +1833,30 @@ class LauncherDialog(QDialog):
         self._armed = True
 
     def _center_on_screen(self):
+        """居中偏上摆放，并保证整窗不出屏（尤其下沿）。
+
+        两条硬要求（用户点名）：① 默认要“向上一些”——顶部只留 ~6% 高的边，视线
+        自然落点偏上；② 高度“不要顶出屏幕”——若整窗比可用屏高就压到屏内并贴顶，
+        绝不让下沿掉到任务栏下面（这正是“太靠下/太高”的来源）。横向仍旧居中。"""
         from PySide6.QtWidgets import QApplication
         scr = QApplication.primaryScreen()
         geo = scr.availableGeometry() if scr is not None else None
         if geo is None:
             return
+        # 高度封顶：既不能顶出屏幕，也不默认吃掉整屏高——取“屏高留边”与
+        # “80% 屏高”里更小的那个（不低于硬下限）。旧版存下的 680 高在笔记本上
+        # 会被这一档拉回来（正是“高度不要这么高”）；大屏上 680 不过 80% 就不动，
+        # 不跟用户亲手拖大的尺寸打架。
+        pad = 24
+        avail_h = int(geo.height())
+        max_h = max(_MIN_H, min(avail_h - pad * 2, int(avail_h * 0.80)))
+        if self.height() > max_h:
+            self.resize(self.width(), max_h)
+        # 顶部偏上：目标边距 6%，但不能把整窗推到屏幕下沿之外，取二者较小值兜底
+        top = min(int(geo.height() * 0.06),
+                  max(0, int(geo.height()) - self.height() - pad))
         self.move(geo.x() + (geo.width() - self.width()) // 2,
-                  geo.y() + int(geo.height() * 0.18))     # 偏上：视线自然落点
+                  geo.y() + top)
 
     def changeEvent(self, e):
         """失焦收起：只在“站稳”之后、且窗口确实不再是活动窗口、且没钉住时才关。
@@ -1254,12 +1886,18 @@ class LauncherDialog(QDialog):
     def hideEvent(self, e):
         # 面板不在眼前就停表：定时器不该在背后一直跑（取数虽已是 O(1)，白刷也没道理）
         self._poll.stop()
+        self._hide_history()                # 历史层是结果区上的浮层，不能留在背后
+        # 搜完了直接关面板（没点任何结果）：这个词也算“搜过”，下次点开输入框能拿回来
+        if str(self.edit.text() or "").strip() and self._last is not None:
+            self._remember()
         # 看不见的卡不值得抽盘：清掉待办（线程留着空闲，下次唤出直接用）
         th = getattr(self, "_thumb", None)
         if th is not None:
             th.clear()
-        # 记住用户调好的整窗尺寸与左右分栏比例，下次召唤直接回到他习惯的样子
-        if hasattr(self, "_split"):
+        # 记住用户调好的整窗尺寸与左右分栏比例，下次召唤直接回到他习惯的样子。
+        # 预览放大时整窗尺寸是程序摆出来的（为了把预览框撑大），存进去就等于把用户
+        # 原来的尺寸覆盖掉——退出放大就再也回不去了，所以这一趟不写。
+        if hasattr(self, "_split") and self._preview_mode == "normal":
             app_state.set_value("launcher_size", [self.width(), self.height()])
             app_state.set_value("launcher_split", list(self._split.sizes()))
         super().hideEvent(e)
@@ -1296,10 +1934,21 @@ class LauncherDialog(QDialog):
             if self._wheel_scroll(e):
                 e.accept()
                 return True
+        if obj is getattr(self, "_left", None) and e.type() == QEvent.Type.Resize:
+            self._fit_tip()             # 左列一变宽就重算底部提示行能留几对
+        if (obj is self.edit and e.type() == QEvent.Type.MouseButtonPress
+                and e.button() == Qt.MouseButton.LeftButton):
+            # 点一下输入框就展开搜索历史（没历史时 _show_history 自己会不启声）；
+            # 不吞事件：光标仍落在点的位置上
+            self._show_history()
         if obj is self.edit and e.type() == QEvent.Type.KeyPress:
+            if self._history_key(e):
+                e.accept()                  # 历史层开着时方向键先归它，不能两边同走
+                return True
             if e.key() == Qt.Key.Key_Space and not e.modifiers():
-                # 空格给预览折叠（模糊匹配不吃空格，代价：搜索框里打不出空格）
-                self._toggle_preview()
+                # 空格归预览（模糊匹配不吃空格，代价：搜索框里打不出空格）：
+                # 鼠标停在预览区切放大预览，在别处仍是折叠/展开，分工见 _on_space
+                self._on_space()
                 e.accept()
                 return True
             for key, dx, dy in _STEP_KEYS:
@@ -1328,7 +1977,7 @@ class LauncherDialog(QDialog):
             self.hide()
             return
         if k == Qt.Key.Key_Space:
-            self._toggle_preview()
+            self._on_space()
             return
         if k == Qt.Key.Key_Right:
             self._step(dx=1)

@@ -102,10 +102,11 @@ class NetSpeedometer:
 
 class LauncherBall(QWidget):
     """桌面悬浮球：移入 on_hover（展开扇形）、移出 on_leave（请求收起），
-    双击 on_double（打开主程序），可拖拽，右键可收起/打开搜索/进索引设置。"""
+    双击 on_double（打开主程序），可拖拽，右键可关闭/打开搜索/进索引设置。"""
 
     def __init__(self, on_hover, on_double=None, on_search=None,
-                 on_config=None, on_index=None, on_leave=None, parent=None):
+                 on_config=None, on_index=None, on_leave=None,
+                 on_close=None, parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
@@ -119,6 +120,7 @@ class LauncherBall(QWidget):
         self._on_config = on_config
         self._on_index = on_index
         self._on_leave = on_leave
+        self._on_close = on_close
 
         # 拖拽：按下点相对窗口左上角的偏移（绝对定位法，见模块注释）
         self._drag_off = None
@@ -290,12 +292,25 @@ class LauncherBall(QWidget):
         elif chosen is act_cfg:
             self._call(self._on_config)
         elif chosen is act_hide:
-            try:
-                from store import app_state
-                app_state.set_value("launcher_ball_on", False)
-            except Exception:
-                pass
-            hide_launcher_ball()
+            self._hide_requested()
+
+    def _hide_requested(self):
+        """右键「关闭悬浮球」：不能只 hide 球自己。
+
+        扇形菜单是另一个顶层窗，不归球管：关了球不收扇形，就会在桌面上留一排没人
+        认领的图标（用户报的“关了悬浮球，展开的内容居然还没关闭”）。交给调用方的
+        on_close（主窗口那里顺手把扇形与宽限期计时器一并抹掉）；没传回调时退回
+        “只收球”的老行为，至少不能抛。"""
+        cb = self._on_close
+        if callable(cb):
+            self._call(cb)
+            return
+        try:
+            from store import app_state
+            app_state.set_value("launcher_ball_on", False)
+        except Exception:
+            pass
+        hide_launcher_ball()
 
     def _call(self, cb):
         if callable(cb):
@@ -453,15 +468,17 @@ _ball_ref = None
 
 
 def show_launcher_ball(on_hover, on_double=None, on_search=None,
-                       on_config=None, on_index=None, on_leave=None, parent=None):
+                       on_config=None, on_index=None, on_leave=None,
+                       on_close=None, parent=None):
     """弹出（并替换）悬浮球，返回实例。
 
     on_hover：鼠标移入（展开扇形）；on_leave：移出（请求收起，宽限期由调用方裁定）；
-    on_double：双击（打开主程序）；on_search/on_config/on_index：右键菜单三入口。"""
+    on_double：双击（打开主程序）；on_search/on_config/on_index：右键菜单三入口；
+    on_close：右键“关闭悬浮球”——由调用方把球、扇形、待收起计时器一并收干净。"""
     global _ball_ref
     hide_launcher_ball()
     ball = LauncherBall(on_hover, on_double, on_search, on_config, on_index,
-                        on_leave, parent)
+                        on_leave, on_close, parent)
     _ball_ref = ball
     ball.show_ball()
     return ball

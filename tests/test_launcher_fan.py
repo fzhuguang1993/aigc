@@ -29,6 +29,10 @@ def qapp():
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(app_state, "STATE_FILE", tmp_path / "ui.json")
+    # 安装层也要隔离：开发机真装过安装包时，C:\ProgramData 里的 install.json
+    # 会被 enabled_modules 首启采纳进用户层，把候选池钉死成半套模块
+    from core import modules
+    monkeypatch.setattr(modules, "COMMON_DATA_DIR", tmp_path / "ProgramData")
 
 
 # ---------------- 纯几何：角度 / 命中 / 朝屏内展开 ----------------

@@ -105,7 +105,8 @@ _QT_TO_VK = {
     int(Qt.Key_Insert): 0x2D, int(Qt.Key_Delete): 0x2E, int(Qt.Key_Help): 0x2F,
     int(Qt.Key_Period): 0xBE, int(Qt.Key_Comma): 0xBC, int(Qt.Key_Semicolon): 0xBA,
     int(Qt.Key_Plus): 0xBB, int(Qt.Key_Equal): 0xBB, int(Qt.Key_Minus): 0xBD,
-    int(Qt.Key_AsciiTilde): 0xC0, int(Qt.Key_BracketLeft): 0xDB,
+    int(Qt.Key_AsciiTilde): 0xC0, int(Qt.Key_QuoteLeft): 0xC0,
+    int(Qt.Key_BracketLeft): 0xDB,
     int(Qt.Key_Backslash): 0xDC, int(Qt.Key_BracketRight): 0xDD,
     int(Qt.Key_Apostrophe): 0xDE, int(Qt.Key_Slash): 0xBF,
 }

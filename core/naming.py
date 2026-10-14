@@ -213,3 +213,104 @@ def preview(ctx=None, tokens=None, sep=None):
          "job_id": "a1b2c3d4e5", "when": datetime(2026, 9, 23, 10, 32)}
     c.update(ctx or {})
     return render(c, tokens, sep)
+
+
+# ====================================================================
+# 命名规律识别（批量重命名「预读规则」按钮用；纯词法，无 Qt）
+# ====================================================================
+_PAT_SEPS = ("_", "-", ".")            # 候选分隔符
+_PAT_DATE8 = re.compile(r"^\d{8}$")     # 20260923
+_PAT_DATE4 = re.compile(r"^(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$")  # MMDD
+_PAT_NUM = re.compile(r"^\d{1,3}$")
+# 对齐阶段尝试的字段（按此顺序认领某一列）
+_PAT_ALIGN_KEYS = ("product", "tag", "block_type", "date", "time", "task_id")
+
+
+def _pat_split(stem, sep):
+    """按主分隔符切段；sep 为空＝整串一段（驼峰/连写）。"""
+    return stem.split(sep) if sep else [stem]
+
+
+def _pat_sequential(vals):
+    """一列全是短数字且严格 +1 递增 → 视为序号列。"""
+    try:
+        nums = [int(v) for v in vals]
+    except (TypeError, ValueError):
+        return False
+    return len(nums) >= 2 and all(_PAT_NUM.match(str(v)) for v in vals) and \
+        all(b - a == 1 for a, b in zip(nums, nums[1:]))
+
+
+def detect_pattern(stems, rows=None, context_fn=None):
+    """从一批现有文件名主干里识别命名规律，供批量重命名「预读规则」回填。
+
+    stems：文件名去后缀的主干列表。
+    rows + context_fn：可选——传入原始行与 build_context(row, idx) 取值函数时，
+      按「某字段的渲染值正好等于这一列所有行的取值」来对齐认领字段（最稳）。
+
+    返回 dict：
+      sep        主分隔符（"_"/"-"/"."/""；识别不到给 None）
+      style      snake|kebab|dot|camel|pascal|none
+      tokens     建议字段顺序（仅当每一列都能被认领时才给；否则 None 表示结构没吃透）
+      mapped     bool，tokens 是否可信（全列命中）
+    """
+    clean = [str(s) for s in (stems or []) if str(s or "").strip()]
+    res = {"sep": None, "style": "none", "tokens": None, "mapped": False}
+    if not clean:
+        return res
+
+    # 1) 主分隔符：三种候选里选总出现次数最多者
+    counts = {c: sum(s.count(c) for s in clean) for c in _PAT_SEPS}
+    best = max(counts, key=counts.get)
+    sep = best if counts[best] > 0 else ""
+    res["sep"] = sep
+
+    # 2) 风格：有分隔符按分隔符命名；否则看驼峰变换
+    if sep:
+        res["style"] = {"_": "snake", "-": "kebab", ".": "dot"}[sep]
+    else:
+        camel = any(re.search(r"[a-z0-9][A-Z]", s) for s in clean)
+        if camel:
+            pascal = all(s[:1].isupper() for s in clean if s)
+            res["style"] = "pascal" if pascal else "camel"
+        else:
+            res["style"] = "none"
+
+    # 3) 逐列认领字段；只有每一列都能被认领，才给出可信的 tokens
+    table = [_pat_split(s, sep) for s in clean]
+    ncol = max((len(t) for t in table), default=0)
+    if ncol == 0:
+        return res
+    colvals = [[t[i] if i < len(t) else "" for t in table] for i in range(ncol)]
+
+    can_align = bool(rows is not None and context_fn is not None
+                     and len(rows) == len(clean))
+    tokens, mapped = [], True
+    for i in range(ncol):
+        col = colvals[i]
+        tok = None
+        if can_align:
+            for key in _PAT_ALIGN_KEYS:
+                if all(str(context_fn(rows[j], j).get(key, "")) != ""
+                       and str(context_fn(rows[j], j).get(key, "")) == col[j]
+                       for j in range(len(clean))):
+                    tok = key
+                    break
+        if tok is None:                            # 词法兜底：日期 / 序号
+            nz = [v for v in col if v]
+            if nz and all(_PAT_DATE8.match(v) for v in nz):
+                tok = "date_full"
+            elif nz and all(_PAT_DATE4.match(v) for v in nz):
+                tok = "date"
+            elif _pat_sequential(col):
+                tok = "seq"
+        if tok is None:
+            mapped = False
+            break
+        if tok not in tokens:
+            tokens.append(tok)
+
+    if mapped and tokens:
+        res["tokens"] = tokens
+        res["mapped"] = True
+    return res

@@ -202,13 +202,15 @@ def _is_self_process(user32, hwnd):
     return pid.value == ctypes.windll.kernel32.GetCurrentProcessId()
 
 
-def list_windows(exclude_self=False):
+def list_windows(exclude_self=False, keep_order=False):
     """任务栏里能看到的应用窗口（含最小化到任务栏的）：
     [(hwnd, 标题, 物理矩形, 是否最小化)]，按标题排序。非 Windows 给 []。
     后台常驻窗（显卡控制面板之类）、工具窗、有主窗体的面板不在范围内。
 
     exclude_self=True 时剔除本进程的窗口（窗口点选遮罩用——自家面板
     永远不该被选为点选目标）；下拉列表不剔除，用户可能就想录主窗口。
+    keep_order=True 时保留 EnumWindows 的 z-order（最前→最后）不排序，
+    供「吸附鼠标下肉眼可见的最前窗口」用；默认按标题排序供列表展示。
     """
     u = _winapi()
     if u is None:
@@ -229,7 +231,8 @@ def list_windows(exclude_self=False):
         user32.EnumWindows(EnumWindowsProc(_cb), 0)
     except Exception:
         return []
-    out.sort(key=lambda t: t[1].lower())
+    if not keep_order:
+        out.sort(key=lambda t: t[1].lower())
     return out
 
 
@@ -448,11 +451,52 @@ def _audio_input_args(spec):
 # 声道处理：单麦只喂一路时，左右求和填进相同的两个声道 = 人声居中、双耳同响
 _PAN_CENTER = "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"
 
-# 视频限幅：实测本机 x264 veryfast 在 4K 全屏 + 音频合流时编码器只能跑到
-# ~23-25fps（剧烈动态下会掉帧→肉眼可见的卡顿），而 1080p+音频 能稳 28fps。
-# 自动把 >1080p 的源缩到 ≤1080p（force_divisible_by=2 保证 yuv420p 偶数要
-# 求）；源 ≤1080p 时无变化。真 4K 原生需换硬件编码（NVENC/AMF/QSV）另开。
-_VSCALE = "scale='min(1920,iw)':'min(1080,ih)':force_divisible_by=2"
+# 视频限幅（分软硬编两套口径）：
+#  · 软编 x264 veryfast 算力有限，实测 4K 全屏 + 音频合流只能跑到 ~23-25fps
+#    （剧烈动态掉帧→肉眼可见卡顿），1080p 才稳，故软编一律压到 ≤1080p；
+#  · 硬编 NVENC 算力充裕，2K/1440p 原生实时无压力，压到 1080p 纯属自降清晰度
+#    （2K 屏用户录出来发虚的真根因就在这），故硬编放到 ≤1440p，2K 屏原样不缩放，
+#    仅 4K 及以上才轻降到 1440p 兼顾码率。
+# force_divisible_by=2 保证 yuv420p/nv12 的偶数宽高要求；源 ≤ 上限时无变化。
+_VSCALE_SW = "scale='min(1920,iw)':'min(1080,ih)':force_divisible_by=2"
+_VSCALE_HW = "scale='min(2560,iw)':'min(1440,ih)':force_divisible_by=2"
+
+# 只保证偶数、不缩放（所见即所得：gdigrab 抓到多大就多大，仅向下取偶
+# 满足 yuv420p/nv12 的偶数宽高要求，不会降采样也不会裁切）
+_VSCALE_SOURCE = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+# 预设分辨率档 -> 上限宽高（仅当源大于该上限时才缩，源更小不放大）
+_RES_PRESETS = {
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "1440p": (2560, 1440),
+    "2k": (2560, 1440),
+    "4k": (3840, 2160),
+}
+
+
+def _scale_filter(resolution, hw):
+    """按用户选的分辨率档给 scale 滤镜（所见即所得的核心开关）：
+    - None/空：沿用自动口径（硬编 ≤1440p、软编 ≤1080p），保向后兼容；
+    - 'source'/'原生'/'原始'/'0'：不缩放，gdigrab 抓到多大录多大；
+    - '720p'/'1080p'/'1440p'/'2k'/'4k'：按预设上限，源小于上限时不放大；
+    - '宽x高'（如 2560x1440）：用户自定义上限。
+    认不出的值退回自动口径，不报错。"""
+    auto = _VSCALE_HW if hw else _VSCALE_SW
+    if not resolution:
+        return auto
+    r = str(resolution).strip().lower()
+    if r in ("source", "原生", "原始", "原始屏", "0", "none", "源屏"):
+        return _VSCALE_SOURCE
+    pair = _RES_PRESETS.get(r)
+    if pair is None:
+        m = re.match(r"^(\d+)\s*x\s*(\d+)$", r)
+        if m:
+            pair = (int(m.group(1)), int(m.group(2)))
+    if pair:
+        w, h = pair
+        return f"scale='min({w},iw)':'min({h},ih)':force_divisible_by=2"
+    return auto
 
 
 # 硬件编码器探测缓存：ffmpeg_path -> None=未探 / False=探过不可用 / "h264_nvenc"=可用
@@ -512,7 +556,8 @@ def _channel_filter(mode):
 def build_record_command(ffmpeg_path, mode, out_path, *,
                          fps=30, bitrate="4M",
                          physical=None, title=None,
-                         audio=None, channel_mode="center"):
+                         audio=None, channel_mode="center",
+                         resolution=None):
     """拼 ffmpeg 录屏命令：画面与音源【分进程】，返回录制子进程计划
     [(命令, 产物路径)]——第一条恒为视频（产物即最终 out_path，只是暂时无声），
     其后是每个音源独立录成的裸 WAV。Recorder 停止后再把它们合流成【一个带声
@@ -526,7 +571,8 @@ def build_record_command(ffmpeg_path, mode, out_path, *,
     画面进程要点：
       · -thread_queue_size 2048 前置，喂饱 gdigrab；
       · 优先硬编 NVENC（pick_hw_encoder 探测，驱动不够则降级 libx264 软编）；
-      · 视频链 -vf：scale 限幅 ≤1080p + fps={fps} 强制恒定帧率（gdigrab 是变帧
+      · 视频链 -vf：scale 限幅（硬编 ≤1440p 保 2K 原生、软编 ≤1080p 保流畅）
+        + fps={fps} 强制恒定帧率（gdigrab 是变帧
         率源，不补 CFR 时间戳不均→卡顿；fps 滤镜落后补重复帧，保证成片总长=
         录制时长）。分进程后视频轨不带音频（-an），最终由 mux 合入。
     音频进程要点：每源一路，dshow/wasapi_loopback 采到 pcm_s16le WAV（44.1k
@@ -543,6 +589,8 @@ def build_record_command(ffmpeg_path, mode, out_path, *,
       立体声混音类 dshow 设备录内部声音。同类型去重（最多一条内部 + 一条外部）。
     channel_mode：center（默认，人声居中双耳同声）| stereo | mono。仅在最终
       合流时生效（见 build_mux_command）。
+    resolution：输出分辨率档（详见 _scale_filter）——'source'/空=所见即所得不
+      缩放；'720p'/'1080p'/'1440p'/'2k'/'4k' 或 '宽x高'=按上限限幅；None=按软硬编自动限幅。
     """
     if mode not in ("fullscreen", "region", "window"):
         raise ValueError(f"未知录制模式: {mode}")
@@ -570,14 +618,17 @@ def build_record_command(ffmpeg_path, mode, out_path, *,
     # 编码：优先硬编（NVENC，不吃 CPU；需驱动 ≥ 610）→ 探测不可用降级 libx264
     hw = pick_hw_encoder(ffmpeg_path)
     if hw:
-        # NVENC: p1=最快档位、ll=low-latency tune（避免编码器内部大缓冲）
-        cmd += ["-c:v", hw, "-preset", "p1", "-tune", "ll",
+        # NVENC：p5（较慢=高画质）+ hq 调优，录屏不吃实时延迟，画质优先；
+        # 2K/1440p 原生编码 4060 Ti 这类卡有充足余量，不会掉帧
+        cmd += ["-c:v", hw, "-preset", "p5", "-tune", "hq",
                 "-b:v", str(bitrate), "-pix_fmt", "nv12"]
     else:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
                 "-b:v", str(bitrate), "-pix_fmt", "yuv420p"]
-    # 画面限幅 + 恒定帧率；分进程后视频轨不带音频（-an），音频由 stop 后合入
-    vchain = _VSCALE + f",fps={int(fps)}"
+    # 画面限幅（按用户选的分辨率档：source=不缩放所见即所得，720p/1080p/2K/4K
+    # 按上限，空=硬编≤1440p/软编≤1080p 自动）+ 恒定帧率；
+    # 分进程后视频轨不带音频（-an），音频由 stop 后合入
+    vchain = _scale_filter(resolution, hw) + f",fps={int(fps)}"
     cmd += ["-vf", vchain, "-an", "-movflags", "+faststart", out_path]
     plans = [(cmd, out_path)]
     if not aspecs:
@@ -863,3 +914,45 @@ class Recorder:
             pass
         return (f"音轨合流失败，已保留无声视频：{tail}" if tail
                 else "音轨合流失败，已保留无声视频")
+
+
+# ====================================================================
+# 录好的区域 mp4 转 GIF（偷/录表情包）
+# ====================================================================
+# GIF 调色板两遍法一次搞定：split 出两路，一路 palettegen 统计最优 256 色，
+# 一路 paletteuse 量化。stats_mode=diff 对屏幕内容（大片纯色 + 小字）配色更准，
+# dither=bayer 减少色带又不糊。限最长边 + 限帧率是体积地板——表情包就图一个轻，
+# 15fps 观感已流畅，宽 480 足够看清；不写死，调用方可调。
+def build_gif_command(ffmpeg_path, src, dst, fps=15, max_width=480):
+    """生成「mp4 → GIF」一条 ffmpeg 命令（不执行）。src/dst 为文件路径。
+
+    fps：GIF 帧率（默认 15，流畅与体积的平衡点）；max_width：最长边像素上限
+    （默认 480，小于此不放大）。输出用 lanczos 缩放保边缘。"""
+    fps = max(1, int(fps))
+    mw = max(16, int(max_width))
+    vf = (f"fps={fps},"
+          f"scale='min({mw},iw)':-2:flags=lanczos,"
+          "split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+          "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle")
+    return [ffmpeg_path, "-hide_banner", "-y", "-i", src, "-vf", vf, dst]
+
+
+def convert_mp4_to_gif(ffmpeg_path, src, dst, fps=15, max_width=480, timeout=180):
+    """把录好的 mp4 转成 GIF。返回 (ok, err_tail)：ok=False 时 err_tail 给诊断尾部。
+
+    只认退出码 + 产物非 0 字节；任何异常吞成 ok=False，绝不外抛（调用在 UI 线程外侧，
+    失败要能优雅回退到保留 mp4）。"""
+    cmd = build_gif_command(ffmpeg_path, src, dst, fps=fps, max_width=max_width)
+    tail = ""
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, timeout=timeout,
+                           creationflags=_devnull())
+        ok = (r.returncode == 0 and os.path.isfile(dst)
+              and os.path.getsize(dst) > 0)
+        if not ok:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            tail = err.splitlines()[-1] if err else f"ffmpeg 退出码 {r.returncode}"
+    except Exception as e:
+        ok, tail = False, str(e)
+    return ok, tail

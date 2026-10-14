@@ -126,3 +126,61 @@ def test_module_of_page():
     assert modules.module_of_page(0) == modules.MODULE_DASHBOARD
     assert modules.module_of_page(4) == modules.MODULE_TOOLS
     assert modules.module_of_page(10) is None        # 工坊页无单一归属
+
+
+# ---------------- 安装期选的成品输出目录（output_dir 交接）----------------
+
+def _write_manifest_full(common, data):
+    common.mkdir(parents=True, exist_ok=True)
+    (common / "install.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_install_output_dir_reads_manifest(_isolate):
+    """清单里没 output_dir → None；有则去空白后返回。"""
+    assert modules.install_output_dir() is None
+    _write_manifest_full(_isolate, {"modules": ["aigc"], "output_dir": r"D:\成品"})
+    assert modules.install_output_dir() == r"D:\成品"
+    _write_manifest_full(_isolate, {"modules": ["aigc"], "output_dir": "   "})
+    assert modules.install_output_dir() is None      # 空白串当作没选
+
+
+def _cfg_dir(tmp_path, monkeypatch):
+    """seed_output_dir 在函数内 import core.paths.CONFIG_DIR：挨个模块打补丁即可。"""
+    import core.paths
+    d = tmp_path / "Roaming"
+    d.mkdir()
+    monkeypatch.setattr(core.paths, "CONFIG_DIR", d)
+    return d
+
+
+def test_seed_output_dir_writes_first_run_config(_isolate, tmp_path, monkeypatch):
+    """首启采纳：安装期选的目录写进 config.json 的 paths.output，且不丢已有字段。"""
+    cfg = _cfg_dir(tmp_path, monkeypatch)
+    (cfg / "config.json").write_text(json.dumps({"user_name": "张三"}), encoding="utf-8")
+    _write_manifest_full(_isolate, {"modules": ["aigc"], "output_dir": r"D:\成品"})
+    assert modules.seed_output_dir() is True
+    data = json.loads((cfg / "config.json").read_text(encoding="utf-8"))
+    assert data["user_name"] == "张三"
+    assert data["paths"]["output"] == r"D:\成品"
+
+
+def test_seed_output_dir_keeps_user_choice(_isolate, tmp_path, monkeypatch):
+    """用户已在设置里自定义过输出目录：安装值不覆盖。"""
+    cfg = _cfg_dir(tmp_path, monkeypatch)
+    (cfg / "config.json").write_text(
+        json.dumps({"paths": {"output": r"E:\我的成品"}}), encoding="utf-8")
+    _write_manifest_full(_isolate, {"modules": ["aigc"], "output_dir": r"D:\成品"})
+    assert modules.seed_output_dir() is False
+    data = json.loads((cfg / "config.json").read_text(encoding="utf-8"))
+    assert data["paths"]["output"] == r"E:\我的成品"
+
+
+def test_seed_output_dir_noop_without_manifest_or_config(_isolate, tmp_path, monkeypatch):
+    """清单没写 output_dir，或 config.json 还没生成：都静默跳过不抛。"""
+    cfg = _cfg_dir(tmp_path, monkeypatch)
+    _write_manifest_full(_isolate, {"modules": ["aigc"]})
+    (cfg / "config.json").write_text("{}", encoding="utf-8")
+    assert modules.seed_output_dir() is False        # 清单没选
+    _write_manifest_full(_isolate, {"modules": ["aigc"], "output_dir": r"D:\成品"})
+    (cfg / "config.json").unlink()
+    assert modules.seed_output_dir() is False        # 首配向导还没跑，不抢跑

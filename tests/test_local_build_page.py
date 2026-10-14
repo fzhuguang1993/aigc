@@ -25,9 +25,10 @@ def test_nav_entry_and_index():
     idxes = [i for _t, i in mw._NAV_PAGES]
     assert 13 in idxes
     assert len(idxes) == len(set(idxes))          # 无重复索引
-    # 页栈装配数：新页追加末尾，0..14 共 15 页（含索引 14 的「🎛 UI 组件库」）；
-    # 导航未列的 7/8/10/11/12 由代码常驻
-    assert sorted(set(idxes) | {7, 8, 10, 11, 12}) == list(range(15))
+    # 页栈装配数：新页追加末尾，0..14 共 15 页；
+    # 导航不列的 5/7/8/10/11/12/14（新手、接口管理、组织结构、工坊三页、UI 组件库）
+    # 由代码常驻或口令解锁后才进导航
+    assert sorted(set(idxes) | {5, 7, 8, 10, 11, 12, 14}) == list(range(15))
 
 
 def test_local_build_page_four_tabs(qapp):

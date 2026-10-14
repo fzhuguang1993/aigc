@@ -7,6 +7,9 @@ gui/pages_output_lib.py —— 成品库（生成产物 + 混剪结果，卡片�
 （右键绑定，落 output_binds 表），其次自动 join（runs/tasks）。可按 产品（含未分类）
 / 标记 / 名称 搜索筛选。
 
+卡片网格（封面首帧 + 滚动标题 + 徽标 + 框选多选 + 自适应重排）整体上收为共享组件
+gui.media_grid.MediaGrid，素材库/混剪选择器同款；本页只保留成品库业务（筛选/操作/回收站）。
+
 顶部标注当前存储后端（本轮本地）。整目录扫描不便宜，定时刷新节流到每 6 秒一次，
 并靠「行签名」判是否真变了，没变就不重建卡片（防闪烁/防抖）。
 """
@@ -14,41 +17,28 @@ import time
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QRect, QSize, QEvent
-from PySide6.QtGui import QPixmap, QColor, QPainter, QFont, QFontMetrics
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject, QEvent
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                               QComboBox, QLineEdit, QScrollArea, QGridLayout,
-                               QSizePolicy, QMessageBox, QFrame, QDialog,
-                               QCheckBox,
-                               QRubberBand, QInputDialog)
+                               QComboBox, QLineEdit, QMessageBox, QDialog, QInputDialog,
+                               QSplitter, QPlainTextEdit, QToolButton, QApplication)
 
 from store import output_store
+from core import video_categories
 from utils.desktop_utils import open_path, reveal_in_folder
-from gui.header import page_header
+from gui.header import page_header, Card
 from gui.menus import StyledMenu
 from gui.widgets import VideoPlayerDialog
-from gui.theme import tokenize
 from gui.dialogs_product import pick_product
+from gui.media_grid import MediaGrid, fmt_size
+from gui.tree_filter import TreeFilterPanel
 
 _AUTO_SEC = 6.0      # 定时刷新最小间隔（整目录扫描不便宜，别 2 秒刷一次）
-CARD_W = 200
-THUMB_H = 118
-GRID_GAP = 14
 
 _MARK_LABEL = {"ok": "🟢可用", "bad": "🔴不可用"}
 
 # 右键「排序」子菜单项：生成日期（文件时间）/ 名称，两个方向都可切
 _SORT_ITEMS = (("time_desc", "生成日期（新→旧）"), ("time_asc", "生成日期（旧→新）"),
                ("name_asc", "名称（A→Z）"), ("name_desc", "名称（Z→A）"))
-
-# 卡片两种描边：普通（hover 变主蓝粗边 + 淡蓝底做强调）/ 选中（主蓝粗边）
-_CARD_STYLE = ("#OlCard{background:#FFFFFF; border:1px solid #E5E6EB;"
-               "border-radius:8px;}"
-               "#OlCard:hover{border:1px solid #3A6EE8; background:#F5F8FF;}")
-_CARD_STYLE_SEL = ("#OlCard{background:#F5F8FF; border:2px solid #3A6EE8;"
-                   "border-radius:8px;}")
-# 缩略图左上角的选择框：只留控件本身，不加任何底色贴片（用户反馈：周围那圈半透白不要）
-_CHECK_STYLE = "QCheckBox{background:transparent;border:none;margin:6px;padding:2px;}"
 
 # 顶部「成品库 / 回收站」分段切换：选中高亮主蓝，未选灰底
 _VIEW_ON = ("QPushButton{background:#3A6EE8;color:#FFFFFF;border:none;"
@@ -57,255 +47,151 @@ _VIEW_OFF = ("QPushButton{background:#F2F3F5;color:#4E5969;"
              "border:1px solid #E5E6EB;border-radius:6px;padding:4px 12px;}")
 
 
-def _fmt_size(n):
-    n = float(n or 0)
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
+class OutputAsrWorker(QThread):
+    """成品库口播增量转写：单后台线程串行跑 Whisper，不碰任何 Qt 对象。
 
+    入队只接「库里尚无 transcript 行」的视频（每条只转写一次）；无就绪模型时调用方不建本
+    worker（静默跳过、不弹）； Vad 已内置于 transcribe，纯 BGM/无声自然出空文本→has_speech=0。
+    每完成一条用 done_one 信号回主线程（路/正文/是否有口播/模型/耗时秒/错误）。
+    单条失败不再静默丢弃：带错误回主线程记入日志流水（不写库→下次可重试）。"""
 
-def _thumb_tile():
-    """缩略占位：深色底 + 摄影机字形（不逐条解码首帧，扫描/刷新都很轻）。"""
-    pm = QPixmap(CARD_W, THUMB_H)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor("#1F2329"))
-    p.drawRoundedRect(0, 0, CARD_W, THUMB_H, 8, 8)
-    p.setPen(QColor("#8A93A6"))
-    f = QFont()
-    f.setPointSize(30)
-    p.setFont(f)
-    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "\U0001F3AC")
-    p.end()
-    return pm
+    done_one = Signal(str, str, int, str, float, str)   # path, text, has_speech, model, 耗时, 错误
 
-
-class _MarqueeLabel(QWidget):
-    """标题标签：静止时单行放不下就省略号；鼠标移入（由卡片 start_scroll 驱动）改成
-    按宽度自动换行后「上下滚动」，几行滚完再回到顶部循环——很快就能读完长标题。
-    自身不吃鼠标事件（透明于鼠标），进/出由外层卡片 enterEvent/leaveEvent 统一触发。"""
-
-    def __init__(self, text="", bold=False, color="#1F2329", px=11, lines=2, parent=None):
+    def __init__(self, size, paths, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._text = str(text or "")
-        self._color = color
-        self._voff = 0
-        self._scrolling = False
-        self._lines = None          # 换行后的行列表（移入滚动时才有值）
-        self._total = 0             # 换行后总高
-        self._f = QFont()
-        self._f.setPointSize(px)
-        self._f.setBold(bold)
-        self._timer = QTimer(self)
-        self._timer.setInterval(40)
-        self._timer.timeout.connect(self._tick)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(QFontMetrics(self._f).height() * max(1, lines))
+        self._size = size
+        self._paths = [str(p) for p in (paths or []) if str(p or "").strip()]
+        self._stop = False
 
-    def set_text(self, text):
-        self._text = str(text or "")
-        self._voff = 0
-        self._scrolling = False
-        self._lines = None
-        self._timer.stop()
-        self.update()
+    def request_stop(self):
+        self._stop = True
 
-    def _fm(self):
-        return QFontMetrics(self._f)
-
-    def _wrap(self, width):
-        """按字符贪心换行（成品名多为 CJK/无空格，逐字排最稳）。"""
-        fm = self._fm()
-        out, cur = [], ""
-        for ch in self._text:
-            if ch == "\n":
-                if cur:
-                    out.append(cur)
-                    cur = ""
-                continue
-            cand = cur + ch
-            if fm.horizontalAdvance(cand) <= width or not cur:
-                cur = cand
-            else:
-                out.append(cur)
-                cur = ch
-        if cur:
-            out.append(cur)
-        return out or [self._text]
-
-    def start_scroll(self):
-        # 卡片鼠标移入时调用：算好换行，行数超过可视高度才上下滚，否则静态显全部行
-        if self.width() <= 0:
-            return
-        lh = self._fm().height()
-        self._lines = self._wrap(max(1, self.width() - 2))
-        self._total = len(self._lines) * lh
-        if self._total > self.height() + 1:
-            self._voff = 0
-            self._scrolling = True
-            self._timer.start()
-        else:
-            self._scrolling = False
-            self._timer.stop()
-        self.update()
-
-    def stop_scroll(self):
-        self._scrolling = False
-        self._lines = None
-        self._timer.stop()
-        self.update()
-
-    def _tick(self):
-        maxoff = max(0, self._total - self.height())
-        self._voff += 1
-        if self._voff > maxoff:      # 滚到底回顶循环
-            self._voff = 0
-        self.update()
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        p.setFont(self._f)
-        p.setPen(QColor(self._color))
-        fm = self._fm()
-        w, h = self.width(), self.height()
-        lh = fm.height()
-        if self._lines is None:
-            # 静止态：单行放不下用省略号
-            tw = fm.horizontalAdvance(self._text)
-            txt = fm.elidedText(self._text, Qt.TextElideMode.ElideRight, w - 2) \
-                if tw > w - 2 else self._text
-            p.drawText(0, 0, w, h,
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
-        else:
-            # 移入态：换行后上下滚（放不下裁剪平移；放得下整段居中显出）
-            p.setClipRect(0, 0, w, h)
-            y = -self._voff if self._scrolling else max(0, (h - self._total) // 2)
-            for ln in self._lines:
-                p.drawText(0, int(y), w, lh,
-                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, ln)
-                y += lh
-        p.end()
+    def run(self):
+        from video_text_tools.asr import transcribe as tr
+        for path in self._paths:
+            if self._stop:
+                break
+            t0 = time.perf_counter()
+            try:
+                if not Path(path).exists():
+                    continue
+                segments, full_text = tr.transcribe(
+                    path, size=self._size, should_stop=lambda: self._stop)
+                text = (full_text or "").strip()
+                has = 1 if (text and segments) else 0
+                self.done_one.emit(path, text, has, self._size,
+                                   time.perf_counter() - t0, "")
+            except Exception as e:
+                # 单条失败（缺依赖/解码错）：带错误回主线程记流水，不写库→下次可重试
+                self.done_one.emit(path, "", 0, self._size,
+                                   time.perf_counter() - t0, str(e))
 
 
-class _OutputCard(QFrame):
-    """单张成品卡：缩略占位 + 文件名/产品徽标/标记·大小·日期。
+class _EscCloseFilter(QObject):
+    """挂在 QApplication 上的临时事件过滤器：捕获任意处的 Esc 键→收起宿主浮窗。
+    浮窗自身不抢焦点（WA_ShowWithoutActivating），收不到按键，故走应用级过滤。"""
 
-    整卡可点开预览（mouseRelease）；右键出操作菜单。产品徽标：人工绑定标 🖇、
-    自动归属直接显名、都没有显「未分类」。"""
+    def __init__(self, bubble):
+        super().__init__(bubble)
+        self._bubble = bubble
 
-    def __init__(self, row, on_open, on_menu, on_check=None, is_multi=None,
-                 show_physical=False, trash=False, parent=None):
-        super().__init__(parent)
-        self.row = row
-        self._path = row.get("path") or ""
-        self._on_open = on_open
-        self._on_menu = on_menu
-        self._on_check = on_check
-        # 多选是否开启由页面提供：开启时点卡片任意位置只切换勾选，不再跳播放
-        self._is_multi = is_multi or (lambda: False)
-        self.setObjectName("OlCard")
+    def eventFilter(self, obj, e):
+        if (e.type() == QEvent.Type.KeyPress
+                and e.key() == Qt.Key.Key_Escape):
+            self._bubble.hide()
+            return True
+        return super().eventFilter(obj, e)
+
+
+class _ScriptBubble(QWidget):
+    """口播脚本悬停浮窗：无边框小提示窗，展示逐字稿 + 复制；单例复用，
+    鼠标移入徽标时弹在徽标旁（越界自动翻到左/上侧），✕ 收起。
+    只给悬停用（非模态）；点击徽标走完整弹窗 _view_transcript。
+    鼠标移出「徽标 + 浮窗」两个范围即刻收起（轮询光标位置，任一在框内都留着）；
+    任意处按 Esc 也能手动关闭。Alt+Tab 切到其它应用时自动消失（无 WindowStaysOnTopHint）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool
+                         | Qt.WindowType.FramelessWindowHint)   # ← 去掉 WindowStaysOnTopHint
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(_CARD_STYLE)
-        self.setFixedSize(CARD_W, THUMB_H + 112)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)  # 不抢焦点
+        self.setObjectName("ScriptBubble")
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
-        # 缩略图与选择框叠在同一格：框浮在左上角，不占额外行高
-        wrap = QWidget()
-        g = QGridLayout(wrap)
-        g.setContentsMargins(0, 0, 0, 0)
-        g.setSpacing(0)
-        self.thumb = QLabel()
-        self.thumb.setFixedSize(CARD_W, THUMB_H)
-        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumb.setPixmap(_thumb_tile())
-        g.addWidget(self.thumb, 0, 0)
-        self.chk = QCheckBox()
-        self.chk.setStyleSheet(_CHECK_STYLE)
-        self.chk.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.chk.setToolTip("可勾选；也可在空白处按住鼠标拖动框选（右键空白→退出多选可关闭）")
-        self.chk.toggled.connect(self._on_toggled)
-        self.chk.setVisible(False)   # 多选默认关：选框藏起来，点「多选」后才出现
-        g.addWidget(self.chk, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        v.addWidget(wrap)
-        r = row
-        # 名称：物理名带后缀，外显名去后缀（或用户自定义）；长名移入后自动换行上下滚动
-        if show_physical:
-            name = r.get("name") or Path(r.get("path") or "").name
-        else:
-            name = output_store.default_display(r) or (r.get("name") or "")
-        if trash:
-            tags = "🗑 已在回收站"
-        else:
-            prod = r.get("product") or ""
-            tags = (("🖇 " if r.get("bound") else "🏷 ") + prod) if prod else "🏷 未分类"
-        flag = _MARK_LABEL.get(r.get("mark"), "")
-        meta = (f"{_fmt_size(r.get('size'))} · {(r.get('created_at') or '')[5:16]}"
-                + (f" · {flag}" if flag else ""))
-        # 下方文字：左右留白加大（原来 10px 太挤），名称单独一行用上下滚动标题控件
-        info = QWidget()
-        iv = QVBoxLayout(info)
-        iv.setContentsMargins(12, 8, 12, 10)
-        iv.setSpacing(3)
-        self._lbl_name = _MarqueeLabel(name, bold=True, color="#1F2329", px=10)
-        self._lbl_name.setToolTip(name)
-        iv.addWidget(self._lbl_name)
-        self.lbl_tags = QLabel(tags)
-        self.lbl_tags.setStyleSheet(
-            "font-size:11px; color:#7C5CFF; background:transparent; border:none;")
-        iv.addWidget(self.lbl_tags)
-        self.lbl_meta = QLabel(meta)
-        self.lbl_meta.setStyleSheet(
-            tokenize("font-size:11px; color:#8F959E; background:transparent; border:none;"))
-        iv.addWidget(self.lbl_meta)
-        v.addWidget(info, 1)
+        v.setContentsMargins(10, 8, 10, 10)
+        v.setSpacing(6)
+        head = QHBoxLayout()
+        self.lbl_title = QLabel()
+        self.lbl_title.setObjectName("PageTip")
+        head.addWidget(self.lbl_title, 1)
+        # ✕ 用 QToolButton+autoRaise，避免 GhostBtn 内边距把字形挤出 FixedWidth 只显外框
+        b_close = QToolButton()
+        b_close.setText("\u2715")
+        b_close.setAutoRaise(True)
+        b_close.setFixedSize(20, 20)
+        b_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        b_close.clicked.connect(self.hide)
+        head.addWidget(b_close)
+        v.addLayout(head)
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        v.addWidget(self.view, 1)
+        b_copy = QPushButton("\U0001f4cb 复制全部")
+        b_copy.setObjectName("GhostBtn")
+        b_copy.clicked.connect(lambda: (self.view.selectAll(), self.view.copy()))
+        v.addWidget(b_copy)
+        self.resize(380, 300)
+        # 光标一旦同时离开「徽标」和「浮窗」→ 立即收起：用一个短轮询定时器查全局光标
+        # 位置，比依赖 enter/leave 可靠（直接从徽标移到别处、从不进浮窗也能及时收）。
+        self._anchor = None        # 触发本次弹出的徽标控件（判定「是否还在 item 上」）
+        self._poll = QTimer(self)
+        self._poll.setInterval(80)
+        self._poll.timeout.connect(self._check_cursor)
+        self._esc_filter = _EscCloseFilter(self)   # 捕获全局 Esc 关闭（浮窗不抢焦点）
+        from gui.theme import tokenize
+        self.setStyleSheet(tokenize(
+            "#ScriptBubble{background:#FFFFFF;border:1px solid #C9CDD4;"
+            "border-radius:8px;}"))
 
-    def enterEvent(self, e):
-        # 鼠标移入：长名自动换行上下滚动（CSS :hover 同时做描边/底色强调）
-        self._lbl_name.start_scroll()
-        super().enterEvent(e)
+    def show_for(self, title, text, pos, anchor=None):
+        self._anchor = anchor
+        self.lbl_title.setText(f"\U0001f399 {title} \u00b7 共 {len(text)} 字")
+        self.view.setPlainText(text)
+        from PySide6.QtGui import QGuiApplication
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        x, y = int(pos.x()), int(pos.y())
+        if x + self.width() > scr.right():        # 右侧装不下→改放徽标左侧
+            x = int(pos.x()) - self.width() - 12
+        x = max(scr.left() + 4, min(x, scr.right() - self.width() - 4))
+        if y + self.height() > scr.bottom():
+            y = scr.bottom() - self.height() - 4
+        y = max(scr.top() + 4, y)
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        QApplication.instance().installEventFilter(self._esc_filter)
+        self._poll.start()
 
-    def leaveEvent(self, e):
-        self._lbl_name.stop_scroll()
-        super().leaveEvent(e)
+    def _check_cursor(self):
+        """光标是否还在徽标或浮窗任一方框内；都不在 → 立即收起。"""
+        from PySide6.QtGui import QCursor
+        gp = QCursor.pos()
+        if self.geometry().contains(gp):
+            return                                  # 还在浮窗内（允许阅读/复制）
+        a = self._anchor
+        if a is not None and a.isVisible():
+            try:
+                if a.rect().contains(a.mapFromGlobal(gp)):
+                    return                          # 还在徽标上
+            except RuntimeError:
+                self._anchor = None                 # 徽标已随卡片销毁
+        self.hide()
 
-    def set_image(self, img):
-        """后台抽好的首帧上色：按卡片尺寸铺满（多余裁掉），抽不到保留占位。"""
-        if img is None or img.isNull():
-            return
-        pm = QPixmap.fromImage(img).scaled(
-            CARD_W, THUMB_H, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation)
-        self.thumb.setPixmap(pm)
-
-    def _on_toggled(self, checked):
-        self.setStyleSheet(_CARD_STYLE_SEL if checked else _CARD_STYLE)
-        if self._on_check is not None:
-            self._on_check(self._path, checked)
-
-    def set_selected(self, checked):
-        """页面回填选中态（重建卡片时按已选集合恢复）：屏蔽信号避免回调重复计数。"""
-        self.chk.blockSignals(True)
-        self.chk.setChecked(bool(checked))
-        self.chk.blockSignals(False)
-        self.setStyleSheet(_CARD_STYLE_SEL if checked else _CARD_STYLE)
-
-    def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
-            if self._is_multi():
-                self.chk.toggle()   # 多选模式：整卡点击只切换勾选，不跳播放
-            else:
-                self._on_open(self.row)
-        super().mouseReleaseEvent(e)
-
-    def contextMenuEvent(self, e):
-        self._on_menu(self.row, e.globalPos())
+    def hideEvent(self, e):
+        self._poll.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self._esc_filter)
+        super().hideEvent(e)
 
 
 class OutputLibPage(QWidget):
@@ -338,7 +224,7 @@ class OutputLibPage(QWidget):
         bar.addWidget(QLabel("产品："))
         self.lbl_product = bar.itemAt(bar.count() - 1).widget()
         self.cb_product = QComboBox()
-        self.cb_product.currentIndexChanged.connect(lambda _=None: self._reload(force=True))
+        self.cb_product.currentIndexChanged.connect(lambda _=None: self._on_product_combo())
         bar.addWidget(self.cb_product)
         bar.addWidget(QLabel("标记："))
         self.lbl_mark = bar.itemAt(bar.count() - 1).widget()
@@ -363,6 +249,11 @@ class OutputLibPage(QWidget):
         self.lbl_hint = QLabel("")
         self.lbl_hint.setObjectName("PageTip")
         bar.addWidget(self.lbl_hint)
+        b_asr_log = QPushButton("📜 口播日志")
+        b_asr_log.setObjectName("GhostBtn")
+        b_asr_log.setToolTip("查看口播识别的执行统计与逐条流水日志")
+        b_asr_log.clicked.connect(self._open_asr_log)
+        bar.addWidget(b_asr_log)
         b_ref = QPushButton("🔄 刷新")
         b_ref.setObjectName("GhostBtn")
         b_ref.clicked.connect(lambda: self._reload(force=True))
@@ -373,51 +264,65 @@ class OutputLibPage(QWidget):
         bar.addWidget(b_root)
         lay.addLayout(bar)
 
-        self._area = QScrollArea()
-        self._area.setWidgetResizable(True)
-        self._area.setStyleSheet("QScrollArea{border:none;background:transparent;}")
-        self._holder = QWidget()
-        self._grid = QGridLayout(self._holder)
-        self._grid.setSpacing(GRID_GAP)
-        self._grid.setContentsMargins(10, 14, 10, 14)
-        self._area.setWidget(self._holder)
-        lay.addWidget(self._area, 1)
+        # 卡片网格用共享组件（成品库/素材库同款排版）：本页只喂取值/回调
+        self.grid = MediaGrid(key_of=lambda r: r["path"],
+                              path_of=lambda r: r["path"],
+                              build_display=self._display,
+                              on_open=self._open,
+                              on_menu=self._menu,
+                              on_selection_changed=self._update_sel_label,
+                              hover_preview=True,
+                              on_badge=self._badge_hit)
+        self.grid.set_empty_menu(self._empty_menu)
 
         self._lbl_empty = QLabel("成品库还没有内容：生成任务产出、或到「🎬 AI 混剪」导出，都会落在这里。")
         self._lbl_empty.setObjectName("PageTip")
         self._lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._lbl_empty.setWordWrap(True)
         self._lbl_empty.setVisible(False)
-        lay.addWidget(self._lbl_empty)
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
+        rv.addWidget(self.grid, 1)
+        rv.addWidget(self._lbl_empty)
+
+        # 左侧「视频类别树 + 产品树」筛选面板（包白卡，对齐产品页 tree_card 视觉）
+        self.panel = TreeFilterPanel(tag_title="视频类别", product_title="产品")
+        self.panel.tag_picked.connect(self._on_tree_tag)
+        self.panel.product_picked.connect(self._on_tree_product)
+        self.left_card = Card(margins=(8, 8, 8, 8))
+        self.left_card.v.addWidget(self.panel)
+        self.left_card.setFixedWidth(220)   # 固定最小宽度 220，不可拖宽
+
+        self.split = QSplitter(Qt.Orientation.Horizontal)
+        self.split.addWidget(self.left_card)
+        self.split.addWidget(right)
+        self.split.setCollapsible(0, False)   # 左栏固定
+        self.split.setSizes([220, 780])
+        lay.addWidget(self.split, 1)
 
         self._rows = []
-        self._cards = []
-        self._cols = 0
+        self._base = []           # 全量库行（做树计数 + 本地筛选的唯一数据源）
         self._sig = None
+        self._tree_sig = None
         self._media = None
         self._last_auto = 0.0
-        # 多选：跨搜索/筛选保留已选路径；当前可见路径（供「全选/计数」用）
-        self._multi = False
         self._sort = "time_desc"   # 默认排序：生成日期新→旧
         self._view = "lib"          # lib=成品库 / trash=回收站（页内视图切换）
         self._show_physical = False  # 卡片底部名称：False=外显名(去后缀/自定义)，True=物理名(带后缀)
-        self._selected = set()
-        self._visible = []
-        # 鼠标框选（卡片网格没有原生橡皮筋，手写）：空白处拖动即自动开启多选
-        self._rubber = None
-        self._rub_anchor = None
-        self._holder.installEventFilter(self)
-        self._holder.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._holder.customContextMenuRequested.connect(self._empty_menu_show)
-        # 首帧缩略图：按 path 缓存已抽好的图，后台只补缺的；重建卡片时直接复用
-        self._thumbs = {}
-        self._by_path = {}
-        from gui.thumb_cache import ThumbWorker
-        self._thumb_worker = ThumbWorker(self)
-        self._thumb_worker.ready.connect(self._on_thumb)
-        self._thumb_worker.start()
+        self._tag = ""             # 视频类别树选中的 category（''=全部）；产品/标记仍走顶栏下拉
+        self._tree_sync = False     # 树驱动下拉时置真，避免下拉回调二次刷新
+        from store import app_state
+        self._tree_visible = bool(app_state.get("output_tree_visible", True))
+        self._asr = None               # 后台口播转写 worker（单线程串行；None=空闲）
+        self._asr_log = self._load_asr_log()  # 历史流水（已持久化，最多500条）+ 本会话追加
+        self._asr_failed = set()       # 本会话已失败/跳过的路径（不每 6 秒热重试）
+        self._asr_model = ""           # 最近一次用到的模型 size
+        self._bubble = None            # 悬停脚本浮窗（单例复用）
         self.rebuild_filters()
         self._update_view_buttons()
+        self._apply_tree_visible()
         self._reload(force=True)
 
     # ---------------- 数据 ----------------
@@ -458,57 +363,51 @@ class OutputLibPage(QWidget):
 
     def _reload(self, force=False):
         if self._is_trash():
-            # 回收站视图：数据源换成 output_store.list_trash()（产品/标记筛选对它无意义）
+            # 回收站视图：数据源换成 output_store.list_trash()（产品/标记/标签筛选对它无意义）
+            self._base = []
             rows = self._sorted(output_store.list_trash())
             sig = tuple((r["path"], r.get("display", "")) for r in rows)
         else:
-            product = self._picked_product()
-            mark = self._mark_val.get(self.cb_mark.currentText(), "")
-            rows = output_store.list_outputs(product=product,
-                                             mark=(mark if mark != "none" else ""))
-            if mark == "none":
-                rows = [r for r in rows if not r["mark"]]
-            rows = self._sorted(rows)
+            # 一次全量扫库做唯一数据源：树计数与产品/标记/标签筛选都在本地切
+            self._base = output_store.list_outputs()
+            rows = self._filtered(self._base)
             sig = tuple((r["path"], r["product"], r["mark"], r["bound"],
                          r.get("display", "")) for r in rows)
         self._last_auto = time.monotonic()
         self._rows = rows
+        self._refresh_trees()
         if force or sig != self._sig:
             self._sig = sig
             self._render()
+        # 库刷完顺手提交待识别队列（开关开 + 模型就绪才跑；无则静默跳过）
+        self._maybe_asr()
+
+    def _display(self, r):
+        """卡片文案：名称（物理/外显）、徽标（产品/回收站）、meta（大小·日期·标记）。
+        交给 MediaGrid 的 build_display；物理/回收站显示态由本页开关决定。"""
+        if self._show_physical:
+            name = r.get("name") or Path(r.get("path") or "").name
+        else:
+            name = output_store.default_display(r) or (r.get("name") or "")
+        if self._is_trash():
+            tags = "🗑 已在回收站"
+        else:
+            prod = r.get("product") or ""
+            tags = (("🖇 " if r.get("bound") else "🏷 ") + prod) if prod else "🏷 未分类"
+        flag = _MARK_LABEL.get(r.get("mark"), "")
+        meta = (f"{fmt_size(r.get('size'))} · {(r.get('created_at') or '')[5:16]}"
+                + (f" · {flag}" if flag else ""))
+        badge = "🎙 口播" if r.get("has_speech") else ""
+        return {"name": name, "tags": tags, "meta": meta, "tooltip": name,
+                "badge": badge}
 
     def _render(self):
         kw = (self.ed_search.text() or "").strip().lower()
-        for c in self._cards:
-            c.deleteLater()
-        self._cards = []
-        self._by_path = {}
-        pending = []
-        while self._grid.count():
-            self._grid.takeAt(0)
-        shown = 0
-        self._visible = []
-        for r in self._rows:
-            if kw and kw not in (r.get("name") or "").lower():
-                continue
-            card = _OutputCard(r, self._open, self._menu, self._on_check,
-                               is_multi=self._multi_on,
-                               show_physical=self._show_physical, trash=self._is_trash(),
-                               parent=self._holder)
-            card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            card.set_selected(r["path"] in self._selected)
-            card.chk.setVisible(self._multi_on())   # 重建卡片后保持多选开关态
-            self._cards.append(card)
-            path = r["path"]
-            self._by_path[path] = card
-            self._visible.append(path)
-            img = self._thumbs.get(path)
-            if img is not None:
-                card.set_image(img)
-            else:
-                pending.append((path, r.get("_ts")))
-            shown += 1
-        self._thumb_worker.submit(pending)
+        rows = self._rows
+        if kw:
+            rows = [r for r in rows if kw in (r.get("name") or "").lower()]
+        self.grid.set_rows(rows)
+        shown = self.grid.count()
         self.lbl_hint.setText(
             f"共 {len(self._rows)} 条 · 显示 {shown} 条 · 后端：{self.current_backend()}")
         self._update_sel_label()
@@ -519,37 +418,305 @@ class OutputLibPage(QWidget):
             self._lbl_empty.setText(
                 "成品库还没有内容：生成任务产出、或到「🎬 AI 混剪」导出，都会落在这里。")
         self._lbl_empty.setVisible(shown == 0)
-        self._relayout()
 
-    def _on_thumb(self, path, img):
-        """后台抽好一帧：存缓存并给仍在屏上的对应卡片上色。"""
-        if img is None or img.isNull():
+    # ---------------- 筛选（产品/标记/标签 + 树） ----------------
+    def _filtered(self, base):
+        """本地按 产品/标记/标签 过滤（数据源是同一次全量 base，不再二扫）。"""
+        prod = self._picked_product()
+        mark = self._mark_val.get(self.cb_mark.currentText(), "")
+        out = []
+        for r in base:
+            if prod == output_store.UNBOUND:
+                if r["product"]:
+                    continue
+            elif prod:
+                if r["product"] != prod:
+                    continue
+            if self._tag and (r.get("category") or "") != self._tag:
+                continue
+            if mark == "none":
+                if r["mark"]:
+                    continue
+            elif mark:
+                if r["mark"] != mark:
+                    continue
+            out.append(r)
+        return self._sorted(out)
+
+    @staticmethod
+    def _count_pairs(rows, field, unbound_label=""):
+        """按 field 统计取值→计数；空值归 unbound_label（不给则跳过）。名称排序，
+        「未分类」置底。回 [(显示值, 计数)]（显示值＝原值或 unbound_label）。"""
+        cnt = {}
+        for r in rows:
+            v = (r.get(field) or "").strip()
+            if not v:
+                if unbound_label:
+                    cnt[unbound_label] = cnt.get(unbound_label, 0) + 1
+                continue
+            cnt[v] = cnt.get(v, 0) + 1
+        named = sorted((k, c) for k, c in cnt.items() if k != unbound_label) \
+            if unbound_label else sorted(cnt.items())
+        if unbound_label and unbound_label in cnt:
+            named = named + [(unbound_label, cnt[unbound_label])]
+        return named
+
+    def _prod_display(self):
+        """当前产品下拉→树显示值：全部=index0→''；否则用文本（含「未分类」）。"""
+        if self.cb_product.currentIndex() <= 0:
+            return ""
+        return self.cb_product.currentText()
+
+    def _refresh_trees(self):
+        """用 base 重算两棵树的取值/计数（只在 base 签名变了才重建，否则只回选），
+        避免定时刷新把树的展开态反复抝。"""
+        if self._is_trash():
+            self.panel.set_tag([], 0, "")
+            self.panel.set_product([], 0, "")
+            self._tree_sig = None
             return
-        self._thumbs[path] = img
-        card = self._by_path.get(path)
-        if card is not None:
-            card.set_image(img)
+        base = self._base
+        pairs_tag = self._count_pairs(base, "category", unbound_label="未分类")
+        pairs_prod = self._count_pairs(base, "product", unbound_label="未分类")
+        tree_sig = (len(base), tuple(pairs_prod), tuple(pairs_tag))
+        cur_prod = self._prod_display()
+        if tree_sig != self._tree_sig:
+            self._tree_sig = tree_sig
+            self.panel.set_tag(pairs_tag, len(base), current=self._tag)
+            self.panel.set_product(pairs_prod, len(base), current=cur_prod)
+        else:
+            self.panel.select_tag(self._tag)
+            self.panel.select_product(cur_prod)
+
+    def _on_product_combo(self):
+        if self._tree_sync:
+            return
+        self._reload(force=True)
+
+    def _on_tree_product(self, value):
+        """树选了某个产品（''=全部/「未分类」/产品名）→ 同步顶栏下拉后刷新。"""
+        self._tree_sync = True
+        try:
+            if not value:
+                self.cb_product.setCurrentIndex(0)
+            else:
+                idx = self.cb_product.findText(value)
+                if idx >= 0:
+                    self.cb_product.setCurrentIndex(idx)
+        finally:
+            self._tree_sync = False
+        self._reload(force=True)
+
+    def _on_tree_tag(self, value):
+        self._tag = value or ""
+        self._reload(force=True)
+
+    def _apply_tree_visible(self):
+        self.left_card.setVisible(self._tree_visible and not self._is_trash())
+
+    def _toggle_tree(self):
+        self._tree_visible = not self._tree_visible
+        from store import app_state
+        app_state.set_value("output_tree_visible", self._tree_visible)
+        self._apply_tree_visible()
+
+    # ---------------- 口播识别（增量后台 Whisper） ----------------
+    @staticmethod
+    def _asr_autorun():
+        from store import app_state
+        return bool(app_state.get("output_asr_autorun", True))
+
+    def _toggle_asr(self):
+        """⚙ 操作菜单开/关自动识别：关→停当前 worker；开→刷一次（顺带提交待识别）。"""
+        from store import app_state
+        new = not self._asr_autorun()
+        app_state.set_value("output_asr_autorun", new)
+        if not new and self._asr is not None and self._asr.isRunning():
+            self._asr.request_stop()
+            self._asr.wait(2000)
+            self._asr = None
+        elif new:
+            self._reload(force=True)
+
+    def _load_asr_log(self):
+        """从 app_state 恢复持久化流水，失败给空列表。"""
+        import json
+        from store import app_state
+        try:
+            raw = app_state.get("output_asr_log")
+            data = json.loads(raw) if raw else []
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_asr_log(self):
+        """持久化当前流水（保留最近500条）。"""
+        import json
+        from store import app_state
+        try:
+            app_state.set_value("output_asr_log",
+                                json.dumps(self._asr_log[-500:], ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _maybe_asr(self):
+        """库刷完提交待识别队列：仅成品库视图 + 开关开 + 模型就绪；上一条 worker 未跑完不重开。
+
+        只队「尚无 transcript 行」（row['transcribed'] 为假）的视频，每条只转写一次；
+        无就绪模型→静默跳过（不弹不提示）。"""
+        if self._is_trash() or not self._asr_autorun():
+            return
+        if self._asr is not None and self._asr.isRunning():
+            return
+        try:
+            from video_text_tools.asr import transcribe as tr
+            size = tr.best_ready_size()
+        except Exception:
+            size = None
+        if not size:
+            return                       # 无就绪模型：静默不跑
+        pending = [r["path"] for r in self._base
+                   if r.get("path")
+                   and r.get("voiceover_marked")      # 只队已标记为口播素材的
+                   and not r.get("transcribed")
+                   and r["path"] not in self._asr_failed]
+        if not pending:
+            return
+        self._asr = OutputAsrWorker(size, pending, self)
+        self._asr.done_one.connect(self._on_asr_done)
+        self._asr.start()
+
+    def _on_asr_done(self, path, text, has_speech, model, elapsed, error):
+        """worker 回主线程：记流水；失败不写库（下次可重试），成功写库 + 对应卡片补徽标。"""
+        name = Path(path).name
+        text = text or ""
+        self._asr_model = model or self._asr_model
+        self._asr_log.append({
+            "name": name, "path": path, "has_speech": int(has_speech or 0),
+            "chars": len(text.strip()), "elapsed": float(elapsed or 0.0),
+            "model": model or "", "error": error or "",
+            "at": time.strftime("%H:%M:%S"),
+        })
+        if error:
+            self._asr_failed.add(path)
+            self.lbl_hint.setText(f"🎙 口播：{name} 识别失败（已跳过，下次重试）")
+            self._save_asr_log()
+            return
+        output_store.set_transcript(path, text, has_speech, model)
+        for r in self._base:
+            if r.get("path") == path:
+                r["transcribed"] = True
+                r["has_speech"] = 1 if (has_speech and text.strip()) else 0
+                r["transcript"] = text
+                break
+        if has_speech and text.strip():
+            self.grid.set_badge(path, "🎙 口播")
+        self._save_asr_log()
+
+    def _view_transcript(self, row):
+        """右键「查看/复制口播」：只读弹框展示逐字稿（可全选复制）。"""
+        text = (row.get("transcript") or "").strip()
+        if not text:
+            QMessageBox.information(self, "无口播", "这条未识别到口播（或尚未转写）。")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"口播逐字稿 · {output_store.default_display(row) or row.get('name', '')}")
+        dlg.resize(560, 460)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(f"共 {len(text)} 字"))
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text)
+        v.addWidget(view, 1)
+        row_b = QHBoxLayout()
+        b_copy = QPushButton("📋 复制全部")
+        b_copy.setObjectName("GhostBtn")
+        b_copy.clicked.connect(lambda: (view.selectAll(), view.copy(),
+                                        self.lbl_hint.setText("已复制口播到剪切板")))
+        b_close = QPushButton("关闭")
+        b_close.setObjectName("GhostBtn")
+        b_close.clicked.connect(dlg.accept)
+        row_b.addWidget(b_copy)
+        row_b.addStretch(1)
+        row_b.addWidget(b_close)
+        v.addLayout(row_b)
+        dlg.exec()
+
+    # ---------------- 徒标交互：悬停/点击看口播脚本 ----------------
+    def _badge_hit(self, row, kind, badge):
+        """卡片右上角 🎙 徒标被移入/点击：有脚本才弹。悬停→轻量浮窗，点击→完整弹窗。"""
+        text = (row.get("transcript") or "").strip()
+        if not text:
+            return
+        self.grid.cancel_hover()        # 不叠悬停视频预览
+        if kind == "click":
+            self._view_transcript(row)
+            return
+        from PySide6.QtCore import QPoint
+        tl = badge.mapToGlobal(badge.rect().topRight())
+        if self._bubble is None:
+            self._bubble = _ScriptBubble(self)
+        title = output_store.default_display(row) or (row.get("name") or "")
+        self._bubble.show_for(title, text, QPoint(tl.x() + 6, tl.y()), anchor=badge)
+
+    # ---------------- 口播识别日志 ----------------
+    def _open_asr_log(self):
+        """📜 口播日志：执行统计（库内/已识别/有口播/待识别/失败 + 模型 + 耗时）+ 逐条流水。"""
+        base = self._base
+        n_total = len(base)
+        n_tr = sum(1 for r in base if r.get("transcribed"))
+        n_sp = sum(1 for r in base if r.get("has_speech"))
+        pend = sum(1 for r in base if r.get("path") and not r.get("transcribed")
+                   and r["path"] not in self._asr_failed)
+        total_s = sum(e["elapsed"] for e in self._asr_log)
+        model = self._asr_model
+        if not model:
+            try:
+                from video_text_tools.asr import transcribe as tr
+                model = tr.best_ready_size() or "—"
+            except Exception:
+                model = "—"
+        head = (f"库内 {n_total} 条 · 已识别 {n_tr} · 有口播 {n_sp} · 待识别 {pend} · 本会话失败 {len(self._asr_failed)}\n"
+                f"当前模型：{model} · 累计已处理 {len(self._asr_log)} 条 · 累计耗时 {total_s:.1f}s")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("口播识别 · 执行统计与日志")
+        dlg.resize(680, 480)
+        v = QVBoxLayout(dlg)
+        hl = QLabel(head)
+        hl.setWordWrap(True)
+        hl.setObjectName("PageTip")
+        v.addWidget(hl)
+        body = QPlainTextEdit()
+        body.setReadOnly(True)
+        lines = []
+        for e in self._asr_log:
+            if e["error"]:
+                st = "❌ 失败：" + (e["error"][:80] or "未知错误")
+            elif e["has_speech"] and e["chars"]:
+                st = f"✅ 有口播 {e['chars']} 字"
+            else:
+                st = "⚪ 无口播"
+            lines.append(f"{e['at']}  {e['name']}  ·  {st}  ·  {e['elapsed']:.1f}s  ·  {e['model']}")
+        body.setPlainText("\n".join(reversed(lines)) if lines else
+                          "本会话还没有口播识别流水（可能：未开启自动识别 / 无就绪模型 / 已全部识别）。")
+        v.addWidget(body, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b_close = QPushButton("关闭")
+        b_close.setObjectName("GhostBtn")
+        b_close.clicked.connect(dlg.accept)
+        row.addWidget(b_close)
+        v.addLayout(row)
+        dlg.exec()
 
     def closeEvent(self, e):
-        self._thumb_worker.request_stop()
-        self._thumb_worker.wait(1500)
+        self.grid.stop_worker()
+        if self._asr is not None and self._asr.isRunning():
+            self._asr.request_stop()
+            self._asr.wait(2000)
+        if self._bubble is not None:
+            self._bubble.hide()
         super().closeEvent(e)
-
-    def _relayout(self):
-        w = self._area.viewport().width()
-        cols = max(1, (w - 8 + GRID_GAP) // (CARD_W + GRID_GAP))
-        if cols != self._cols:
-            self._cols = cols
-        while self._grid.count():
-            self._grid.takeAt(0)
-        for i, card in enumerate(self._cards):
-            self._grid.addWidget(card, i // cols, i % cols,
-                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self._grid.setRowStretch(self._grid.rowCount(), 1)
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        QTimer.singleShot(0, self._relayout)
 
     # ---------------- 交互 ----------------
     def _open(self, row):
@@ -584,6 +751,11 @@ class OutputLibPage(QWidget):
         menu.addAction("⚪ 取消标记", lambda: self._set_mark([row], ""))
         menu.addSeparator()
         menu.addAction("🎬 送混剪", lambda: self._send_remix([row]))
+        menu.addSeparator()
+        menu.addAction("🎬 设置视频类别…", lambda: self._set_category_one(row))
+        if (row.get("category") or "").strip():
+            menu.addAction("✖ 清除视频类别", lambda: self._apply_category([row], ""))
+        menu.addMenu(self._build_voiceover_menu([row]))
         menu.addSeparator()
         menu.addAction("🗑 移入回收站", lambda: self._do_trash([row]))
         menu.exec(global_pos)
@@ -641,27 +813,147 @@ class OutputLibPage(QWidget):
         root.mkdir(parents=True, exist_ok=True)
         open_path(str(root))
 
-    # ---------------- 多选 / 批量操作 ----------------
-    def _multi_on(self):
-        return self._multi
+    def ingest_files(self, paths):
+        """右键「入库到成品库」落地：把视频复制进成品库扫描根（撞名挂 (2)），刷一次库。
 
-    def _set_multi(self, on):
-        """开/关多选：开 = 卡片出选框、点卡片任意位置即勾选（触发区=整张卡）；
-        关 = 收起选框并清空。开启入口：空白处拖动框选自动开，或右键空白处手动开。"""
-        if on == self._multi:
+        成品库是“扫盘只读视图”（不建独立表），文件必须在扫描根下才会出现，所以采用“复制”
+        而非移动（保留原文件）；返回成功条数。"""
+        import shutil
+        root = output_store.scan_root()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        done = 0
+        for p in (paths or []):
+            src = Path(str(p or ""))
+            if not src.is_file():
+                continue
+            target = output_store._free_target(root, src.stem, src.suffix)
+            try:
+                shutil.copy2(str(src), str(target))
+                done += 1
+            except OSError:
+                continue
+        if done:
+            self._reload(force=True)
+        return done
+
+    # ---------------- 口播素材标记 / 逐字稿（多级右键） ----------------
+    def _build_voiceover_menu(self, rows):
+        """「🎙 口播 ▸」子菜单（单卡传 [row]，批量传选中行）：
+        标记/取消口播素材、清除口播稿、查看/复制口播。"""
+        m = StyledMenu("🎙 口播", self)
+        marked = all(r.get("voiceover_marked") for r in rows if r)
+        if marked:
+            m.addAction("取消口播标记", lambda: self._set_voiceover(rows, False))
+        else:
+            m.addAction("标记为口播素材", lambda: self._set_voiceover(rows, True))
+        if any((r.get("transcript") or "").strip() or r.get("transcribed") for r in rows):
+            m.addAction("清除口播稿", lambda: self._clear_voiceover_script(rows))
+        if len(rows) == 1 and (rows[0].get("transcript") or "").strip():
+            m.addSeparator()
+            m.addAction("🎙 查看/复制口播", lambda: self._view_transcript(rows[0]))
+        return m
+
+    def _set_voiceover(self, rows, flag):
+        """批量标记/取消口播素材；标记后下次库刷新会自动排队跑 ASR。"""
+        paths = [r["path"] for r in rows if r and r.get("path")]
+        if not paths:
             return
-        self._multi = on
-        for c in self._cards:
-            c.chk.setVisible(on)
-        if not on:
-            self._clear_sel()
-        self._update_sel_label()
+        if flag:
+            output_store.mark_voiceover(paths)
+            self.lbl_hint.setText(f"已标记 {len(paths)} 条为口播素材")
+        else:
+            output_store.unmark_voiceover(paths)
+            self.lbl_hint.setText(f"已取消 {len(paths)} 条口播标记")
+        self._reload(force=True)
 
-    def _empty_menu_show(self, pos):
-        self._empty_menu().exec(self._holder.mapToGlobal(pos))
+    def _clear_voiceover_script(self, rows):
+        """清除选中成品的口播逐字稿（保留口播标记，只清文字）。"""
+        paths = [r["path"] for r in rows if r and r.get("path")]
+        if not paths:
+            return
+        for p in paths:
+            output_store.clear_transcript(p)
+        self.lbl_hint.setText(f"已清除 {len(paths)} 条口播稿")
+        self._reload(force=True)
+
+    # ---------------- 视频类别（手动归类，写入 output_categories） ----------------
+    def _set_category_one(self, row):
+        self._pick_category([row])
+
+    def _pick_category(self, rows):
+        """从词库选一个视频类别（含「自定义…」）写入 output_categories；当前类别预选。"""
+        cats = video_categories.load()
+        cur = (rows[0].get("category") or "") if rows else ""
+        items = (([cur] if cur and cur in cats else []) + cats + ["自定义…"])
+        # 去重保序（当前类别若在词库里，提到首位预选）
+        seen, opts = set(), []
+        for c in items:
+            if c not in seen:
+                seen.add(c)
+                opts.append(c)
+        pick, ok = QInputDialog.getItem(self, "设置视频类别", "选择类别（可自定义）：",
+                                        opts, opts.index(cur) if cur in opts else 0, False)
+        if not ok:
+            return
+        if pick == "自定义…":
+            pick, ok = QInputDialog.getText(self, "自定义视频类别", "新类别名：")
+            if not ok:
+                return
+            pick = pick.strip()
+            if not pick:
+                return
+            video_categories.add(pick)         # 自定义项进词库，下次可选
+        self._apply_category(rows, pick)
+
+    def _apply_category(self, rows, category):
+        """把一批成品归到某个视频类别（category='' 则清除分类）。"""
+        paths = [r["path"] for r in rows if r and r.get("path")]
+        if not paths:
+            return
+        for p in paths:
+            output_store.set_category(p, category)
+        self.lbl_hint.setText((f"已清除 {len(paths)} 条视频类别" if not category
+                               else f"已为 {len(paths)} 条设视频类别：{category}"))
+        self._reload(force=True)
+
+    def _act_set_category(self):
+        rows = self._require_sel()
+        if rows:
+            self._pick_category(rows)
+            self._clear_sel()
+
+    def _act_mark_voiceover(self):
+        rows = self._require_sel()
+        if rows:
+            self._set_voiceover(rows, True)
+            self._clear_sel()
+
+    def _act_unmark_voiceover(self):
+        rows = self._require_sel()
+        if rows:
+            self._set_voiceover(rows, False)
+            self._clear_sel()
+
+    def _act_clear_voiceover(self):
+        rows = self._require_sel()
+        if rows:
+            self._clear_voiceover_script(rows)
+            self._clear_sel()
+
+    # ---------------- 多选 / 批量操作 ----------------
+    def _set_multi(self, on):
+        """开/关多选（转交网格组件）：开 = 卡片出选框、点卡片任意位置即勾选；
+        关 = 收起选框并清空。开启入口：空白处拖动框选自动开，或右键空白处手动开。"""
+        self.grid.set_multi(on)
+
+    def _multi_on(self):
+        return self.grid.multi_on()
 
     def _empty_menu(self):
-        """空白处右键：最顶是多选开关，严格跟随当前多选态 self._multi——
+        """空白处右键：最顶是多选开关，严格跟随当前多选态——
         未开显示「开启多选」，已在多选态显示「退出多选」（含已选 0/1 条的情况）。
         文案与实际状态一一对应，点击必定切换生效。
         成品库态：开启后列 全选/反选/绑定/批量设显示名/批量重命名/移入回收站，常驻排序与名称显示切换。
@@ -670,9 +962,10 @@ class OutputLibPage(QWidget):
         注意：菜单项一律不用 setCheckable——windowsvista 会在项前画原生小圆框+对钩，
         很丑；当前状态靠文案表达（排序用「✓ 」文本前缀）。"""
         m = StyledMenu(self)
+        multi = self.grid.multi_on()
         if self._is_trash():
-            if self._multi:
-                m.addAction("退出多选", lambda: self._set_multi(False))
+            if multi:
+                m.addAction("退出多选", lambda: self.grid.set_multi(False))
                 m.addSeparator()
                 m.addAction("全选", self._act_select_all)
                 m.addAction("反选", self._act_invert)
@@ -681,12 +974,12 @@ class OutputLibPage(QWidget):
                 m.addAction("🗑 彻底删除选中", self._act_purge)
                 m.addAction("🧹 清空回收站", self._act_clear_trash)
             else:
-                m.addAction("开启多选", lambda: self._set_multi(True))
+                m.addAction("开启多选", lambda: self.grid.set_multi(True))
             m.addSeparator()
             m.addMenu(self._build_sort_menu())
             return m
-        if self._multi:
-            m.addAction("退出多选", lambda: self._set_multi(False))
+        if multi:
+            m.addAction("退出多选", lambda: self.grid.set_multi(False))
             m.addSeparator()
             m.addAction("全选", self._act_select_all)
             m.addAction("反选", self._act_invert)
@@ -696,9 +989,12 @@ class OutputLibPage(QWidget):
             m.addAction("✏ 批量重命名…", self._act_rename)
             m.addAction("🗑 移入回收站", self._act_delete)
         else:
-            m.addAction("开启多选", lambda: self._set_multi(True))
+            m.addAction("开启多选", lambda: self.grid.set_multi(True))
         m.addSeparator()
         m.addAction(self._physical_toggle_text(), self._toggle_physical)
+        m.addSeparator()
+        m.addAction("🌲 " + ("隐藏筛选树" if self._tree_visible else "显示筛选树"),
+                    self._toggle_tree)
         m.addSeparator()
         m.addMenu(self._build_sort_menu())
         return m
@@ -732,76 +1028,15 @@ class OutputLibPage(QWidget):
             return sorted(rows, key=lambda r: (r.get("created_at") or ""), reverse=True)
         return rows
 
-    def eventFilter(self, obj, e):
-        """在卡片网格的空白处按住拖动 = 橡皮筋框选，框到即自动开启多选并勾上；
-        多选态下单击空白（没拖动）= 清空勾选。卡片自身的点击由 _OutputCard 分流。"""
-        if obj is self._holder:
-            t = e.type()
-            if (t == QEvent.Type.MouseButtonPress
-                    and e.button() == Qt.MouseButton.LeftButton):
-                self._rub_anchor = e.position().toPoint()
-                if self._rubber is None:
-                    self._rubber = QRubberBand(
-                        QRubberBand.Shape.Rectangle, self._holder)
-                self._rubber.setGeometry(QRect(self._rub_anchor, QSize()))
-                self._rubber.show()
-            elif (t == QEvent.Type.MouseMove and self._rubber is not None
-                    and self._rubber.isVisible() and self._rub_anchor is not None):
-                self._rubber.setGeometry(
-                    QRect(self._rub_anchor, e.position().toPoint()).normalized())
-                return True
-            elif (t == QEvent.Type.MouseButtonRelease
-                    and e.button() == Qt.MouseButton.LeftButton
-                    and self._rubber is not None
-                    and self._rub_anchor is not None):
-                # 只收尾「一次由左键按下发起、还没消费掉」的框选手势：
-                # 右键释放不得进来——否则会用上一段框选残留的大 geometry 误判为
-                # 「框到东西」而直接开启多选（QRubberBand 对象一旦建就常驻、geometry 是脏的）。
-                rect = self._rubber.geometry()
-                self._rubber.hide()
-                self._rub_anchor = None
-                if rect.width() <= 4 and rect.height() <= 4:
-                    # 单击空白：没开多选时什么都不做；开着则清空
-                    if self._multi:
-                        self._clear_sel()
-                else:
-                    self._set_multi(True)   # 框选即多选
-                    for c in self._cards:
-                        c.chk.setChecked(c.geometry().intersects(rect))
-                return True
-        return super().eventFilter(obj, e)
-
-    def _on_check(self, path, checked):
-        """卡片选框变化：更新已选集合与计数（跨搜索/筛选保留）。"""
-        if checked:
-            self._selected.add(path)
-        else:
-            self._selected.discard(path)
-        self._update_sel_label()
-
     def _update_sel_label(self):
-        n = len(self._selected)
+        n = len(self.grid.selected())
         self.lbl_sel.setText(f"已选 {n} 条")
         self.lbl_sel.setVisible(n > 0)
         # 多选/已勾选时，批量入口改名“批量操作”；setMenu 自带箭头，文本不写 ▾
-        self.b_ops.setText("⚙ 批量操作" if (self._multi or n) else "⚙ 操作")
-
-    def _select_all(self):
-        for p in self._visible:
-            self._selected.add(p)
-        for c in self._cards:
-            c.set_selected(True)
-        self._update_sel_label()
+        self.b_ops.setText("⚙ 批量操作" if (self.grid.multi_on() or n) else "⚙ 操作")
 
     def _clear_sel(self):
-        self._selected.clear()
-        for c in self._cards:
-            c.set_selected(False)
-        self._update_sel_label()
-
-    def _selected_rows(self):
-        """已选且仍在当前数据里的行，按库默认序（修改时间倒序）——重命名序号按这个走。"""
-        return [r for r in self._rows if r["path"] in self._selected]
+        self.grid.clear_sel()
 
     def _rebuild_ops_menu(self):
         """「⚙ 操作/批量操作」按钮菜单：按当前视图重建（成品库给绑定/设显示名/重命名/移入回收站；
@@ -814,29 +1049,39 @@ class OutputLibPage(QWidget):
             m.addSeparator()
             m.addAction("🧹 清空回收站", self._act_clear_trash)
         else:
+            m.addAction("🎙 自动识别口播：" + ("开" if self._asr_autorun() else "关"),
+                        self._toggle_asr)
+            m.addAction("🌲 " + ("隐藏筛选树" if self._tree_visible else "显示筛选树"),
+                        self._toggle_tree)
+            m.addSeparator()
             m.addAction("🏷 绑定产品…", self._act_bind)
+            m.addAction("🎬 批量设置视频类别…", self._act_set_category)
             m.addAction("🏷 批量设置显示名称…", self._act_set_display)
+            vm = StyledMenu("🎙 口播", m)
+            vm.addAction("批量标记为口播素材", self._act_mark_voiceover)
+            vm.addAction("批量取消口播标记", self._act_unmark_voiceover)
+            vm.addAction("批量清除口播稿", self._act_clear_voiceover)
+            m.addMenu(vm)
             m.addSeparator()
             m.addAction("✏ 批量重命名…", self._act_rename)
             m.addSeparator()
             m.addAction("🗑 移入回收站", self._act_delete)
 
     def _require_sel(self):
-        rows = self._selected_rows()
+        rows = self.grid.selected_rows()
         if not rows:
             QMessageBox.information(self, "先选几条",
                                     "先空白处拖动框选，或右键空白处→开启多选后点选要操作的成品。")
         return rows
 
     def _act_select_all(self):
-        self._set_multi(True)
-        self._select_all()
+        self.grid.set_multi(True)
+        self.grid.select_all()
 
     def _act_invert(self):
         """反选：已勾的去掉、没勾的勾上（多选未开时先自动开启）。"""
-        self._set_multi(True)
-        for c in self._cards:
-            c.chk.setChecked(not c.chk.isChecked())
+        self.grid.set_multi(True)
+        self.grid.invert()
 
     def _act_bind(self):
         rows = self._require_sel()
@@ -884,9 +1129,10 @@ class OutputLibPage(QWidget):
         if view == self._view:
             return
         self._view = view
-        self._set_multi(False)
-        self._clear_sel()
+        self.grid.set_multi(False)
+        self.grid.clear_sel()
         self._update_view_buttons()
+        self._apply_tree_visible()
         self._reload(force=True)
 
     def _update_view_buttons(self):
@@ -920,7 +1166,7 @@ class OutputLibPage(QWidget):
         ) != QMessageBox.StandardButton.Yes:
             return
         ok, failed = output_store.to_trash(paths)
-        self._selected -= set(ok)
+        self.grid.discard_keys(ok)
         self._clear_sel()
         self._update_view_buttons()
         self._reload(force=True)
@@ -1021,4 +1267,3 @@ class OutputLibPage(QWidget):
         output_store.set_display(row["path"], text.strip())
         self._show_physical = False
         self._reload(force=True)
-

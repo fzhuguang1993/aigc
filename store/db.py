@@ -147,6 +147,29 @@ CREATE TABLE IF NOT EXISTS output_display(
   display TEXT DEFAULT '',
   updated_at TEXT DEFAULT ''
 );
+-- 成品口播逐字稿（增量后台 Whisper 转写）：以归一化绝对路径为主键，与绑定/标记/外显同口径。
+-- 每条只转写一次；has_speech=0 表示 VAD 判定纯 BGM/无声（卡片不显徽标）；model 记转写用的档位。
+CREATE TABLE IF NOT EXISTS output_transcripts(
+  path TEXT PRIMARY KEY,
+  text TEXT DEFAULT '',
+  has_speech INTEGER DEFAULT 0,
+  model TEXT DEFAULT '',
+  updated_at TEXT DEFAULT ''
+);
+-- 成品库「口播素材」标记：只有被手动标记的路径才允许后台跑 ASR 生成逐字稿
+-- （ASR 有时把环境音误识别成口播，故门控）。与 output_transcripts 解耦：标记先于
+-- 转写存在，取消标记不删已转写的稿。以归一化绝对路径为主键（与绑定/标记/外显同口径）。
+CREATE TABLE IF NOT EXISTS output_voiceover(
+  path TEXT PRIMARY KEY,
+  updated_at TEXT DEFAULT ''
+);
+-- 成品库「视频类别」（品牌类/促销类/情景剧…）：按路径手动赋值，与任务 tag 解耦
+-- （词库在设置里维护，core.video_categories）。成品库侧栏的类别维度读这张表。
+CREATE TABLE IF NOT EXISTS output_categories(
+  path TEXT PRIMARY KEY,
+  category TEXT DEFAULT '',
+  updated_at TEXT DEFAULT ''
+);
 -- 批量基建（抖音本地推搭计划）执行历史：一次「方案 × 账户」的搭建结果存一行。
 -- 只存回执与原因，真实创建结果以平台为准；CREATE TABLE IF NOT EXISTS 对新老库
 -- 都幂等，不进 _MIGRATIONS。
@@ -182,6 +205,19 @@ CREATE TABLE IF NOT EXISTS local_ad_accounts(
   secret_enc TEXT DEFAULT '', owner TEXT DEFAULT '', extra TEXT DEFAULT '{}',
   created_at TEXT DEFAULT '', updated_at TEXT DEFAULT ''
 );
+-- 剪贴板历史：复制过的文字/图片各落一行（独立于业务体系）。
+-- kind=text 时正文存 content；kind=image 时图片落盘 CLIPBOARD_DIR、path 存绝对路径，
+-- w/h 尺寸。列表显示用 preview（文字首行摘要 / "WxH"）。删行连带删图（见 clipboard_store）。
+CREATE TABLE IF NOT EXISTS clipboard_history(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT DEFAULT 'text',        -- text=文字  image=图片
+  content TEXT DEFAULT '',         -- 文字正文（kind=text）
+  path TEXT DEFAULT '',            -- 图片 PNG 绝对路径（kind=image）
+  preview TEXT DEFAULT '',         -- 列表显示：文字首行摘要 / "WxH"
+  w INTEGER DEFAULT 0, h INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_clipboard_kind ON clipboard_history(kind);
 """
 
 # 老库升级：列不存在时 ALTER 补上（重复执行安全）
@@ -217,6 +253,12 @@ _MIGRATIONS = (
     "ALTER TABLE local_build_runs ADD COLUMN customer_id INTEGER DEFAULT 0",
     "ALTER TABLE local_build_runs ADD COLUMN license_id INTEGER DEFAULT 0",
     "ALTER TABLE local_build_runs ADD COLUMN account_id INTEGER DEFAULT 0",
+    # 素材库口播标记与逐字稿列：只有标了 is_voiceover 的片段才跑 ASR；
+    # transcript 存逐字稿，has_speech=VAD 是否有语音，transcribed=是否已转写过。
+    "ALTER TABLE material_clips ADD COLUMN is_voiceover INTEGER DEFAULT 0",
+    "ALTER TABLE material_clips ADD COLUMN transcript TEXT DEFAULT ''",
+    "ALTER TABLE material_clips ADD COLUMN has_speech INTEGER DEFAULT 0",
+    "ALTER TABLE material_clips ADD COLUMN transcribed INTEGER DEFAULT 0",
 )
 
 

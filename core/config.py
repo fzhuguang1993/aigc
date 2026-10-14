@@ -110,6 +110,9 @@ EXPORT_DIR = _resolve_dir("export", str(RUNTIME_DIR / "exports"))
 #     拆解中间产物（下载的视频/关键帧/音频）落在运行目录 outputs/爆款拆解，用完即清。
 # ============================================================
 MODELS_DIR = str(CONFIG_DIR / "models")
+# 剪贴板历史：复制过的图片落盘的家（文字直接进 DB 的 content 列，图片只存路径，
+# 沿用 BREAKDOWN_LIBRARY 的“文件落盘 + DB 存路径”范式）。跟随隐藏配置家，不进 git。
+CLIPBOARD_DIR = str(CONFIG_DIR / "clipboard")
 BREAKDOWN_TMP = str(RUNTIME_DIR / "outputs" / "爆款拆解")
 # 拆解任务库：图集/封面持久落盘的家（跨会话回看，不随 BREAKDOWN_TMP 用完即清）。
 # 每条任务一个 task_<id>/ 子目录，内含 cover.jpg + gallery/f*.jpg；DB 只存路径与 payload。
@@ -521,7 +524,9 @@ def save_doubao_vision(api_key, endpoint, base_url=None):
 # ============================================================
 BREAKDOWN_DEFAULTS = {"vision_mode": "video_url", "fps": 0.5,
                       "blocks_types": ["钩子", "痛点", "产品介绍",
-                                        "权威背书", "使用场景", "行动号召"]}
+                                        "功能演示", "效果展示", "权威背书",
+                                        "用户评价", "使用场景", "促销优惠",
+                                        "行动号召", "结尾引导"]}
 
 
 def breakdown_config():

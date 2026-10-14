@@ -18,6 +18,28 @@ import core.config as config
 #: 启动后直接进托盘的参数（开机自启注册表写的就是它）
 TRAY_FLAGS = ("--minimized", "--tray")
 
+#: 右键入库发起参数：`--aigc-import <material|output> "<文件>"`（由资源管理器菜单触发）
+IMPORT_FLAG = "--aigc-import"
+
+
+def pop_import_args(argv=None):
+    """从 argv 取走全部 `--aigc-import <目标> <文件>`，逐条落进共享导入队列；返回取到的条数。
+
+    必须早于 QApplication：Qt 会把不认识的参数当自己的选项解析（同 pop_tray_flag）。
+    目标只认 material/output，其余忽略（防手滑）；无论“已有一个在跑”还是“本实例首发”，
+    都先写队列，再由在跑的实例排空——保证多次连点右键不丢。"""
+    argv = sys.argv if argv is None else argv
+    from core import shell_integration as sh
+    n, i = 0, 0
+    while i < len(argv):
+        if argv[i] == IMPORT_FLAG and i + 2 < len(argv):
+            if sh.enqueue(argv[i + 1], argv[i + 2]):
+                n += 1
+            del argv[i:i + 3]
+            continue
+        i += 1
+    return n
+
 
 def pop_tray_flag(argv=None):
     """从 argv 里取走托盘旗标，返回是否带了。
@@ -45,6 +67,8 @@ def _icon_path():
 
 def main():
     minimized = pop_tray_flag()
+    # 右键入库：先把 --aigc-import 参数取走写进共享队列（单实例接管后由主窗口排空）
+    pop_import_args()
     # 崩溃留痕：必须赶在 QApplication 与任何线程之前装。这次"反复崩溃"就是因为
     # native 层一死什么都不留（只有 Qt 的 qFatal → abort），只能去 %LOCALAPPDATA%
     # \CrashDumps 用 cdb 解 dump 才看到真凶。装上后 logs/crash.log + aigc.log
@@ -80,6 +104,10 @@ def main():
         dlg = FirstRunDialog()
         if dlg.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
+        # 安装期在向导里选的成品输出目录：首启采纳进 config.json（仅当用户未自定义），
+        # 然后 reload——DOWNLOAD_DIR 是 import 期算的，不 reload 就读不到刚写的值。
+        from core import modules as _modules
+        _modules.seed_output_dir()
         importlib.reload(config)
 
     # 商用网关模式：激活校验通过才进主窗口（开发直连模式自动放行）

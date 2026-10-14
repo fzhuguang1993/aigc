@@ -29,7 +29,9 @@ from gui.pages_remix import RemixPage
 from gui.pages_local_build import LocalBuildPage
 from gui.pages_ui_kit import UiKitPage
 from gui.menus import StyledMenu
-from gui.tools_registry import LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN, RESERVED_TOKENS
+from gui.tools_registry import (LAUNCHER_TOKEN, HOME_TOKEN, RECORDER_TOKEN,
+                                SCREENSHOT_TOKEN, CLIPBOARD_TOKEN, RESIZE_TOKEN,
+                                RESERVED_TOKENS)
 from gui.window_foreground import raise_to_front
 from store import app_state
 
@@ -51,11 +53,12 @@ def resource_path(rel):
 # 导航基础项：(文本, 页栈索引)。页栈顺序固定不变；导航行号与索引不再
 # 一一对应——「固定在左侧」的工具项插在「⚙️ 设置」之前，由 _nav_rows 映射表桥接
 # 「🔥 拆解任务」页常驻页栈末尾（索引 9），显示位在「工具中心」之后、「设置」仍在末位
-# 「🎛 UI 组件库」是维护/联调用的视觉画廊（索引 14），先摆在侧栏便于整体核对，后续可改口令呼出
+# 「🎛 UI 组件库」/「🏢 组织结构」/「🔌 接口管理」都是维护人页，默认不进导航，
+# 设置页维护人口令解锁后由 reveal_api_page() 一并补出；「📖 新手入门」已永久下线
+# （页面仍在页栈索引 5，只是不再有导航入口）。
 _NAV_PAGES = [("🖥️  数据中台", 0), ("🎯  任务中心", 1), ("🧩  产品中心", 2),
               ("📡  线路负载", 3), ("🧰  工具中心", 4), ("🏗  批量基建", 13),
-              ("🔥  拆解任务", 9), ("📖  新手入门", 5), ("🎛  UI 组件库", 14),
-              ("⚙️  设置", 6)]
+              ("🔥  拆解任务", 9), ("⚙️  设置", 6)]
 
 # 素材工坊折叠分组：素材库/成品库/AI 混剪三项收进一个可折叠组行，点击组行
 # 展开/收起（状态持久化到 ui_state）；页栈索引 10/11/12 与三个页面本体都不动。
@@ -105,6 +108,8 @@ class MainWindow(QMainWindow):
         self._nav_rows = []
         self._page_row = 0                    # 当前页所在导航行（点工具项后选回来）
         self._api_revealed = False            # 「接口管理」口令解锁后常驻末尾
+        self._org_revealed = False            # 「组织结构」口令解锁后才进导航
+        self._uikit_revealed = False          # 「UI 组件库」口令解锁后才进导航
         self.nav.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.nav.customContextMenuRequested.connect(self._nav_menu)
         slay.addWidget(self.nav, 1)
@@ -191,7 +196,12 @@ class MainWindow(QMainWindow):
         self.apply_launcher_shortcut()
         self.apply_home_shortcut()          # 默认不给键，设了才注册
         self.apply_recorder_shortcut()      # 录屏开/停（默认 Ctrl+Alt+R，可在设置改）
+        self.apply_screenshot_shortcut()    # 截图全局一键（默认 Ctrl+Alt+A，可在设置改）
+        self.apply_clipboard_shortcut()     # 剪贴板快贴全局一键（默认 Ctrl+`，可在设置改）
+        self.apply_launcher_resize_shortcut()   # 唤出面板切换窗口大小（默认 Ctrl+Alt+E，可在设置改）
         self.apply_launcher_ball()          # 桌面悬浮球：开关关着就什么都不做
+        self.apply_quicklook()              # 全局 QuickLook 空格预览（默认开，设置可关）
+        self.apply_clipboard_monitor()      # 剪贴板历史后台监听（默认开，面板可关）
         self._update_identity()
 
         # 本地文件索引：软件一启动就在后台建（用户点名要的不是“第一次用才扫”）。
@@ -312,19 +322,28 @@ class MainWindow(QMainWindow):
 
     # ---------- 导航：基础 7 页 + 素材工坊折叠组 + 组织结构(admin) + 固定工具（插到「设置」前面）+ 接口管理 ----------
     def _rebuild_nav(self):
-        """按 app_state 里的固定列表重拼导航；选中页不变（行号可能因插入而顺移）"""
+        """按启用模块/解锁态重拼导航；选中页不变（行号可能因插入而顺移）"""
         from core import modules
         from gui.pages_tools import TOOLS
-        from store import org_store
         icons = {n: ico for n, ico, _d, _f in TOOLS}
         rows = []
         items = []
         tail = len(_NAV_PAGES) - 1                # 「⚙️ 设置」是基础项最后一位
         ws_open = bool(app_state.get(_WORKSHOP_KEY))
         for i, (text, idx) in enumerate(_NAV_PAGES):
-            if i == tail:                         # 固定工具默认排在设置前一位
-                # 组织结构只给管理员看（未启用组织时 is_admin=True，要能进来建首个成员）
-                if org_store.is_admin():
+            if i == tail:                         # 工坊/组织/固定工具都排在「设置」前一位
+                # 素材工坊分组：AIGC 或 基建 任一启用即露
+                if modules.workshop_visible():
+                    rows.append(("group", "workshop"))
+                    items.append(f"🗂  素材工坊 {'▾' if ws_open else '▸'}")
+                    if ws_open:
+                        for ctext, cidx in _WORKSHOP_PAGES:
+                            if not modules.page_visible(cidx):
+                                continue
+                            rows.append(("page", cidx))
+                            items.append(f"　　└ {ctext}")
+                # 组织结构：默认藏，维护人口令解锁后出现（见 reveal_api_page）
+                if self._org_revealed:
                     rows.append(("page", 8))
                     items.append("🏢  组织结构")
                 # 固定工具项归「工具中心」模块：关掉工具中心就不露这些入口
@@ -332,22 +351,17 @@ class MainWindow(QMainWindow):
                     for name in load_pinned():
                         rows.append(("tool", name))
                         items.append(f"{icons.get(name, '🧰')}  {name}")
-            if idx == 5 and modules.workshop_visible():   # 「素材工坊」分组插在「新手入门」前一位
-                rows.append(("group", "workshop"))
-                items.append(f"🗂  素材工坊 {'▾' if ws_open else '▸'}")
-                if ws_open:
-                    for ctext, cidx in _WORKSHOP_PAGES:
-                        if not modules.page_visible(cidx):
-                            continue
-                        rows.append(("page", cidx))
-                        items.append(f"　　└ {ctext}")
             if not modules.page_visible(idx):     # 模块关掉：这一页的入口收起
                 continue
             rows.append(("page", idx))
             items.append(text)
+        # 维护人页：口令解锁后才补进导航（接口管理 7 / UI 组件库 14）
         if self._api_revealed:
             rows.append(("page", 7))
             items.append("🔌  接口管理")
+        if self._uikit_revealed:
+            rows.append(("page", 14))
+            items.append("🎛  UI 组件库")
         self._nav_rows = rows
         want = self.pages.currentIndex()          # 选中跟着页面走，不跟旧行号
         self.nav.blockSignals(True)
@@ -475,6 +489,30 @@ class MainWindow(QMainWindow):
         # 主窗口藏在托盘时按它不会有反应，必须在日志里留话，不然又是一桩悬案
         self._log_hotkeys("总唤出键")
 
+    def apply_quicklook(self):
+        """按开关挂/摘全局空格预览钩子（与悬浮球/热键同一口径：即时生效）。
+
+        只在 Windows、且开关开着时才装 WH_KEYBOARD_LL 钩子；钩子自己只在前台
+        确实是资源管理器/桌面文件列表时截空格，其余一律放行（不扰打字）。"""
+        from gui import quicklook
+        from gui.tools_registry import quicklook_enabled
+        if quicklook_enabled() and quicklook.manager.available():
+            quicklook.manager.start()
+        else:
+            quicklook.manager.stop()
+
+    def apply_clipboard_monitor(self):
+        """按开关启停剪贴板历史后台监听（与 QuickLook 同口径：即时生效、可回关）。
+
+        监听器是进程内单例，只连 QClipboard.dataChanged（主线程），不起工作线程。
+        懒 import：clipboard_hist 拽着面板与存储，不该在主窗口模块顶层就拖进来。"""
+        try:
+            from gui import clipboard_hist
+            clipboard_hist.manager.start() if clipboard_hist.monitor_enabled() \
+                else clipboard_hist.manager.stop()
+        except Exception:
+            pass
+
     def apply_launcher_ball(self):
         """按「设置 → 唤出面板 → 桌面悬浮球」开关显示/收起那颗悬浮球。
 
@@ -484,16 +522,31 @@ class MainWindow(QMainWindow):
         """
         from gui import launcher_ball
         if not app_state.get("launcher_ball_on"):
-            launcher_ball.hide_launcher_ball()
-            if getattr(self, "_fan", None) is not None:
-                self._fan.hide_menu()
-            self._fan_cancel_collapse()
+            self._close_ball()
             return
         self._ball = launcher_ball.show_launcher_ball(
             self._fan_expand, self._on_ball_double,
             on_search=self._summon_launcher,
             on_config=self._on_ball_config, on_index=self._on_ball_index,
-            on_leave=self._fan_schedule_collapse)
+            on_leave=self._fan_schedule_collapse,
+            on_close=self._close_ball)
+
+    def _close_ball(self):
+        """关球：球、扇形、宽限期计时器一起收干净（右键“✕ 关闭悬浮球”也走这里）。
+
+        以前右键那一下只 hide 球自己：扇形是另一个顶层窗、不归球管，于是球没了、
+        展开的一排功能图标还贴在桌面上，而且鼠标再也不会往那儿发事件——只能重启。"""
+        from gui import launcher_ball
+        try:
+            app_state.set_value("launcher_ball_on", False)
+        except Exception:
+            pass
+        launcher_ball.hide_launcher_ball()
+        fan = getattr(self, "_fan", None)
+        if fan is not None:
+            fan.hide_menu()
+        self._fan_cancel_collapse()
+        self._ball = None
 
     # ---------- 悬浮球：移入展开扇形 / 双击开主程序 / 右键入口 ----------
     def _fan_collapse_timer(self):
@@ -649,6 +702,115 @@ class MainWindow(QMainWindow):
         self._rec_scuts.append(sc)
         self._log_hotkeys("录屏开停键")
 
+    def apply_screenshot_shortcut(self):
+        """截图全局键：默认 Ctrl+Alt+A，全局优先，注册不上退回窗口内。
+
+        命中后直接进区域框选（hide 主窗→冻结→遮罩），无需先开面板（与录屏
+        开停键同口径：都活在主窗口，面板从没开过也能按）。"""
+        from gui import global_hotkey as ghk
+        from gui.tools_registry import screenshot_shortcut
+        seq = screenshot_shortcut()
+        hk = ghk.manager
+        for s in getattr(self, "_shot_scuts", []):
+            s.setEnabled(False)
+            s.setParent(None)
+        self._shot_scuts = []
+        hk.forget(SCREENSHOT_TOKEN)
+        if not seq:
+            return
+        if hk.available() and hk.register(SCREENSHOT_TOKEN, seq):
+            hk.set_callback(SCREENSHOT_TOKEN,
+                            lambda _t=None: self.trigger_screenshot())
+            self._log_hotkeys("截图键")
+            return
+        sc = QShortcut(QKeySequence(seq), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self.trigger_screenshot)
+        self._shot_scuts.append(sc)
+        self._log_hotkeys("截图键")
+
+    def trigger_screenshot(self, mode="region"):
+        """热键/托盘/面板共用：直接跑一次截图（默认区域框选）。"""
+        from gui import screenshot
+        screenshot.capture(mode, self)
+
+    def apply_clipboard_shortcut(self):
+        """剪贴板快贴全局键：默认 Ctrl+`，全局优先，注册不上退回窗口内。
+
+        与截图/录屏键同口径：都活在主窗口，面板从没开过也能按。命中后弹 Ditto 式
+        悬浮快贴窗（clipboard_quick），选中一条即把内容粘回呼出前的前台窗口。"""
+        from gui import global_hotkey as ghk
+        from gui.tools_registry import clipboard_shortcut
+        seq = clipboard_shortcut()
+        hk = ghk.manager
+        for s in getattr(self, "_clip_scuts", []):
+            s.setEnabled(False)
+            s.setParent(None)
+        self._clip_scuts = []
+        hk.forget(CLIPBOARD_TOKEN)
+        if not seq:
+            return
+        if hk.available() and hk.register(CLIPBOARD_TOKEN, seq):
+            hk.set_callback(CLIPBOARD_TOKEN,
+                            lambda _t=None: self.trigger_clipboard())
+            self._log_hotkeys("剪贴板快贴键")
+            return
+        sc = QShortcut(QKeySequence(seq), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self.trigger_clipboard)
+        self._clip_scuts.append(sc)
+        self._log_hotkeys("剪贴板快贴键")
+
+    def apply_launcher_resize_shortcut(self):
+        """唤出面板「切换窗口大小」全局键：默认 Ctrl+Alt+E，全局优先，注册不上退回窗口内。
+
+        与剪贴板/截图键同口径。命中后只在搜索面板当前可见时才真切尺寸（见
+        trigger_launcher_resize）：面板没开时按它无意义，不能无风不起浪。"""
+        from gui import global_hotkey as ghk
+        from gui.tools_registry import launcher_resize_shortcut
+        seq = launcher_resize_shortcut()
+        hk = ghk.manager
+        for s in getattr(self, "_resize_scuts", []):
+            s.setEnabled(False)
+            s.setParent(None)
+        self._resize_scuts = []
+        hk.forget(RESIZE_TOKEN)
+        if not seq:
+            return
+        if hk.available() and hk.register(RESIZE_TOKEN, seq):
+            hk.set_callback(RESIZE_TOKEN,
+                            lambda _t=None: self.trigger_launcher_resize())
+            self._log_hotkeys("切换窗口大小键")
+            return
+        sc = QShortcut(QKeySequence(seq), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self.trigger_launcher_resize)
+        self._resize_scuts.append(sc)
+        self._log_hotkeys("切换窗口大小键")
+
+    def trigger_launcher_resize(self):
+        """热键动作：只在唤出搜索面板当前可见时切它的大小（常规↔放大半屏）。
+
+        面板从未开过/已收起时静默不动：对一个不在眼前的浮窗改尺寸只会把偏好改掉，
+        下次 summon 弹出来才发现“怎么变大了”，不是用户要的。"""
+        d = getattr(self, "_launcher", None)
+        if d is None or not d.isVisible():
+            return
+        try:
+            d.toggle_size()
+        except Exception:
+            pass
+
+    def trigger_clipboard(self):
+        """热键/托盘共用：呼出（或收起）剪贴板快贴悬浮窗。
+
+        懒 import：clipboard_quick 拽着 ClipboardView/存储/前台层，不该在主窗口顶层拖进。"""
+        try:
+            from gui import clipboard_quick
+            clipboard_quick.toggle()
+        except Exception:
+            pass
+
     def toggle_record(self):
         """录屏开/停热键动作：正在录→停；否则→打开（或唤起）录屏面板并开录。
 
@@ -669,6 +831,26 @@ class MainWindow(QMainWindow):
         panel = getattr(dlg, "panel", None) if dlg is not None else None
         if panel is not None:
             panel.toggle_record()
+
+    def record_region(self, rect, sys_on=False, mic_on=False, gif=False):
+        """截图工具栏「录屏」/「🎞 GIF」联动：把选区交给屏幕录制面板，直接就位并开录。
+
+        面板实例取法与 toggle_record 一致（优先拿已开的，没开就 open_tool 建一个）；
+        rect 为全局逻辑矩形。走面板自带的 start_region_record，复用它的整套录制状态机。
+        gif=True 时录完自动转 GIF 并复制进剪贴板（GIF 不录声音）。"""
+        name = "屏幕录制"
+        page = getattr(self, "page_tools", None)
+        if page is None or rect is None:
+            return
+        dialogs = getattr(page, "_dialogs", None) or {}
+        dlg = dialogs.get(name)
+        panel = getattr(dlg, "panel", None) if dlg is not None else None
+        if panel is None:
+            page.open_tool(name)
+            dlg = (getattr(page, "_dialogs", None) or {}).get(name)
+            panel = getattr(dlg, "panel", None) if dlg is not None else None
+        if panel is not None:
+            panel.start_region_record(rect, sys_on, mic_on, gif=gif)
 
     def show_home(self):
         """把主界面拉回眼前：藏在托盘、最小化、被压在其它窗口下面都要露出来。
@@ -750,6 +932,16 @@ class MainWindow(QMainWindow):
             shutdown_img_worker()           # 免得 Qt 收尾时析构还在跑的 QThread（qFatal）
         except Exception:
             pass
+        try:                                # 全局 QuickLook 钩子必须在本进程退出前摘掉：
+            from gui import quicklook       # 低级键盘钩子挂在 Qt 主线程上，忘了 Unhook
+            quicklook.manager.stop()        # 就是“程序退了、钩子还卡在全系统键盘链上”
+        except Exception:
+            pass
+        try:                                # 剪贴板监听：断掉 dataChanged 连接，退出流程干净
+            from gui import clipboard_hist
+            clipboard_hist.manager.stop()
+        except Exception:
+            pass
         self.tray.remove()
         self.close()
         app = QApplication.instance()
@@ -811,6 +1003,57 @@ class MainWindow(QMainWindow):
         page = self.pages.currentWidget()
         if hasattr(page, "refresh"):
             page.refresh()
+        self._drain_shell_imports()
+
+    def _drain_shell_imports(self):
+        """排空右键入库队列（每 2 秒随定时刷新）：
+        素材库目标→按路径建索引；成品库目标→复制进扫描根；完成跳页 + 气泡提示。
+
+        任何一步出错都吞掉，不能让一个后台入库把主循环的定时刷新带崩。"""
+        try:
+            from core import shell_integration as sh
+            reqs = sh.drain()
+        except Exception:
+            return
+        if not reqs:
+            return
+        mat = [p for t, p in reqs if t == "material"]
+        out = [p for t, p in reqs if t == "output"]
+        n_mat = n_out = 0
+        last_page = None
+        try:
+            if mat:
+                n_mat = self.page_material.ingest_files(mat)
+                last_page = self.page_material
+            if out:
+                n_out = self.page_output_lib.ingest_files(out)
+                last_page = self.page_output_lib
+        except Exception:
+            pass
+        if last_page is not None:
+            try:
+                self.pages.setCurrentWidget(last_page)
+                self._sync_nav_to_page(last_page)
+            except Exception:
+                pass
+        total = n_mat + n_out
+        if total:
+            if n_mat and n_out:
+                msg = f"📥 已入库：素材库 {n_mat} 个 · 成品库 {n_out} 个"
+            elif n_mat:
+                msg = f"📥 已入库素材库 {n_mat} 个"
+            else:
+                msg = f"📥 已入库成品库 {n_out} 个"
+            try:
+                self.statusBar().showMessage(msg, 6000)
+            except Exception:
+                pass
+            tray = getattr(self, "tray", None)
+            if tray is not None:
+                try:
+                    tray.notify("右键入库完成", msg)
+                except Exception:
+                    pass
 
     # ---------- 首次使用引导（分步高亮）与看板演示数据 ----------
     def _seed_demo_once(self):
@@ -909,19 +1152,22 @@ class MainWindow(QMainWindow):
         self._update_identity()
         # 当前停在对方没权限的页（组织结构/接口管理）：退回数据中台
         cur = self.pages.currentIndex()
-        if (cur == 8 and not org_store.is_admin()) or \
+        if (cur == 8 and not self._org_revealed) or \
                 (cur == 7 and not self._api_revealed):
             self.pages.setCurrentIndex(0)
         self._refresh()
 
     def reveal_api_page(self):
-        """口令验证通过后由设置页调用：把「🔌 接口管理」补进导航并跳过去
+        """维护人口令验证通过后由设置页调用：把维护人专属页
+        （🔌 接口管理 / 🏢 组织结构 / 🎛 UI 组件库）一次性补进导航并跳到接口管理。
 
         本次运行期内保持可见（再锁回去没意义：口令都给你了）；
         重启后恢复默认隐藏。"""
         self._api_revealed = True
+        self._org_revealed = True
+        self._uikit_revealed = True
         self._rebuild_nav()
-        self.nav.setCurrentRow(len(self._nav_rows) - 1)
+        self.nav.setCurrentRow(self._row_for_page(7))
 
     def open_output_dir(self):
         """打开（并自动创建）输出文件夹"""

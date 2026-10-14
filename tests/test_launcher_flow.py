@@ -44,6 +44,21 @@ def _isolate_state(tmp_path, monkeypatch):
     monkeypatch.setattr(_lp, "_SYNC_PREVIEW", True)   # 预览走同步：离屏等不到线程
 
 
+@pytest.fixture(autouse=True)
+def _no_active_window_leak(qapp):
+    """每个用例收完尾都把活动窗口清干净。
+
+    离屏平台上 close() 只 hide、不会补一个 WindowDeactivate，显示过的面板会一直
+    挂在 QApplication.activeWindow() 上，漏给后面的测试文件（test_hotkey_wiring
+    那一整套前台判定直接被它带歪，还换个跑测顺序才报，看上去像随机翻车）。
+    实测：close() 之后再补一次 hide()+processEvents() 才真能清掉。"""
+    yield
+    w = QApplication.activeWindow()
+    if w is not None:
+        w.hide()
+        qapp.processEvents()
+
+
 # ---------------- 分行算法（纯函数，不靠排版） ----------------
 
 @pytest.mark.parametrize("positions,expect", [
@@ -707,18 +722,71 @@ def test_typing_a_new_word_bumps_the_round(panel, indexed):
     assert panel._seq > first
 
 
-def test_summon_drops_the_previous_results(qapp, monkeypatch, indexed):
-    """重开面板不能拖上一次搜的词与行（_seq 也要进位，否则旧回包能贴回来）"""
+def test_summon_keeps_the_previous_results(qapp, monkeypatch, indexed):
+    """重开面板还上次的画面：词留在框里、行用上一次那批重建，绝不再查一遍库。
+
+    用户点名“重新打开搜索功能要保留上次显示的内容，不要重新搜索”——这条同时钉住
+    三件事：不查库（search_* 一次都不许被调）、结果与上次一致、不起新一轮次
+    （_seq 不动，也就没机会把旧回包贴成“搜过了但屏幕不对”）。"""
+    from core import fileindex
     d = LauncherDialog(lambda name: None, None)
     monkeypatch.setattr(d, "_load_tools", lambda: list(TOOLS))
     d._refill("")
     _ask(d, "关节")
-    assert d._frows
+    paths = [r.item["path"] for r in d._frows]
+    assert paths
     seq = d._seq
+    calls = []
+    monkeypatch.setattr(fileindex, "search_files",
+                        lambda q, limit=50: calls.append(q) or [])
+    monkeypatch.setattr(fileindex, "search_docs",
+                        lambda q, limit=50: calls.append(q) or [])
+    d.hide()
     d.summon()
-    assert d._frows == [] and d._drows == []
-    assert d._seq > seq
+    assert calls == [], "重开不能自己去重查一遍"
+    assert d._seq == seq, "没起新一轮次，旧回包也没机会贴回来"
+    assert d.edit.text() == "关节"
+    assert [r.item["path"] for r in d._frows] == paths
     d.close()
+
+
+def test_summon_with_an_empty_box_starts_clean(qapp, monkeypatch, indexed):
+    """框里空着（用户自己删了词）时 summon 仍旧走原来的清空重排：“保留上次”
+    不能变成“贴一屏陈旧结果”。"""
+    d = LauncherDialog(lambda name: None, None)
+    monkeypatch.setattr(d, "_load_tools", lambda: list(TOOLS))
+    _ask(d, "关节")
+    d.edit.blockSignals(True)
+    d.edit.clear()                    # 手动清干净：不让 textChanged 先走一次重排
+    d.edit.blockSignals(False)
+    d.hide()
+    d.summon()
+    assert d.edit.text() == ""
+    assert d._frows == []
+    d.close()
+
+
+def test_hover_never_switches_the_preview(panel, indexed, monkeypatch):
+    """划过别的行不能换预览（用户点名“鼠标太灵活”）：预览只跟单击/键盘选中走。
+
+    以前 hover 一行就 _set_cur 一次：鼠标想从选中行走到右边预览窗，路上扫过的
+    每一行都会把预览换掉——到了预览窗看到的已经是另一个文件了。"""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QEnterEvent
+    panel._refill("")
+    _ask(panel, "关节")
+    rows = panel._frows
+    hits = []
+    monkeypatch.setattr(panel._preview, "show_item",
+                        lambda item: hits.append(item))
+    panel._on_row(rows[0])                        # 单击：预览必须跟上
+    assert len(hits) == 1 and hits[0] is rows[0].item
+    cur = panel._cur
+    ev = QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5))
+    for r in rows[1:]:
+        r.enterEvent(ev)                          # 划过其余行
+    assert len(hits) == 1, "hover 不能换预览"
+    assert panel._cur == cur, "hover 也不能换选中"
 
 
 def test_empty_index_says_it_is_building(panel, monkeypatch):
@@ -844,6 +912,92 @@ def test_a_broken_index_never_breaks_the_panel(panel, monkeypatch):
     panel._refill("")
     _ask(panel, "关节")
     assert panel._frows == []
+
+
+# ---------------- 搜索历史 ----------------
+
+def test_push_and_remove_history_are_pure():
+    """历史的本体就是这两个算子：最新在前、同词只留一条、封顶、空词不记。"""
+    from gui.dialogs_launcher import push_history, remove_history
+    assert push_history([], "关节") == ["关节"]
+    assert push_history(["a", "b"], "a") == ["a", "b"]        # 同词提到最前，不重样
+    assert push_history(["a"], "  a  ") == ["a"]              # 去空格后同一个词
+    assert push_history(["a"], "") == ["a"]
+    assert push_history(["a"], None) == ["a"]
+    capped = push_history([str(i) for i in range(30)], "new", limit=20)
+    assert capped[0] == "new" and len(capped) == 20
+    src = ["a", "b"]
+    push_history(src, "c")                       # 返回新列表，不改传入的那份
+    assert src == ["a", "b"]
+    assert remove_history(["a", "b"], "a") == ["b"]
+    assert remove_history(["a"], "") == ["a"]
+
+
+def test_used_word_is_recorded_and_box_click_opens_history(panel, indexed,
+                                                           monkeypatch):
+    """真去用了某个结果才记历史（只打字不点开的不记，不然历史里堆满敲到一半的碎片），
+    并且点一下输入框就把历史展开在框底下。"""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from gui.dialogs_launcher import load_history
+    monkeypatch.setattr("utils.desktop_utils.open_path", lambda p: None)
+    panel._refill("")
+    _ask(panel, "关节")
+    assert load_history() == [], "光打字不能进历史"
+    panel._activate(panel._frows[0])                   # 真去用了这个结果
+    assert load_history() == ["关节"]
+    panel._refill("")
+    _ask(panel, "骨胶蓜")
+    panel._activate(panel._frows[0])
+    assert load_history() == ["骨胶蓜", "关节"]        # 最新在前
+    panel.show()
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(5, 5), QPointF(5, 5),
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    panel.eventFilter(panel.edit, ev)                  # 点输入框
+    assert panel.history_shown()
+    assert panel._history.visible_rows() == ["骨胶蓜", "关节"]
+
+
+def test_history_single_delete_and_batch_clear(panel, monkeypatch):
+    """单条删（行上那个 ✕）与批量删（头部「清空」）都要落盘，下次开面板仍旧是删过的。"""
+    from PySide6.QtWidgets import QToolButton
+    from gui.dialogs_launcher import load_history, save_history
+    monkeypatch.setattr(panel, "_place_history", lambda: None)   # 离屏不算几何
+    save_history(["关节", "骨胶蓜", "稿子"])
+    assert panel._show_history() is True
+    row = panel._history._rows[0]
+    assert row.findChildren(QToolButton), "历史行得自带一个删除按钮"
+    row.findChildren(QToolButton)[0].click()           # 单删第一条
+    assert load_history() == ["骨胶蓜", "稿子"]
+    assert panel._history.visible_rows() == ["骨胶蓜", "稿子"]
+    panel._history.btn_clear.click()                   # 批量删：清空
+    assert load_history() == []
+    assert not panel.history_shown()
+
+
+def test_history_picked_fills_the_box_and_researches(panel, monkeypatch):
+    """点一条历史：不是只填字，要按这个词重查一次（用户就是要拿回上次那批结果）。"""
+    from gui.dialogs_launcher import save_history
+    monkeypatch.setattr(panel, "_place_history", lambda: None)
+    save_history(["关节"])
+    panel._show_history()
+    got = []
+    monkeypatch.setattr(panel, "_refill",
+                        lambda text="", rescan=True: got.append(text))
+    assert panel._history.pick_current() is True
+    assert got == ["关节"]
+    assert not panel.history_shown()                   # 用完就收，不能盖着结果区
+
+
+def test_typing_closes_the_history_layer(panel, monkeypatch):
+    """一旦打字就收历史：它还盖在结果区上，用户要看的是新结果。"""
+    from gui.dialogs_launcher import save_history
+    monkeypatch.setattr(panel, "_place_history", lambda: None)
+    save_history(["关节"])
+    assert panel._show_history() is True
+    panel._refill("骨")                                # 打字（走 textChanged 那一段）
+    assert not panel.history_shown()
 
 
 # ---------------- 行控件本身：内容、高亮、换算 ----------------

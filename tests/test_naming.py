@@ -169,3 +169,45 @@ def test_load_is_cached_until_forced(cfg_file):
     cfg_file.write_text('{"filename": {"tokens": ["num"], "sep": "."}}', encoding="utf-8")
     assert naming.load()[0] == list(naming.DEFAULT_TOKENS)      # 还在用缓存
     assert naming.load(force=True)[0] == ["num"]                # 重读才看到新规则
+
+
+# ====================================================================
+# 命名规律识别（批量重命名「预读规则」）
+# ====================================================================
+def test_detect_pattern_snake_seq_and_date():
+    got = naming.detect_pattern(["001_0923", "002_0924"])
+    assert got["sep"] == "_" and got["style"] == "snake"
+    assert got["mapped"] and got["tokens"] == ["seq", "date"]
+
+
+def test_detect_pattern_kebab_separator_only():
+    got = naming.detect_pattern(["2026-09-23", "2026-10-01"])
+    assert got["sep"] == "-" and got["style"] == "kebab"
+    # 结构没被完整吃透 → 不给 tokens（只回填分隔符）
+    assert got["tokens"] is None and not got["mapped"]
+
+
+def test_detect_pattern_camel_and_pascal():
+    assert naming.detect_pattern(["productFoo", "itemBar"])["style"] == "camel"
+    assert naming.detect_pattern(["ProductFoo", "ItemBar"])["style"] == "pascal"
+    # 驼峰无分隔符：sep 为空串
+    assert naming.detect_pattern(["productFoo"])["sep"] == ""
+
+
+def test_detect_pattern_no_pattern():
+    got = naming.detect_pattern(["helloworld", "justtext"])
+    assert got["style"] == "none" and got["tokens"] is None and not got["mapped"]
+
+
+def test_detect_pattern_aligns_known_fields():
+    rows = [{"name": "诺特兰德益生菌_雷亮.mp4", "product": "诺特兰德益生菌", "tag": "雷亮"},
+            {"name": "诺特兰德益生菌_张三.mp4", "product": "诺特兰德益生菌", "tag": "张三"}]
+    stems = ["诺特兰德益生菌_雷亮", "诺特兰德益生菌_张三"]
+
+    def ctx(row, idx):
+        return {"product": row["product"], "tag": row["tag"], "block_type": "",
+                "date": "", "time": "", "task_id": ""}
+
+    got = naming.detect_pattern(stems, rows=rows, context_fn=ctx)
+    assert got["sep"] == "_"
+    assert got["mapped"] and got["tokens"] == ["product", "tag"]

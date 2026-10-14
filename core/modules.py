@@ -71,17 +71,63 @@ def _app_state():
     return app_state
 
 
-def _read_manifest():
-    """安装清单里选中的模块集合；无文件 / 坏档 / 空集合都返回 None（＝"无安装记录"）。"""
+def _raw_manifest():
+    """安装清单原始 dict；读不到 / 坏档返回 None。"""
     try:
         raw = json.loads(manifest_path().read_text(encoding="utf-8"))
-        mods = raw.get("modules") if isinstance(raw, dict) else raw
-        if isinstance(mods, list):
-            picked = {m for m in mods if m in ALL}
-            return picked or None
+        return raw if isinstance(raw, dict) else None
     except Exception:
-        pass
+        return None
+
+
+def _read_manifest():
+    """安装清单里选中的模块集合；无文件 / 坏档 / 空集合都返回 None（＝"无安装记录"）。"""
+    raw = _raw_manifest()
+    if raw is None:
+        return None
+    mods = raw.get("modules")
+    if isinstance(mods, list):
+        picked = {m for m in mods if m in ALL}
+        return picked or None
     return None
+
+
+def install_output_dir():
+    """安装清单里用户选的成品输出目录；没有返回 None。"""
+    raw = _raw_manifest()
+    if raw:
+        d = str(raw.get("output_dir") or "").strip()
+        return d or None
+    return None
+
+
+def seed_output_dir():
+    """首启把安装期选的输出目录采纳进 config.json 的 paths.output（仅在用户尚未
+    自定义时）；返回是否写入了新值。desktop.py 在 reload config 之前调用一次，
+    让 DOWNLOAD_DIR 按安装期选择初始化（API 接口配置不在此处动，仍走首配向导）。"""
+    d = install_output_dir()
+    if not d:
+        return False
+    from core.paths import CONFIG_DIR
+    cfg = CONFIG_DIR / "config.json"
+    if not cfg.exists():
+        return False
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    paths = data.get("paths")
+    if not isinstance(paths, dict):
+        paths = {}
+    if str(paths.get("output", "") or "").strip():
+        return False                     # 用户已在设置里自定义过：安装值不覆盖
+    paths["output"] = d
+    data["paths"] = paths
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
 
 
 def enabled_modules():

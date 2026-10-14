@@ -14,11 +14,11 @@ gui/dialogs_rename.py —— 成品库/素材库「批量重命名 / 批量设�
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QMimeData, QPoint
+from PySide6.QtCore import Qt, QMimeData, QPoint, QUrl
 from PySide6.QtGui import QDrag, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QWidget, QComboBox, QSpinBox, QMessageBox, QFrame,
-                               QApplication, QSizePolicy)
+                               QApplication, QSizePolicy, QLineEdit)
 
 from core import naming
 from gui.window_frame import apply_rounded
@@ -230,6 +230,7 @@ class BatchRenameDialog(QDialog):
         self._tokens = picked or list(self._keys[:1])
         self.setWindowTitle(title or "批量重命名")
         self.resize(680, 560)
+        self.setAcceptDrops(True)      # 支持从资源管理器拖入文件/文件夹重建待改列表
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 14)
@@ -240,6 +241,11 @@ class BatchRenameDialog(QDialog):
         tip.setObjectName("PageTip")
         tip.setWordWrap(True)
         lay.addWidget(tip)
+
+        self._drop_tip = QLabel("💡 可把文件/文件夹从资源管理器直接拖进本窗，用它们重建待改列表（含文件夹内视频，递归收集）。")
+        self._drop_tip.setObjectName("PageTip")
+        self._drop_tip.setWordWrap(True)
+        lay.addWidget(self._drop_tip)
 
         lay.addWidget(QLabel("① 字段池（点一下追加到末尾，也可拖到下面插入）"))
         self.pool = _ChipBar("pool", self)
@@ -267,6 +273,25 @@ class BatchRenameDialog(QDialog):
         foot.addStretch(1)
         lay.addLayout(foot)
 
+        # 🔁 文件名搜索替换：在拼好的新名里把「查找」子串换成「替换为」（空=不处理）。
+        # 默认命名顺序含「原名」，勾上它就等于对原文件名做查找替换。
+        rep = QHBoxLayout()
+        rep.setSpacing(6)
+        rep.addWidget(QLabel("🔁 文件名替换：把"))
+        self.rep_find = QLineEdit()
+        self.rep_find.setPlaceholderText("要查找的字（留空=不替换）")
+        self.rep_find.setFixedWidth(160)
+        self.rep_find.textChanged.connect(lambda _=None: self._refresh())
+        rep.addWidget(self.rep_find)
+        rep.addWidget(QLabel("换成"))
+        self.rep_repl = QLineEdit()
+        self.rep_repl.setPlaceholderText("替换为（留空=删除）")
+        self.rep_repl.setFixedWidth(160)
+        self.rep_repl.textChanged.connect(lambda _=None: self._refresh())
+        rep.addWidget(self.rep_repl)
+        rep.addStretch(1)
+        lay.addLayout(rep)
+
         self.lbl_preview = QLabel()
         self.lbl_preview.setTextFormat(Qt.TextFormat.RichText)
         self.lbl_preview.setWordWrap(True)
@@ -280,6 +305,11 @@ class BatchRenameDialog(QDialog):
         b_reset.setObjectName("GhostBtn")
         b_reset.clicked.connect(self._reset_defaults)
         bb.addWidget(b_reset)
+        b_scan = QPushButton("🔎 识别命名结构")
+        b_scan.setObjectName("PrimaryBtn")
+        b_scan.setToolTip("扫描这批文件名的现有格式，自动识别分隔符（_ - . / 驼峰）与字段顺序并回填；不自动跑，只随本钮")
+        b_scan.clicked.connect(self._prescan)
+        bb.addWidget(b_scan)
         bb.addStretch(1)
         b_cancel = QPushButton("取消")
         b_cancel.setObjectName("GhostBtn")
@@ -303,6 +333,13 @@ class BatchRenameDialog(QDialog):
     def _sep(self):
         return self.cb_sep.currentData()
 
+    def _apply_replace(self, stem):
+        """在拼好的新名主干上做“查找→替换”；查找框为空则原样返回。"""
+        find = self.rep_find.text()
+        if not find:
+            return stem
+        return stem.replace(find, self.rep_repl.text())
+
     def _build_plan(self):
         plan = []
         for i, row in enumerate(self.rows, start=self.spin.value()):
@@ -311,6 +348,7 @@ class BatchRenameDialog(QDialog):
             if not stem:
                 name = row.get("name") or row.get("path") or ""
                 stem = Path(name).stem
+            stem = self._apply_replace(stem)
             plan.append((row, stem))
         return plan
 
@@ -331,6 +369,41 @@ class BatchRenameDialog(QDialog):
         self._tokens = [t for t in DEFAULT_TOKENS if t in self._keys] or list(self._keys[:1])
         self._rebuild_bars()
         self._refresh()
+
+    def _prescan(self):
+        """手动预读命名规律：扫描选中行文件名主干→回填分隔符与字段顺序。
+        绝不自动触发；识别不到就提示保持手动。"""
+        if not self.rows:
+            self.lbl_preview.setText("<span style='color:#D83931'>没有可预读的行。</span>")
+            return
+        stems = [Path(r.get("name") or r.get("path") or "").stem for r in self.rows]
+        info = naming.detect_pattern(stems, rows=self.rows, context_fn=build_context)
+        applied = []
+        style = info.get("style") or "none"
+        sep = info.get("sep")
+        # 只有真识别到规律（有分隔符或驼峰）才改分隔符，避免把无名规律的文件“连写”误导
+        if sep is not None and (style != "none"):
+            idx = self.cb_sep.findData(sep)
+            if idx >= 0 and idx != self.cb_sep.currentIndex():
+                self.cb_sep.setCurrentIndex(idx)
+            applied.append("分隔符「%s」" % (sep or "无（连着写/%s）" % style))
+        toks = info.get("tokens")
+        if toks:
+            picked = [t for t in toks if t in self._keys]
+            if picked:
+                self._tokens = picked
+                applied.append("字段顺序 " + (self._sep() or "·").join(
+                    _FIELD_LABEL.get(t, t) for t in picked))
+        self._rebuild_bars()
+        self._refresh()
+        if not applied:
+            self.lbl_preview.setText(
+                "<span style='color:#D83931'>未识别出稳定命名规律，已保持手动。</span>"
+                "<div style='color:#8F959E'>（可仍手动拖字段、选分隔符）</div>")
+        else:
+            self.lbl_preview.setText(
+                "<div style='color:#00A870'>🔎 已按现有文件名预读：" + "　·　".join(applied) +
+                "（不满意可继续手动调，确认无误再点应用）</div>" + self.lbl_preview.text())
 
     def handle_drop(self, role, event):
         try:
@@ -398,8 +471,8 @@ class BatchRenameDialog(QDialog):
         lines = [f"<div style='color:#4E5969'>模板：<b style='color:#1F2329'>{template}</b></div>"]
         for i, row in enumerate(self.rows[:6], start=self.spin.value()):
             ctx = build_context(row, i)
-            stem = render_stem(self._tokens, sep, ctx) or Path(
-                row.get("name") or row.get("path") or "").stem
+            stem = self._apply_replace(render_stem(self._tokens, sep, ctx) or Path(
+                row.get("name") or row.get("path") or "").stem)
             old = Path(row.get("name") or row.get("path") or "").name
             suf = Path(row.get("path") or "").suffix
             lines.append(f"<div><span style='color:#8F959E'>{old}</span>"
@@ -407,6 +480,65 @@ class BatchRenameDialog(QDialog):
         more = (f"<div style='color:#8F959E'>… 其余 {len(self.rows) - 6} 条同理</div>"
                 if len(self.rows) > 6 else "")
         self.lbl_preview.setText("".join(lines) + more)
+
+    # ---------- 拖入文件/文件夹重建待改列表 ----------
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        md = e.mimeData()
+        if not md.hasUrls():
+            return
+        try:
+            from store.output_store import VID_EXT
+        except Exception:
+            VID_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+        files, seen = [], set()
+
+        def add(f):
+            k = str(f).lower()
+            if k not in seen:
+                seen.add(k)
+                files.append(f)
+
+        for url in md.urls():
+            p = url.toLocalFile()
+            if not p:
+                continue
+            path = Path(p)
+            try:
+                if path.is_dir():
+                    for f in sorted(path.rglob("*")):
+                        if f.is_file() and f.suffix.lower() in VID_EXT:
+                            add(f)
+                elif path.is_file() and path.suffix.lower() in VID_EXT:
+                    add(path)
+            except OSError:
+                continue
+        if not files:
+            QMessageBox.information(
+                self, "没收集到视频",
+                "拖入的内容里没有视频文件（支持 " + " ".join(sorted(VID_EXT)) + "）。")
+            return
+        self.rows = [self._row_from_file(f) for f in files]
+        self._drop_tip.setText(
+            f"✅ 已拖入并重建待改列表：共 <b>{len(self.rows)}</b> 个视频（来路：拖入的文件/文件夹）。")
+        self._refresh()
+        e.acceptProposedAction()
+
+    @staticmethod
+    def _row_from_file(f):
+        """一个磁盘文件→一行最小记录（path/name/created_at）；供 build_context 取值。"""
+        import datetime
+        import os
+        f = Path(f)
+        try:
+            m = datetime.datetime.fromtimestamp(os.path.getmtime(f))
+        except OSError:
+            m = datetime.datetime.now()
+        return {"name": f.name, "path": str(f),
+                "created_at": m.strftime("%Y-%m-%d %H:%M:%S")}
 
     # ---------- 确认 ----------
     def _accept(self):

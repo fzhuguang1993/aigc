@@ -5,16 +5,17 @@ import html
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QRect, QRectF, QTimer, Signal, QKeyCombination
+from PySide6.QtCore import (Qt, QEvent, QUrl, QPoint, QSize, QRect, QRectF, QTimer,
+                            Signal, QKeyCombination)
 from PySide6.QtGui import (QGuiApplication, QPixmap, QPainter, QPen, QColor, QCursor,
-                           QRegion, QPainterPath, QTransform, QKeySequence)
+                           QKeySequence)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QSlider,
                                QPushButton, QLabel, QWidget, QMessageBox,
                                QComboBox, QSizeGrip, QSizePolicy, QLineEdit,
                                QInputDialog, QLayout, QApplication,
-                               QGraphicsView, QGraphicsScene, QFrame)
+                               QGraphicsView, QGraphicsScene, QFrame, QSpacerItem)
 
 from core import translate
 from gui.maintainer import Gate, app_has_unlocked
@@ -127,43 +128,49 @@ STEP_SECONDS = (1, 2, 3, 4, 5)
 STEP_DEFAULT = 5                        # 没记过时的默认（与旧版写死的 5 秒一致）
 STEP_KEY = "player_step_sec"
 
-# 深色播放器外壳。选择器全部挂在 #PlayerShell 下：应用级样式表里已经有
-# QPushButton{...}，不拿 id 提高优先级的话按钮会被全局浅色样式盖掉。
-# 也不用 WA_TranslucentBackground 做真圆角：透明窗口叠硬解视频在 Windows 上
-# 会把画面区域变成一块黑，宁可角上直角。
+# 播放器配色。窗口本体是 #PlayerRoot，后代选择器全部挂在它下面：两条控制条上的
+# 控件（按钮/下拉/滑块/标签）都直接受用，不必再借一层壳子的 id 提优先级——
+# 应用级样式表里已经有 QPushButton{...}，不拿 id 压一层的话按钮会被全局浅色样式盖掉。
+# 顶部窗控条 #TopBar 仍是实体深底；底部播放条换成浮层控件（_ControlBar），
+# 底色由它自己的 paintEvent 逐像素画 alpha，所以这里不再给它写 background。
+# 窗口本体 #PlayerRoot 改纯黑：画面四周不再有留白/描边/圆角，视频自身的黑边与
+# 底色同色，看不出“一圈边框”。
+# 顶层窗仍然不设 WA_TranslucentBackground：透明窗口叠硬解视频在 Windows 上会把
+# 画面区域变成一块黑。半透明只做在子控件这一层（画面走 QGraphicsVideoItem 的
+# QPainter 合成，浮层的逐像素 alpha 才真能透出视频）。
 _SHELL_QSS = """
-#PlayerRoot { background:#15171C; }
-#PlayerShell { background:#15171C; border:1px solid #2A2E37; border-radius:10px; }
-#PlayerShell QLabel { color:#C9CFDA; background:transparent; font-size:12px; }
-#PlayerShell QLabel#FileName { color:#F2F5FA; font-size:12px; font-weight:600; }
-#PlayerShell QLabel#StatusTip { color:#8F959E; font-size:11px; }
-#PlayerShell QPushButton, #PlayerShell QToolButton {
+#PlayerRoot { background:#000000; }
+#TopBar { background:#15171C; border:0; }
+#PlayerRoot QLabel { color:#C9CFDA; background:transparent; font-size:12px; }
+#PlayerRoot QLabel#FileName { color:#F2F5FA; font-size:12px; font-weight:600; }
+#PlayerRoot QLabel#StatusTip { color:#8F959E; font-size:11px; }
+#PlayerRoot QPushButton, #PlayerRoot QToolButton {
     background:#252A33; color:#DCE1EA; border:0; border-radius:6px; padding:4px 9px; }
-#PlayerShell QPushButton:hover, #PlayerShell QToolButton:hover { background:#323A47; }
-#PlayerShell QPushButton:checked { background:#3370FF; color:#FFFFFF; }
-#PlayerShell QPushButton#MarkOk:checked { background:#12A150; color:#FFFFFF; }
-#PlayerShell QPushButton#MarkBad:checked { background:#D94A43; color:#FFFFFF; }
-#PlayerShell QPushButton#CloseBtn:hover { background:#D94A43; color:#FFFFFF; }
-#PlayerShell QComboBox { background:#252A33; color:#DCE1EA; border:0;
+#PlayerRoot QPushButton:hover, #PlayerRoot QToolButton:hover { background:#323A47; }
+#PlayerRoot QPushButton:checked { background:#3370FF; color:#FFFFFF; }
+#PlayerRoot QPushButton#MarkOk:checked { background:#12A150; color:#FFFFFF; }
+#PlayerRoot QPushButton#MarkBad:checked { background:#D94A43; color:#FFFFFF; }
+#PlayerRoot QPushButton#CloseBtn:hover { background:#D94A43; color:#FFFFFF; }
+#PlayerRoot QComboBox { background:#252A33; color:#DCE1EA; border:0;
     border-radius:6px; padding:3px 6px; }
-#PlayerShell QComboBox QAbstractItemView { background:#252A33; color:#DCE1EA;
+#PlayerRoot QComboBox QAbstractItemView { background:#252A33; color:#DCE1EA;
     selection-background-color:#3370FF; selection-color:#FFFFFF;
     border:1px solid #3A4150; outline:none; }
 /* 弹层列表的每个条目：默认深底浅字，鼠标划过/选中给蓝底白字。
    必须显式写 ::item，否则会被应用级浅色主题里的
    `QComboBox QAbstractItemView::item:hover/selected {background:#EAF1FF}` 顶掉——
    表现就是深黑列表上冒出一个几乎白色的选中块，看不清也反人类。 */
-#PlayerShell QComboBox QAbstractItemView::item { color:#DCE1EA; background:#252A33;
+#PlayerRoot QComboBox QAbstractItemView::item { color:#DCE1EA; background:#252A33;
     padding:4px 8px; min-height:22px; }
-#PlayerShell QComboBox QAbstractItemView::item:hover,
-#PlayerShell QComboBox QAbstractItemView::item:selected {
+#PlayerRoot QComboBox QAbstractItemView::item:hover,
+#PlayerRoot QComboBox QAbstractItemView::item:selected {
     background:#3370FF; color:#FFFFFF; }
-#PlayerShell QSlider::groove:horizontal { height:6px; background:#31363F; border-radius:3px; }
-#PlayerShell QSlider::sub-page:horizontal { background:#3370FF; border-radius:3px; }
-#PlayerShell QSlider::handle:horizontal { width:16px; height:16px; margin:-5px 0;
+#PlayerRoot QSlider::groove:horizontal { height:6px; background:#31363F; border-radius:3px; }
+#PlayerRoot QSlider::sub-page:horizontal { background:#3370FF; border-radius:3px; }
+#PlayerRoot QSlider::handle:horizontal { width:16px; height:16px; margin:-5px 0;
     border-radius:8px; background:#EAF0FA; }
-#PlayerShell QSlider::handle:horizontal:pressed { background:#FFFFFF; }
-#PlayerShell QSizeGrip { background:transparent; }
+#PlayerRoot QSlider::handle:horizontal:pressed { background:#FFFFFF; }
+#PlayerRoot QSizeGrip { background:transparent; }
 """
 
 
@@ -181,41 +188,128 @@ class _SeekSlider(QSlider):
         self.setFixedHeight(20)             # 抬高命中区，好点中手柄
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
 
-    def _value_at(self, x):
+    def _value_at(self, p):
         half = 8                            # 手柄半径（与上面 QSS 的 16px 对应）
         span = max(self.width() - 2 * half, 1)
-        r = min(max((x - half) / span, 0.0), 1.0)
+        r = min(max((p - half) / span, 0.0), 1.0)
         return int(self.minimum() + r * (self.maximum() - self.minimum()))
 
-    def _jump(self, x):
+    def _jump(self, p):
         if self.maximum() <= self.minimum():
             return                          # 时长还没回来：不拦着报错就行
-        v = self._value_at(int(x))
+        v = self._value_at(int(p))
         self.setValue(v)                    # setValue 不发 sliderMoved，自己补一个
         self.seeked.emit(v)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self.setSliderDown(True)
-            self._jump(e.position().x())
+            self._jump(int(e.position().x()))
             e.accept()
         else:
             super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
         if self.isSliderDown():
-            self._jump(e.position().x())
+            self._jump(int(e.position().x()))
             e.accept()
         else:
             super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
         if self.isSliderDown():
-            self._jump(e.position().x())
+            self._jump(int(e.position().x()))
             self.setSliderDown(False)
             e.accept()
         else:
             super().mouseReleaseEvent(e)
+
+
+class _ControlBar(QWidget):
+    """播放条：非全屏是贴在窗口底的一条实体栏，全屏时换成压在画面上的浮层。
+
+    底色走 paintEvent 逐像素画 alpha，而不是靠 QSS 的 rgba(...)：子控件的 QSS
+    背景不参与合成，透明度画不出来（同 _FloatBar 那条已经验证过的路）。
+    浮层能真半透明还有个前提：画面是 QGraphicsVideoItem（走 QPainter 合成进
+    窗口缓冲），而不是 QVideoWidget 那块原生视频表面——同层的普通子控件画不到
+    它上面去。顶层窗本身仍然不设 WA_TranslucentBackground（那会把硬解画面压黑）。
+
+    它不进布局，位置由 VideoPlayerDialog._relocate 手动摆（非全屏贴下沿通栏，
+    全屏按设置的下方/左侧/右侧摆在画面上，三档用的是同一套横排面板）。
+    """
+
+    RADIUS = 12
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PlayerShell")     # 控件的配色靠 #PlayerRoot 后代选择器拿
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._alpha = 255
+        self._rounded = False
+        self._bg = QColor(21, 23, 28)         # 与 #TopBar 同色，两套样子看着是一家的
+
+    def alpha(self):
+        return self._alpha
+
+    def set_style(self, alpha, rounded):
+        """alpha：不透明度（0~255）；rounded：浮层给圆角、实体栏通栏方角"""
+        alpha = max(0, min(255, int(alpha)))
+        if alpha == self._alpha and rounded == self._rounded:
+            return
+        self._alpha, self._rounded = alpha, bool(rounded)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, self._rounded)
+        p.setPen(Qt.PenStyle.NoPen)
+        self._bg.setAlpha(self._alpha)
+        p.setBrush(self._bg)
+        if self._rounded:
+            r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            p.drawRoundedRect(r, self.RADIUS, self.RADIUS)
+        else:
+            p.drawRect(self.rect())
+        p.end()
+
+
+class _VideoView(QGraphicsView):
+    """画面画布：无边框播放器里鼠标落在画面上的事都在这儿接。
+
+    事件写在 view 而不是对话框上，是因为对话框本体被三行布局占满了，画面以外的
+    地方点不到；而全屏时需要靠 MouseMove 把收起的浮层唤回来，只能挂在画面上。
+    具体的点/拖/双击语义仍在对话框那边（_video_pressed 等），这里只负责递过来。
+    """
+
+    def __init__(self, scene, dlg, parent=None):
+        super().__init__(scene, parent)
+        self._dlg = dlg
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setBackgroundBrush(QColor("#000000"))    # 黑边：与 #PlayerRoot 同色
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMouseTracking(True)                   # 全屏时要知道鼠标到哪儿了
+
+    def mousePressEvent(self, e):
+        self._dlg._video_pressed(e)
+
+    def mouseReleaseEvent(self, e):
+        self._dlg._video_released(e)
+
+    def mouseDoubleClickEvent(self, e):
+        self._dlg._video_double(e)
+
+    def mouseMoveEvent(self, e):
+        self._dlg._video_move(e)
+
+    def contextMenuEvent(self, e):
+        self._dlg._show_bar_menu(e)
+
+    def wheelEvent(self, e):
+        # 画面上的滚轮拿去调音量（与 ↑/↓ 同一件事），不能让 QGraphicsView
+        # 默认行为把场景滚走/缩放——那会让视频在窗里跑位
+        self._dlg._video_wheel(e)
 
 
 class VideoPlayerDialog(QDialog):
@@ -226,6 +320,14 @@ class VideoPlayerDialog(QDialog):
     右下角 QSizeGrip 拉大，Esc 关、双击画面全屏、单击画面播放/暂停；
     识别字幕 / 定位源文件收到画面右键菜单里（不占顶栏）。
 
+    画面就是窗口本体：四周不留留白、不描边、不剪圆角。按 ⛶ 全屏时顶部窗控条
+    收掉，画面铺满整块屏（含任务栏那一条），播放条换成压在画面上的半透明浮层：
+    默认 alpha 150（能透出视频），鼠标移到栏上变不透明，鼠标只要动一下栏就回来、
+    真静止满 2.5 秒才收起；浮层的位置没有选项——就是屏幕底部居中那一条，
+    进度条恒在它最下面一行横着（贴左右边的版本试过，进度条落在屏幕中部，
+    不符合使用习惯，按用户要求收回底部）。
+    顶栏收起后窗控改由浮层末尾的 ―/✕ 承担，其余快捷键不变。
+
     allow_mark：只有【成品视频】才给标记按钮。素材库里预览的是同事传上来的
     原材，误点一下就把素材改名了，所以默认不给。
 
@@ -234,16 +336,26 @@ class VideoPlayerDialog(QDialog):
 
     marked = Signal(str, str)
 
-    MIN_W, MIN_H = 360, 220             # 画面区最小尺寸（也是没报出视频尺寸时的兜底）
-    # 自适应时画面可占屏幕可用区的比例。已在原 0.88 / 0.94 基础上整体缩小约 30%，
-    # 作为新的默认基准；设置页「视频预览框大小」的百分比再在这个基准上乘系数。
-    FILL_W, FILL_H = 0.62, 0.66
-    FALLBACK_FILL = 0.35                # 后端还没报视频尺寸时的半屏兜底，同样缩过（原 0.5）
+    MIN_W, MIN_H = 360, 220             # 还没报出视频尺寸时的兜底（尺寸到了改成手机量级）
+    # 自适应时画面可占屏幕可用区的比例。先在原 0.88 / 0.94 基础上整体缩小约 30%，
+    # 又按用户反馈（整窗看着小了一圈、播放条里的按钮被挤）上调约 5%；
+    # 设置页「视频预览框大小」的百分比再在这个基准上乘系数。
+    FILL_W, FILL_H = 0.65, 0.69
+    FALLBACK_FILL = 0.37                # 后端还没报视频尺寸时的半屏兜底，跟着上面一起调过
     REFIT_EPS = 0.015                   # 宽高比变化超过这个值才重摆（不跟用户抢尺寸）
-    SHELL_RADIUS = 10                   # 外壳圆角半径（与 _SHELL_QSS 的 border-radius 对齐）
     # 预览框大小缩放（百分比）：存 ui_state，播放器每次打开时读取即时生效。
     SCALE_KEY = "player_preview_scale"
     SCALE_MIN, SCALE_MAX, SCALE_DEFAULT = 40, 160, 100
+    # 播放区域最小尺寸：按 iPhone 17 的屏幕给（6.3"，物理 1206×2622，
+    # 逻辑点 402×874），方向跟着视频转：竖版画面至少 402×874，横版至少 874×402。
+    # 拖窗、横竖屏自适应都拆不开这一对（小过一个手机屏幕就没法审片）。
+    PHONE_SHORT, PHONE_LONG = 402, 874
+    # 全屏浮层：栏最小高 / 鼠标静止多久收起 / 半透明与不透明的 alpha
+    # / 浮层与屏幕边之间的空隙。栏宽不写死：横排面板要多少宽听布局的。
+    BAR_H = 56
+    IDLE_MS = 2500
+    ALPHA_IDLE, ALPHA_HOT = 150, 255
+    GAP = 16                              # 浮层与屏幕边之间的空隙
 
     def __init__(self, parent, file_path, allow_mark=False):
         super().__init__(parent)
@@ -254,24 +366,32 @@ class VideoPlayerDialog(QDialog):
         self._swapping = False           # 换文件途中屏蔽报错
         self._fullscreen = False
         self._last_size = None           # 视频真实宽高（退出全屏时重摆一次）
+        self._press = None               # 画面上的按下位置：判“是点还是拖”用（见 release）
+        self._click1_toggled = False     # 单击画面拨过一下播放态：双击时要拨回去
+        self._deck_h = self.BAR_H        # 非全屏时播放条那一行占多高（spacer 跟着它走）
+        self._bar_timer = QTimer(self)   # 鼠标静止计时：到点收起浮层（仅全屏启用）
+        self._bar_hidden = False         # 浮层是否已收起
+        self._bar_hold = False           #  true=不许收（报错时置上，等下一次鼠标静止）
 
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setObjectName("PlayerRoot")        # 供 #PlayerRoot 规则给四角补上深色底，避免白角
+        self.setObjectName("PlayerRoot")        # 供 #PlayerRoot 规则铺黑底
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)   # 让 #PlayerRoot 背景真能绘出来
         self.setStyleSheet(_SHELL_QSS)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setSizeGripEnabled(True)
 
-        shell = QWidget(objectName="PlayerShell")
+        # 三行紧贴：顶部窗控条 / 画面 / 播放条占位。播放条本体不进布局（见 _deck），
+        # 只用一条 spacer 把那一行的高度占住，这样同一个控件在“贴下沿的实体条”
+        # 与“压在画面上的浮层”之间切换时不必重排任何子控件。
         out = QVBoxLayout(self)
         out.setContentsMargins(0, 0, 0, 0)
-        out.addWidget(shell)
-        lay = QVBoxLayout(shell)
-        lay.setContentsMargins(10, 8, 10, 8)
-        lay.setSpacing(6)
+        out.setSpacing(0)
 
-        # ---------- 顶部：拖动区 + 窗口按钮 ----------
-        bar = QHBoxLayout()
+        # ---------- 顶部：拖动区 + 窗口按钮（全屏时收掉）----------
+        topbar = QWidget(objectName="TopBar")
+        self._topbar = topbar
+        out.addWidget(topbar)
+        bar = QHBoxLayout(topbar)
+        bar.setContentsMargins(10, 4, 8, 4)
         bar.setSpacing(6)
         self.lbl_name = QLabel(objectName="FileName")
         # 文件名动辄二三十字，不降到「可压缩」的话它会拿自己的最小宽度
@@ -294,26 +414,45 @@ class VideoPlayerDialog(QDialog):
         # contextMenuEvent）：需要时右键画面即取，标题栏只留全屏/最小化/关闭。
         for b in (self.btn_full, b_min, b_close):
             bar.addWidget(b)
-        lay.addLayout(bar)
 
-        # ---------- 画面 ----------
-        self.video = QVideoWidget()
-        self.video.setMinimumSize(self.MIN_W, self.MIN_H)
-        self.video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
-        self.video.mousePressEvent = self._video_clicked
-        lay.addWidget(self.video, 1)
+        # ---------- 画面：顶到窗口的左、右、上三边 ----------
+        # 用 QGraphicsView + QGraphicsVideoItem 而不是 QVideoWidget：后者是一块
+        # 原生视频表面，同层的普通子控件画不到它上面去，全屏的半透明浮层就压不上去；
+        # 前者把帧走 QPainter 合成进窗口缓冲，逐像素 alpha 能真透出视频。
+        self.scene = QGraphicsScene(self)
+        self.item = QGraphicsVideoItem()
+        self.item.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        self.scene.addItem(self.item)
+        self.view = _VideoView(self.scene, self)
+        self.view.setMinimumSize(self.MIN_W, self.MIN_H)
+        out.addWidget(self.view, 1)
+
+        # ---------- 底部：播放条（浮层控件，手动摆位，只把 spacer 放进布局）----------
+        deck = _ControlBar(self)
+        self._deck = deck
+        deck.setMouseTracking(True)          # 浮层要认“鼠标在不在栏上”
+        deck.installEventFilter(self)        # Enter/Leave/Move 走 eventFilter 改 alpha
+        lay = QVBoxLayout(deck)
+        lay.setContentsMargins(10, 4, 8, 4)
+        lay.setSpacing(4)
+        self._deck_gap = QSpacerItem(0, self._deck_h,
+                                     QSizePolicy.Policy.Ignored,
+                                     QSizePolicy.Policy.Fixed)
+        out.addItem(self._deck_gap)
 
         # ---------- 媒体（先建好，控制条要接它的信号） ----------
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
         self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video)
+        # 画面接到 item 自己的 sink 上（QMediaPlayer 那条 setVideoOutput(QGraphicsVideoItem)
+        # 内部也是转手到这个 sink，直接给 sink 少一层依赖）
+        self.player.setVideoSink(self.item.videoSink())
 
-        # ---------- 控制条（拆两行）----------
-        # 为什么拆：竖屏成品要的是窄窗口，一行摆下 9 个控件的话
+        # ---------- 控制条（横排两行：进度那一行摆最下面）----------
+        # 为什么拆两行：竖屏成品要的是窄窗口，一行摆下 9 个控件的话
         # 布局算出来的最小宽度会把窗口顶宽，多出来的那截就成了画面两侧的黑边。
-        ctrl = QHBoxLayout()
-        ctrl.setSpacing(6)
+        # 全屏时换成浮层、非全屏时贴在窗口底，用的都是这一套横排面板：
+        # 进度条永远横着摆在最下面一行（用户口径：换位置不能换使用习惯）。
         self.btn_play = QPushButton("▶")
         self.btn_play.setToolTip("播放 / 暂停（空格）")
         self.btn_play.setFixedWidth(40)
@@ -341,15 +480,12 @@ class VideoPlayerDialog(QDialog):
         self.slider.seeked.connect(self._seek_to)
         self.lbl_time = QLabel("00:00 / 00:00")
         self.lbl_time.setToolTip("当前位置 / 总时长（进度条上点一下就能跳到那儿）")
-        for w in (self.btn_play, b_back, self.cb_step, b_fwd,
-                  self.slider, self.lbl_time):
-            ctrl.addWidget(w)
-        lay.addLayout(ctrl)
+        # 进度行的成员（这一行永远横着，且在栏里排最下面）
+        self._row1_widgets = (self.btn_play, b_back, self.cb_step, b_fwd,
+                               self.slider, self.lbl_time)
         self.btn_back, self.btn_fwd = b_back, b_fwd
 
         # ---------- 第二行：倍速 / 音量 / 循环 +（只给成品的）审片按钮 ----------
-        mark_bar = QHBoxLayout()
-        mark_bar.setSpacing(6)
         self.cb_rate = QComboBox()
         self.cb_rate.addItems([f"{_fmt_rate(r)}x" for r in RATES])
         self.cb_rate.setCurrentIndex(list(RATES).index(1.0))
@@ -369,9 +505,6 @@ class VideoPlayerDialog(QDialog):
         self.btn_loop = QPushButton("🔁")
         self.btn_loop.setCheckable(True)
         self.btn_loop.setToolTip("循环播放：同一条反复看（L）")
-        for w in (self.cb_rate, self.btn_mute, self.vol, self.btn_loop):
-            mark_bar.addWidget(w)
-        mark_bar.addStretch(1)
         self.lbl_mark = QLabel("审片：")
         self.btn_ok = QPushButton("👍 可用")
         self.btn_ok.setObjectName("MarkOk")
@@ -385,19 +518,47 @@ class VideoPlayerDialog(QDialog):
                                 "回头用任务中心的「🧹 清理不可用」一次清掉（再点一次＝取消）")
         self.btn_ok.clicked.connect(lambda: self._on_mark("ok"))
         self.btn_bad.clicked.connect(lambda: self._on_mark("bad"))
-        mark_bar.addWidget(self.lbl_mark)
-        mark_bar.addWidget(self.btn_ok)
-        mark_bar.addWidget(self.btn_bad)
         for w in (self.lbl_mark, self.btn_ok, self.btn_bad):
             w.setVisible(self._allow_mark)
-        lay.addLayout(mark_bar)
+
+        # 全屏时顶部窗控条是收起来的，―/✕ 搬到浮层末尾接着能最小化、关窗；
+        # 非全屏顶栏就在，这两颗隐着（隐藏的控件不占布局位置）
+        self.btn_min_fs = QPushButton("―")
+        self.btn_min_fs.setToolTip("最小化")
+        self.btn_min_fs.clicked.connect(self.showMinimized)
+        self.btn_min_fs.setVisible(False)
+        self.btn_close_fs = QPushButton("✕")
+        self.btn_close_fs.setObjectName("CloseBtn")
+        self.btn_close_fs.setToolTip("关闭（Esc）")
+        self.btn_close_fs.clicked.connect(self.close)
+        self.btn_close_fs.setVisible(False)
 
         self.lbl_tip = QLabel(objectName="StatusTip")
         self.lbl_tip.setVisible(False)
         self.lbl_tip.setWordWrap(True)
+
+        # 上行：倍速 / 静音 / 音量 / 循环 /（只给成品的）审片 + 窗控；
+        # 下行：播放 / 快退 / 步长 / 进度 / 时间。进度条必须在最下面一行。
+        self._row_top = QHBoxLayout()
+        self._row_top.setSpacing(6)
+        for w in (self.cb_rate, self.btn_mute, self.vol, self.btn_loop,
+                  self.lbl_mark, self.btn_ok, self.btn_bad):
+            self._row_top.addWidget(w)
+        self._row_top.addStretch(1)             # 窗控贴右，不被拉伸带跑
+        self._row_top.addWidget(self.btn_min_fs)
+        self._row_top.addWidget(self.btn_close_fs)
+        self._row_seek = QHBoxLayout()
+        self._row_seek.setSpacing(6)
+        for w in self._row1_widgets:
+            self._row_seek.addWidget(w)
+        self._rows = QVBoxLayout()
+        self._rows.setSpacing(4)
+        self._rows.addLayout(self._row_top)
+        self._rows.addLayout(self._row_seek)
+        lay.addLayout(self._rows)
         lay.addWidget(self.lbl_tip)
 
-        self._grip = QSizeGrip(shell)          # 无边框时手动挂一个拖动块
+        self._grip = QSizeGrip(deck)            # 无边框时手动挂一个拖动块（挂播放条上）
 
         self.player.playbackStateChanged.connect(self._on_state)
         self.player.positionChanged.connect(self._on_pos)
@@ -405,8 +566,13 @@ class VideoPlayerDialog(QDialog):
         self.player.errorOccurred.connect(self._on_err)
         self.player.mediaStatusChanged.connect(self._on_status)
         self.player.playbackRateChanged.connect(self._on_rate)
-        # 真实宽高比靠视频尺寸变化重排窗口（不依赖容器写没写 Resolution）
-        self.video.videoSink().videoSizeChanged.connect(self._on_video_size)
+        # 真实宽高比靠视频尺寸变化重排窗口（不依赖容器写没写 Resolution）。
+        # item 上是 nativeSizeChanged（QVideoWidget 那套是 sink 上的 videoSizeChanged）
+        self.item.nativeSizeChanged.connect(self._on_video_size)
+
+        self._bar_timer.setSingleShot(True)
+        self._bar_timer.setInterval(self.IDLE_MS)
+        self._bar_timer.timeout.connect(self._on_bar_idle)
 
         self._load(self._path, autoplay=True)
         self._sync_mark_buttons()
@@ -550,15 +716,210 @@ class VideoPlayerDialog(QDialog):
         self.lbl_tip.setText(msg)
         self.lbl_tip.setStyleSheet(f"color:{'#FF8D19' if warn else '#8F959E'};")
         self.lbl_tip.setVisible(bool(msg))
+        if warn and msg:
+            # 报错时不许收起浮层：全屏下顶栏是收起来的，栏再一收，
+            # 用户就看不到“为什么没画面”了
+            self._bar_hold = True
+            self._wake_bar()
+        self._sync_deck_gap()      # 提示行的有/无会改播放条高度，spacer 与摆位都得跟上
+
+    # ---------------- 全屏浮层：摆位 / 静止收起 ----------------
+
+    def _bar_rect(self):
+        """浮层该占的那块矩形（dialog 坐标）：永远底部居中
+
+        取消左/右侧边那两档：用户要的是“进度条就在屏幕下面横着”，
+        贴左右边时它落在屏幕中部，反而不符合使用习惯。"""
+        w = min(max(self._deck.sizeHint().width(), 320),
+                max(self.width() - 2 * self.GAP, 200))
+        h = max(self._deck.sizeHint().height(), self.BAR_H)
+        return QRect(int((self.width() - w) // 2), int(self.height() - h - self.GAP),
+                     int(w), int(h))
+
+    def _relocate(self):
+        """按当前态摆播放条：非全屏贴下沿通栏、不透明方角；全屏做底部居中的浮层"""
+        if not hasattr(self, "_deck") or self._deck is None:
+            return
+        if self._fullscreen:
+            self._deck.setGeometry(self._bar_rect())
+        else:
+            self._deck.setGeometry(0, max(self.height() - self._deck_h, 0),
+                                   self.width(), self._deck_h)
+        self._update_bar_state()
+        self._deck.raise_()
+        if hasattr(self, "_grip") and self._grip is not None:
+            # 播放条不进布局了，QSizeGrip 也没人替它摆（它不属任何布局，默认停在
+            # 左上角一块 100×30，恰好压在播放/快退按钮上拦点击）：自己抬到右下角。
+            # 全屏时收起来：浮层靠逐像素 alpha 透视频，native 子窗口会把那块戳个坑。
+            self._grip.setVisible(not self._fullscreen)
+            if not self._fullscreen:
+                gs = self._grip.sizeHint().boundedTo(self._deck.size())
+                self._grip.resize(gs)
+                self._grip.move(max(self._deck.width() - gs.width(), 0),
+                                max(self._deck.height() - gs.height(), 0))
+                self._grip.raise_()
+
+    def _update_bar_state(self):
+        """把浮层的显/隐与不透明度算一遍（非全屏永远实体不透明）"""
+        if not self._fullscreen:
+            self._deck.show()
+            self._deck.set_style(self.ALPHA_HOT, False)
+            return
+        if self._bar_hidden:
+            self._deck.hide()
+            return
+        self._deck.show()
+        hot = self._bar_hold or self._hover_bar()
+        self._deck.set_style(self.ALPHA_HOT if hot else self.ALPHA_IDLE, True)
+
+    def _hover_bar(self):
+        """鼠标是否落在浮层矩形里
+
+        用全局坐标算，不用 Enter/Leave：栏里的按钮/下拉会各自吃掉事件，
+        指针从播放条空白移到按钮上时栏自己收到的是 Leave，拿它判会误报“移开了”，
+        表现就是按住倍速下拉时横栏突然变透。"""
+        if self._deck.isHidden():
+            return False
+        return self._deck.rect().contains(self._deck.mapFromGlobal(QCursor.pos()))
+
+    def _wake_bar(self):
+        """浮层现身（或保持在身）并把静止计时归零"""
+        if not self._fullscreen:
+            return
+        self._bar_hidden = False
+        self._update_bar_state()
+        self._bar_timer.start(self.IDLE_MS)
+
+    def _on_bar_idle(self):
+        """鼠标静止到点：先验一眼“是不是正搭在栏上/正报错”，都不是才收"""
+        if not self._fullscreen:
+            return
+        if self._bar_hold or self._hover_bar():
+            self._update_bar_state()
+            self._bar_timer.start(self.IDLE_MS)
+            return
+        self._bar_hidden = True
+        self._update_bar_state()
+
+    def _apply_shell_min(self):
+        """窗口最小宽度的底线：既不能窄过播放条要的宽，也不能窄过画面下限
+
+        播放条不进布局，就没人替它顶住窗宽：窗一窄，栏里的控件先被压扁
+        （实测栏要 436，窗只有 402 时时间标签就被切成 140）。"""
+        if self._fullscreen or not hasattr(self, "_deck"):
+            return
+        need = max(self.view.minimumWidth(), self._deck.minimumSizeHint().width())
+        if self.minimumWidth() != need:
+            self.setMinimumWidth(need)
+
+    def _sync_deck_gap(self):
+        """非全屏时把 spacer 高度对到播放条实测高（报错提示行一出，条就长一截）
+
+        不靠“_deck_h 变没变”判要不要刷 spacer：退出全屏那一路 spacer 是被收到 0 的，
+        而高度值本身可能跟全屏里一样，靠旧值比就会漏刷，画面底下永远少一条播放条。"""
+        if self._fullscreen or not hasattr(self, "_deck_gap"):
+            return
+        h = max(self._deck.sizeHint().height(), 48)
+        self._deck_h = h
+        self._deck_gap.changeSize(0, h, QSizePolicy.Policy.Ignored,
+                                  QSizePolicy.Policy.Fixed)
+        self._apply_shell_min()
+        self.layout().activate()
+        if self.height() < self.minimumSizeHint().height():
+            # 窗高是早先按“没提示行”的播放条算出来的，提示行一冒出来就不够放：
+            # 不补这一刀，画面（有 MIN_H 顶着不肯让）会与播放条叠在一起
+            self.resize(self.width(), self.minimumSizeHint().height())
+        self._relocate()
+
+    def _refit(self):
+        """把视频按原比例塞进可见区：多出来的地方由 view 的纯黑背景当黑边
+
+        必须在每次窗口尺寸变化后重跑：fitInView 设的是一次性的缩放矩阵，
+        窗口后来被 _place/_reconcile 改大改小，缩放不会自己跟着变，
+        画面就会停在旧尺寸上（看着比播放器大一号或小一号）。"""
+        if not hasattr(self, "item") or self.item.boundingRect().isEmpty():
+            return
+        self.view.fitInView(self.item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    @property
+    def _deck_alpha(self):
+        """当前播放条的不透明度（测试与调试用）"""
+        return self._deck.alpha()
+
+    def _video_move(self, e):
+        """画面上的鼠标移动：非全屏时拿它拖着窗走（无边框，画面就是唯一抓手）；
+        全屏时不拖窗，只负责把浮层顶回来。
+
+        这里不再区分“有没有动到栏那条边缘”：鼠标动一下就算续期/唤回，
+        真的静止满 IDLE_MS 才收起（用户反馈过：往栏那边动的时候它不该收得
+        那么快，那会儿计时根本没归零）。"""
+        if self._fullscreen:
+            self._wake_bar()
+            return
+        if self._drag_pos is not None and e.buttons() & Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+            e.accept()
+
+    def _video_wheel(self, e):
+        """画面上的滚轮调音量（与 ↑/↓ 同一件事），不让 view 拿它去滚动场景"""
+        dy = e.angleDelta().y()
+        if dy == 0:
+            e.ignore()
+            return
+        step = 5 if dy > 0 else -5
+        self.vol.setValue(max(0, min(100, self.vol.value() + step)))
+        e.accept()
+
+    def eventFilter(self, obj, e):
+        """播放条自己的鼠标事件：进了栏就变不透明并重新计时，离开了恢复半透明"""
+        if obj is self._deck and self._fullscreen:
+            t = e.type()
+            if t == QEvent.Type.MouseMove:
+                self._bar_hidden = False
+                self._update_bar_state()
+                self._bar_timer.start(self.IDLE_MS)
+            elif t in (QEvent.Type.Enter, QEvent.Type.Leave):
+                self._update_bar_state()      # 悬停态靠 _hover_bar 实算，这里只刷新 alpha
+        return super().eventFilter(obj, e)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._refit()           # 窗一变画面必须重按比例铺（缩放不会自己跟着变）
+        self._relocate()          # 窗宽一变，通栏/浮层都得重新摆
 
     # ---------------- 窗口：全屏 / 横竖屏自适应 / 无边框拖动 ----------------
 
     def _set_fullscreen(self, on):
+        """全屏＝画面铺满整块屏 + 播放条换成压在画面上的半透明浮层
+
+        showFullScreen() 用的是屏幕 geometry（不是 availableGeometry），本来就该
+        盖住任务栏；以前看着“不真全屏”，是外面那一层壳子还留着 10×8 留白 + 描边
+        + 顶栏，画面根本没顶到屏幕边。
+        进全屏：顶栏收掉、播放条那一行的 spacer 收到 0（画面吃满整屏）、按设置的
+        位置把横排面板摆成浮层、重新起“鼠标静止就收起”的计时。
+        退出反过来走一遍：窗控条回来、播放条恢复实体通栏，再按视频比例重摆一次。"""
         self._fullscreen = bool(on)
+        # 顶栏收起后窗控改由浮层末尾的 ―/✕ 承担
+        for b in (self.btn_min_fs, self.btn_close_fs):
+            b.setVisible(on)
         if on:
+            self._topbar.hide()
+            self._deck_gap.changeSize(0, 0, QSizePolicy.Policy.Ignored,
+                                      QSizePolicy.Policy.Fixed)
+            self.layout().activate()
             self.showFullScreen()
+            self._bar_hold = False
+            self._bar_hidden = False
+            self._refit()
+            self._relocate()
+            self._wake_bar()          # 刚进全屏先亮一遍，静止够久才收
         else:
             self.showNormal()
+            self._topbar.show()
+            self._bar_timer.stop()
+            self._bar_hidden = False
+            self._bar_hold = False
+            self._sync_deck_gap()     # spacer 要回那一行高度，画面不能再盖到栏下面
             if self._last_size:
                 # 退出全屏：重新按视频比例摆一次（_fitted 清空才能再触发）
                 self._fitted = None
@@ -584,30 +945,6 @@ class VideoPlayerDialog(QDialog):
         v = max(self.SCALE_MIN, min(self.SCALE_MAX, v))
         return v / 100.0
 
-    def _apply_round_mask(self):
-        """把无边框窗口沿圆角剪出一个真圆角（用遮罩而不是透明窗口）
-
-        以前只给 #PlayerShell 做了 border-radius，外层 QDialog 仍是直角，
-        壳子圆角外的四个小三角露出窗口默认白底——就是那个“白角突出”。
-        不用 WA_TranslucentBackground（会把硬解视频变黑），改用 setMask 把窗口
-        区域剪成圆角矩形：四角直接透明掉到桌面，客户区仍完全不透明，视频不受影响。"""
-        if self._fullscreen:
-            self.clearMask()
-            return
-        w, h, r = self.width(), self.height(), self.SHELL_RADIUS
-        if w <= 0 or h <= 0:
-            return
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, w, h, r, r)
-        # 本 PySide6 不支持 QRegion(QPainterPath, FillRule) 重载（会回退到
-        # 要求 QPolygon/QRect 的重载报错、遮罩为空）。转成多边形再构 region。
-        poly = path.toFillPolygon(QTransform()).toPolygon()
-        self.setMask(QRegion(poly))
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self._apply_round_mask()
-
     def _place(self, w, h):
         """摆窗 + 居中（居中按可用区算，别被菜单栏/Dock 顶到屏幕外）"""
         avail = self._avail()
@@ -617,6 +954,7 @@ class VideoPlayerDialog(QDialog):
 
     def showEvent(self, e):
         super().showEvent(e)
+        self._relocate()
         if self._fitted is None and not self._fullscreen:
             # 后端还没报出视频尺寸（容器没写 Resolution 或报得比首帧晚）：
             # 先按半屏给一个够大的窗，不要把播放器开成一个巴掌大的方块，
@@ -627,13 +965,19 @@ class VideoPlayerDialog(QDialog):
                         int(avail.height() * self.FALLBACK_FILL * s))
 
     def _on_video_size(self, *_):
-        """视频尺寸变化的通知：尺寸要自己从 sink 上取
+        """视频尺寸变化的通知：尺寸要自己从 item 上取
 
         PySide6 6.11 里这条信号到 Python 槽是不带参数的（签名就是
-        videoSizeChanged()），当初写成接一个 QSize，槽每次都被 0 参数调用、
+        nativeSizeChanged()），当初写成接一个 QSize，槽每次都被 0 参数调用、
         报个 TypeError 被 Qt 吃掉——横竖屏自适应等于完全没做。
         所以这里签 (self, *_)：带不带尺寸都能接。"""
-        self._fit_to_video(self.video.videoSink().videoSize())
+        ns = self.item.nativeSize()
+        if ns.width() > 0 and ns.height() > 0:
+            # 把场景尺寸钉成视频像素（1:1）：nativeSizeChanged 只改 nativeSize，
+            # item 自己的 size 不跟着变，不补这一刀 fitInView 就是按 320×240 放
+            self.item.setSize(ns)
+        self._refit()
+        self._fit_to_video(ns)
 
     def _fit_to_video(self, size):
         """按视频真实宽高比重排窗口：横屏视频给横窗、竖屏视频给窄高窗
@@ -646,6 +990,13 @@ class VideoPlayerDialog(QDialog):
         if w <= 0 or h <= 0 or self._fullscreen:
             return
         self._last_size = (w, h)
+        # 画面下限按手机屏幕给，方向跟着视频转（竖版 402×874、横版 874×402）：
+        # 小过一个手机屏幕就没法审片，拖窗也拖不到那么小。
+        pw, ph = ((self.PHONE_SHORT, self.PHONE_LONG) if h > w
+                  else (self.PHONE_LONG, self.PHONE_SHORT))
+        if (self.view.minimumWidth(), self.view.minimumHeight()) != (pw, ph):
+            self.view.setMinimumSize(pw, ph)
+            self._apply_shell_min()
         cur = w / h
         if self._fitted is not None and abs(cur - self._fitted) < self.REFIT_EPS:
             return
@@ -654,8 +1005,11 @@ class VideoPlayerDialog(QDialog):
         s = self._scale_factor()
         scale = min(avail.width() * self.FILL_W * s / w,
                     avail.height() * self.FILL_H * s / h)
-        self._place(max(int(w * scale), self.MIN_W + 60),
-                    max(int(h * scale), self.MIN_H + 60))
+        # 宽的底线还要给播放条留出富余：播放条不进布局，没人替它顶住窗宽，
+        # 窗比栏要的宽度还窄时，栏里的时间标签先被切成一截（按钮也挤成一团）
+        bar_w = self._deck.minimumSizeHint().width() if hasattr(self, "_deck") else 0
+        self._place(max(int(w * scale), pw + 60, bar_w + 2 * self.GAP),
+                    max(int(h * scale), ph + 60))
         # 上面的尺寸是「整窗」而不是「画面」，布局会把画面区压成另一个比例；
         # 等一轮事件让布局落地后再按实测尺寸补差（_reconcile 里会继续约正）。
         QTimer.singleShot(0, self._reconcile)
@@ -668,7 +1022,7 @@ class VideoPlayerDialog(QDialog):
         先调高（高的余量最便宜），顶到屏幕上下限了再反过来调宽。"""
         if self._fullscreen or not self._last_size or not self.isVisible():
             return
-        vw, vh = self.video.width(), self.video.height()
+        vw, vh = self.view.viewport().width(), self.view.viewport().height()
         if vw <= 0 or vh <= 0:
             return
         w, h = self._last_size
@@ -690,7 +1044,7 @@ class VideoPlayerDialog(QDialog):
         """高度顶到屏幕上限补不开时，反过来把宽度收到贴视频比例"""
         if self._fullscreen or not self._last_size or not self.isVisible():
             return
-        vw, vh = self.video.width(), self.video.height()
+        vw, vh = self.view.viewport().width(), self.view.viewport().height()
         if vw <= 0 or vh <= 0:
             return
         w, h = self._last_size
@@ -702,19 +1056,48 @@ class VideoPlayerDialog(QDialog):
                     avail.width())
         self.resize(new_w, self.height())
 
-    def _video_clicked(self, e):
-        """左键单击画面＝播放/暂停，双击＝全屏（右键不在这管，交给 contextMenuEvent）"""
+    def _video_pressed(self, e):
+        """按下画面先不得动手：可能是要点（播放/暂停），也可能是想把窗拖走——
+        无边框之后四周再没有留白，画面就是唯一能抓的地方，所以按下只记下位置，
+        等松手看位移再判（同思维导图那套）。
+        右键不在这里管（交给 contextMenuEvent），ignore 掉免得顺带拨一下播放态。"""
+        self._press = None
         if e.button() != Qt.MouseButton.LeftButton:
-            e.ignore()                      # 右键不拨播放态，否则弹菜单会顺带把暂停/播放切一下
+            e.ignore()
             return
-        if e.detail() == 2:
-            self._toggle_fullscreen()
-        else:
-            self._toggle_play()
+        self._press = e.globalPosition().toPoint()
+        self._drag_pos = self._press - self.frameGeometry().topLeft()
+        e.accept()                # 收下按下：后续 move 才回到本控件（再往上传给窗口拖动）
+
+    def _video_released(self, e):
+        p, self._press = self._press, None
+        self._drag_pos = None
+        if (p is not None and e.button() == Qt.MouseButton.LeftButton
+                and (e.globalPosition().toPoint() - p).manhattanLength() <= self._click_tol()):
+            self._toggle_play()   # 原地按住松开＝点；拖出去了＝只挪窗，不拨播放态
+            self._click1_toggled = True
         e.accept()
 
-    def contextMenuEvent(self, e):
-        """播放界面右键菜单：把从标题栏收起的「识别字幕 / 定位源文件」收在这里。"""
+    def _video_double(self, e):
+        """双击画面＝全屏。Qt6 的 QMouseEvent 没 detail()（那是 Qt5 的），双击走
+        mouseDoubleClickEvent，不是带 detail()==2 的按下——上一版这里靠 detail() 判双击，
+        每次按画面都直接抛异常，所以单击暂停与双击全屏其实一直没生效。
+        双击的第一个按下已经把播放态拨了一下，这里再拨回去：不要“进全屏顺手把片停了”。"""
+        self._press = None
+        self._toggle_fullscreen()
+        if self._click1_toggled:
+            self._toggle_play()
+            self._click1_toggled = False
+        e.accept()
+
+    @staticmethod
+    def _click_tol():
+        """允许的位移判据：跟着系统拖动阈值走，最少给 4px（否则手抖一下就算拖拽）。"""
+        return max(int(QApplication.startDragDistance()), 4)
+
+    def _show_bar_menu(self, e):
+        """播放界面右键菜单：把从标题栏收起的「识别字幕 / 定位源文件」收在这里。
+        事件从 _VideoView 递过来（画面是窗口的主体，右键能落到的就那一块）。"""
         m = StyledMenu(self)
         m.addAction("🎤 识别字幕", self._do_asr)
         m.addAction("📂 定位源文件", self._reveal)

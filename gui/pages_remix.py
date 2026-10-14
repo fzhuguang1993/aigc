@@ -12,13 +12,15 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QListWidget, QListWidgetItem, QMessageBox,
-                               QLineEdit, QAbstractItemView, QDialog, QDialogButtonBox)
+                               QLineEdit, QComboBox, QAbstractItemView, QDialog, QDialogButtonBox,
+                               QToolButton, QSplitter)
 
 from store import material_store, output_store
 from utils.desktop_utils import open_path, reveal_in_folder
 from gui.header import page_header, Card
 from gui.widgets import VideoPlayerDialog
 from gui.menus import StyledMenu
+from gui.media_grid import MediaGrid
 
 from video_text_tools.remix import remixer
 
@@ -40,34 +42,273 @@ def _clip_from_path(p):
             "duration": 0.0, "label": Path(str(p)).name}
 
 
+# 选素材排序选项（key, 中文名）：多条件快速定位。
+_PICKER_SORTS = (("default", "默认（加入顺序）"),
+                 ("name_asc", "名称 A→Z"),
+                 ("name_desc", "名称 Z→A"),
+                 ("dur_desc", "时长（长→短）"),
+                 ("dur_asc", "时长（短→长）"),
+                 ("tag_dur", "标签↑ · 时长↓"),
+                 ("prod_dur", "产品↑ · 时长↓"))
+
+
+class _SectionBox(QWidget):
+    """可收缩的单选筛选列表：小标题行带 ▼/▶ 按钮，点击切换列表显隐；
+    点击列表项调 on_pick(value)。首个自动为“全部”（value=""）。"""
+
+    def __init__(self, title, on_pick, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._expanded = True
+        self._on_pick = on_pick
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
+        self._btn = QToolButton()
+        self._btn.setText(f"\u25bc {title}")
+        self._btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._btn.setAutoRaise(True)
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.clicked.connect(self._toggle)
+        v.addWidget(self._btn)
+        self._list = QListWidget()
+        self._list.setMaximumHeight(160)
+        self._list.itemClicked.connect(
+            lambda it: self._on_pick(str(it.data(Qt.ItemDataRole.UserRole) or "")))
+        v.addWidget(self._list)
+
+    def set_items(self, pairs):
+        """重建列表；第一个固定为“全部”（value=""），随后为 pairs=[(label, value)]。
+        保留当前选中项。"""
+        cur = self._cur_val()
+        self._list.blockSignals(True)
+        self._list.clear()
+        it0 = QListWidgetItem("全部")
+        it0.setData(Qt.ItemDataRole.UserRole, "")
+        self._list.addItem(it0)
+        for label, val in pairs:
+            it = QListWidgetItem(label)
+            it.setData(Qt.ItemDataRole.UserRole, val)
+            self._list.addItem(it)
+        for i in range(self._list.count()):
+            if str(self._list.item(i).data(Qt.ItemDataRole.UserRole) or "") == cur:
+                self._list.setCurrentRow(i)
+                break
+        else:
+            self._list.setCurrentRow(0)
+        self._list.blockSignals(False)
+
+    def _cur_val(self):
+        it = self._list.currentItem()
+        return str(it.data(Qt.ItemDataRole.UserRole) or "") if it else ""
+
+    def _toggle(self):
+        self._expanded = not self._expanded
+        self._list.setVisible(self._expanded)
+        self._btn.setText(f"{'\u25bc' if self._expanded else '\u25b6'} {self._title}")
+
+
 class _PickerDialog(QDialog):
-    """通用多选挑选：items=[(label, clip)]；确认后回吐勾选的 clip 列表。"""
+    """通用多选挑选：items=[(label, clip)]；卡片网格 pick 模式，确认后回吐勾选的 clip 列表。
+
+    pick 模式：卡片常开勾选、单击只勾选不预览、双击预览；勾选集合按 clip 对象 id 归集，
+    确认后 selected_rows() 按入参顺序回吐 clip（接口对外不变，_open_picker 逻辑不变）。"""
 
     def __init__(self, parent, title, items):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(640, 460)
+        self.resize(900, 600)
+        self._entries = [clip for _label, clip in items]
+        self._picked = []
+        self._media = None
+        self._shown = []
+        self._tag_filter = ""    # 当前标签筛选值（""=全部）
+        self._prod_filter = ""   # 当前产品筛选值（""=全部，"__unbound__"=未分类）
         v = QVBoxLayout(self)
-        self.list = QListWidget()
-        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        for label, clip in items:
-            it = QListWidgetItem(label)
-            it.setData(Qt.ItemDataRole.UserRole, clip)
-            self.list.addItem(it)
-        v.addWidget(self.list)
-        tip = QLabel("Ctrl/Shift 多选 · 双击预览")
-        v.addWidget(tip)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+
+        # 顶部筛选行：搜索 + 排序 + 显示统计
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.ed_search = QLineEdit()
+        self.ed_search.setPlaceholderText("搜索名称/路径…")
+        self.ed_search.setFixedWidth(200)
+        self.ed_search.textChanged.connect(lambda *_: self._apply_filter())
+        bar.addWidget(self.ed_search)
+        bar.addStretch(1)
+        bar.addWidget(QLabel("排序："))
+        self.cb_sort = QComboBox()
+        self.cb_sort.addItems([lbl for _k, lbl in _PICKER_SORTS])
+        self._sort_keys = [k for k, _l in _PICKER_SORTS]
+        self.cb_sort.currentIndexChanged.connect(lambda *_: self._apply_filter())
+        bar.addWidget(self.cb_sort)
+        self.lbl_shown = QLabel("")
+        self.lbl_shown.setObjectName("PageTip")
+        bar.addWidget(self.lbl_shown)
+        v.addLayout(bar)
+
+        self.grid = MediaGrid(key_of=lambda r: str(id(r)),
+                              path_of=lambda r: r.get("path") or "",
+                              build_display=self._display,
+                              on_open=self._preview,
+                              on_menu=self._menu,
+                              on_selection_changed=self._update_shown,
+                              pick=True)
+        self.grid.set_empty_menu(self._empty_menu)
+
+        # 左侧可收缩筛选面板
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
+        self.sec_tag = _SectionBox("标签（板块类型）",
+                                   lambda v: self._set_filter("tag", v))
+        self.sec_prod = _SectionBox("产品",
+                                     lambda v: self._set_filter("prod", v))
+        lv.addWidget(self.sec_tag)
+        lv.addWidget(self.sec_prod)
+        lv.addStretch(1)
+        left.setFixedWidth(160)
+
+        rc = Card(margins=(8, 8, 8, 8))
+        rc.v.addWidget(self.grid, 1)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(left)
+        split.addWidget(rc)
+        split.setStretchFactor(1, 1)
+        split.setSizes([160, 720])
+        v.addWidget(split, 1)
+
+        v.addWidget(QLabel("勾选要加入的片段 · 双击预览 · 左侧可收缩面板按标签/产品筛选"))
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
         v.addWidget(btns)
-        self._picked = []
+        self._fill_filters()
+        self._apply_filter()
+
+    def _set_filter(self, which, val):
+        if which == "tag":
+            self._tag_filter = val
+        else:
+            self._prod_filter = val
+        self._apply_filter()
+    
+    def _fill_filters(self):
+        """按本批 entries 的取值重建两个筛选段（含“未分类”）。"""
+        tag_cnt: dict = {}
+        prod_cnt: dict = {}
+        for c in self._entries:
+            t = (c.get("block_type") or "").strip()
+            p = (c.get("product") or "").strip()
+            tag_cnt[t] = tag_cnt.get(t, 0) + 1
+            prod_cnt[p] = prod_cnt.get(p, 0) + 1
+        tag_pairs = [(f"{k or '未分类'} ({tag_cnt[k]})", k or "__unbound__")
+                     for k in sorted(tag_cnt.keys()) if k]  # 非空分类单独列出
+        if "" in tag_cnt:
+            tag_pairs.insert(len(tag_pairs),
+                             (f"未分类 ({tag_cnt['']})",  "__unbound__"))
+        prod_pairs = [(f"{k or '未分类'} ({prod_cnt[k]})", k or "__unbound__")
+                      for k in sorted(prod_cnt.keys()) if k]
+        if "" in prod_cnt:
+            prod_pairs.insert(len(prod_pairs),
+                              (f"未分类 ({prod_cnt['']})", "__unbound__"))
+        self.sec_tag.set_items(tag_pairs)
+        self.sec_prod.set_items(prod_pairs)
+    
+    def _apply_filter(self):
+        """按搜索/标签/产品过滤 + 多条件排序，重建卡片（勾选集合跳重建保持）。"""
+        if not hasattr(self, "grid"):        # 构造期下拉 addItems 会先发一次信号，此时网格未就绪
+            return
+        kw = (self.ed_search.text() or "").strip().lower()
+        tag = self._tag_filter
+        prod = self._prod_filter
+        out = []
+        for c in self._entries:
+            bt = (c.get("block_type") or "").strip()
+            cp = (c.get("product") or "").strip()
+            if tag == "__unbound__":
+                if bt:
+                    continue
+            elif tag and bt != tag:
+                continue
+            if prod == "__unbound__":
+                if cp:
+                    continue
+            elif prod and cp != prod:
+                continue
+            if kw and kw not in ((c.get("label") or "") + " " + (c.get("path") or "")).lower():
+                continue
+            out.append(c)
+        key = self._sort_keys[self.cb_sort.currentIndex()] if self.cb_sort.count() else "default"
+        if key != "default":
+            def _name(c):
+                return (c.get("label") or Path(c.get("path") or "").name).lower()
+    
+            def _dur(c):
+                return float(c.get("duration") or 0)
+            if key == "name_asc":
+                out.sort(key=_name)
+            elif key == "name_desc":
+                out.sort(key=_name, reverse=True)
+            elif key == "dur_desc":
+                out.sort(key=_dur, reverse=True)
+            elif key == "dur_asc":
+                out.sort(key=_dur)
+            elif key == "tag_dur":
+                out.sort(key=lambda c: ((c.get("block_type") or ""), -_dur(c)))
+            elif key == "prod_dur":
+                out.sort(key=lambda c: ((c.get("product") or ""), -_dur(c)))
+        self._shown = out
+        self.grid.set_rows(out)
+        self._update_shown()
+
+    def _update_shown(self, *_a):
+        self.lbl_shown.setText(
+            f"显示 {len(self._shown)}/{len(self._entries)} · 已选 {len(self.grid.selected())}")
+
+    def _display(self, clip):
+        return {"name": clip.get("label") or Path(clip.get("path") or "").name,
+                "tags": f"🎬 {clip.get('block_type') or '片段'}",
+                "meta": _fmt(clip.get("duration") or 0),
+                "tooltip": clip.get("path") or ""}
+
+    def _preview(self, clip):
+        p = (clip or {}).get("path") or ""
+        if not p or not Path(p).exists():
+            QMessageBox.information(self, "提示", "片段文件不存在或已被移动")
+            return
+        self._media = VideoPlayerDialog(self, p)
+        self._media.show()
+
+    def _menu(self, clip, global_pos):
+        menu = StyledMenu(self)
+        menu.addAction("👁 预览", lambda: self._preview(clip))
+        p = (clip or {}).get("path") or ""
+        if p and Path(p).exists():
+            menu.addAction("📁 打开所在文件夹", lambda: reveal_in_folder(p))
+        menu.exec(global_pos)
+
+    def _empty_menu(self):
+        menu = StyledMenu(self)
+        menu.addAction("☑ 全选", self.grid.select_all)
+        menu.addAction("⇄ 反选", self.grid.invert)
+        menu.addAction("✕ 清空勾选", self.grid.clear_sel)
+        return menu
 
     def _accept(self):
-        self._picked = [it.data(Qt.ItemDataRole.UserRole)
-                        for it in self.list.selectedItems()]
+        # 从全量 entries 按勾选集合回吏（包括当前被筛掉但仍勾选的），保留加入顺序
+        sel = self.grid.selected()
+        self._picked = [c for c in self._entries if str(id(c)) in sel]
+        self.grid.stop_worker()
         self.accept()
+
+    def reject(self):
+        self.grid.stop_worker()
+        super().reject()
 
     def clips(self):
         return self._picked
@@ -100,6 +341,14 @@ class RemixPage(QWidget):
         ops = QHBoxLayout()
         b_ai = QPushButton("🧠 AI 建议顺序")
         b_ai.clicked.connect(self._ai_order)
+        b_tmpl = QPushButton("🏗 模板拼装")
+        b_tmpl.setObjectName("GhostBtn")
+        b_tmpl.setToolTip("自定义段落模板，逐槽从素材库选片")
+        b_tmpl.clicked.connect(self._open_template_editor)
+        b_auto = QPushButton("🤖 AI 自动拼装")
+        b_auto.setObjectName("GhostBtn")
+        b_auto.setToolTip("按板块类型序列自动从素材库取片，每类最多 N 条")
+        b_auto.clicked.connect(self._open_auto_template)
         b_export = QPushButton("▶ 导出混剪")
         b_export.setObjectName("PrimaryBtn")
         b_export.clicked.connect(self._export)
@@ -107,6 +356,8 @@ class RemixPage(QWidget):
         b_clear.setObjectName("GhostBtn")
         b_clear.clicked.connect(self.list_clear)
         ops.addWidget(b_ai)
+        ops.addWidget(b_tmpl)
+        ops.addWidget(b_auto)
         ops.addWidget(b_export)
         ops.addWidget(b_clear)
         ops.addStretch(1)
@@ -183,6 +434,48 @@ class RemixPage(QWidget):
                 self._append_clip(clip)
                 n += 1
             self._append(f"加入 {n} 段。")
+
+    # ---------------- 模板拼装 / AI 自动拼装 ----------------
+    def _open_template_editor(self):
+        """自定义模板：用户编排 block_type 序列，逐槽从素材库选片，按模板顺序载入清单。"""
+        from gui.dialogs_remix_template import TemplateEditorDialog
+        rows = material_store.list_clips(limit=2000)
+        if not rows:
+            QMessageBox.information(self, "素材库为空",
+                                    "素材库还没有片段：先去拆解详情页「✂ 切割入素材库」")
+            return
+        clips = [_clip_from_material(r) for r in rows]
+        dlg = TemplateEditorDialog(self, clips)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            result = dlg.result_clips()
+            if not result:
+                return
+            self.list.clear()
+            for c in result:
+                self._append_clip(c)
+            self._append(f"模板拼装完成，共 {self.list.count()} 段。"
+                         "可继续拖拽微调后导出。")
+
+    def _open_auto_template(self):
+        """AI 自动拼装：按 block_categories 序列自动从素材库取片，载入清单等待用户微调。"""
+        from gui.dialogs_remix_template import AutoTemplateDialog
+        rows = material_store.list_clips(limit=2000)
+        if not rows:
+            QMessageBox.information(self, "素材库为空",
+                                    "素材库还没有片段：先去拆解详情页「✂ 切割入素材库」")
+            return
+        clips = [_clip_from_material(r) for r in rows]
+        prods = material_store.distinct_products()
+        dlg = AutoTemplateDialog(self, clips, prods)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            result = dlg.result_clips()
+            if not result:
+                return
+            self.list.clear()
+            for c in result:
+                self._append_clip(c)
+            self._append(f"AI 自动拼装完成，共 {self.list.count()} 段。"
+                         "可微调后导出。")
 
     def _items(self):
         return [self.list.item(i) for i in range(self.list.count())]
