@@ -85,3 +85,8 @@ build_log.txt
 _[a-z]*.py
 _[a-z]*.ps1
 _[a-z]*.txt
+
+# ========== 一次性维护/演示脚本（仅本地保留，不入库） ==========
+/mount_videos.py
+/rebuild_from_table.py
+/recorder_demo.py
